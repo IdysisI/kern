@@ -83,6 +83,14 @@ class StallError(Exception):
                          f"This is usually the proxy/upstream; switch model with ctrl+p.")
 
 
+
+def default_max_output_tokens(model: str) -> int:
+    low = model.lower()
+    if any(k in low for k in ("glm-5", "claude-", "deepseek", "minimax", "mimo", "gemini", "gpt-5", "gpt-4")):
+        return 32768
+    return 8192
+
+
 def protocol_for(model: str) -> str:
     if model.startswith("claude-"):
         return "anthropic"
@@ -108,12 +116,13 @@ class Client:
         messages: list[dict],          # IR messages (see pager)
         system: str | None = None,
         tools: list[dict] | None = None,   # openai-style schemas
-        max_tokens: int = 8192,
+        max_tokens: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        actual_max = max_tokens or default_max_output_tokens(model)
         if protocol_for(model) == "anthropic":
-            gen = self._stream_anthropic(model, messages, system, tools, max_tokens)
+            gen = self._stream_anthropic(model, messages, system, tools, actual_max)
         else:
-            gen = self._stream_openai(model, messages, system, tools, max_tokens)
+            gen = self._stream_openai(model, messages, system, tools, actual_max)
         async for ev in gen:
             yield ev
 
@@ -205,6 +214,8 @@ class Client:
                         if chunk.get("usage"):
                             yield StreamEvent("usage", usage=chunk["usage"])
                         for choice in chunk.get("choices", []):
+                            if choice.get("finish_reason") == "length":
+                                yield StreamEvent("finish", text="length")
                             delta = choice.get("delta") or {}
                             reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                             if reasoning:

@@ -200,9 +200,13 @@ class Engine:
             text_parts: list[str] = []
             calls: list[dict] = []
             error = ""
+            truncated = False
             async for ev in self.client.stream_chat(self.model, view, system=system, tools=tools):
                 if ev.kind == "thinking":
                     self.stream_cb("thinking", ev.text)
+                elif ev.kind == "finish" and ev.text == "length":
+                    truncated = True
+                    self.stream_cb("note", "⚠ Le modèle a atteint sa limite de tokens de sortie (max_tokens).")
                 elif ev.kind == "text":
                     text_parts.append(ev.text)
                     self.tokens_streamed += max(1, len(ev.text) // 4)
@@ -249,6 +253,10 @@ class Engine:
                 self.stream_cb("note", note)
 
             if not calls and not notes:
+                if truncated and not display:
+                    msg = "⚠ Le modèle a atteint sa limite de tokens de sortie (max_tokens) pendant son raisonnement."
+                    self.session.emit("note", text=msg)
+                    return msg
                 return final_text
             if notes and not calls:
                 continue   # mount/list results just landed; let the model act on them
