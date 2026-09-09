@@ -201,7 +201,9 @@ class Engine:
             calls: list[dict] = []
             error = ""
             async for ev in self.client.stream_chat(self.model, view, system=system, tools=tools):
-                if ev.kind == "text":
+                if ev.kind == "thinking":
+                    self.stream_cb("thinking", ev.text)
+                elif ev.kind == "text":
                     text_parts.append(ev.text)
                     self.tokens_streamed += max(1, len(ev.text) // 4)
                     self.stream_cb("text", ev.text)

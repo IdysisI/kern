@@ -25,8 +25,8 @@ BASE_URL = os.environ.get("KERN_BASE_URL", "http://127.0.0.1:8790")
 KERN_HOME = os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern"))
 # stall watchdog: proxies like vsllm sometimes go silent mid-stream.
 # first chunk gets a generous window; after that, silence = dead stream.
-STALL_FIRST = float(os.environ.get("KERN_STALL_FIRST", "120"))
-STALL_NEXT = float(os.environ.get("KERN_STALL_NEXT", "60"))
+STALL_FIRST = float(os.environ.get("KERN_STALL_FIRST", "360"))
+STALL_NEXT = float(os.environ.get("KERN_STALL_NEXT", "90"))
 HEALTH_PATH = os.path.join(KERN_HOME, "health.json")
 
 # ---------------------------------------------------------------- events ---
@@ -90,7 +90,7 @@ def protocol_for(model: str) -> str:
 
 
 class Client:
-    def __init__(self, base_url: str = BASE_URL, timeout: float = 240.0):
+    def __init__(self, base_url: str = BASE_URL, timeout: float = 600.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
@@ -206,6 +206,9 @@ class Client:
                             yield StreamEvent("usage", usage=chunk["usage"])
                         for choice in chunk.get("choices", []):
                             delta = choice.get("delta") or {}
+                            reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                            if reasoning:
+                                yield StreamEvent("thinking", text=reasoning)
                             if delta.get("content"):
                                 clean, mm_calls = Client._split_minimax_raw_tool_calls(
                                     delta["content"]
@@ -280,6 +283,8 @@ class Client:
                             d = ev.get("delta", {})
                             if d.get("type") == "text_delta" and d.get("text"):
                                 yield StreamEvent("text", text=d["text"])
+                            elif d.get("type") == "thinking_delta" and d.get("thinking"):
+                                yield StreamEvent("thinking", text=d["thinking"])
                             elif d.get("type") == "input_json_delta" and cur_tool is not None:
                                 cur_tool["args"] += d.get("partial_json", "")
                         elif et == "content_block_stop" and cur_tool is not None:

@@ -32,7 +32,7 @@ from textual.message import Message
 from textual.renderables.blank import Blank
 from textual.screen import ModalScreen
 from textual.worker import Worker
-from textual.widgets import (Button, Label, ListItem, ListView,
+from textual.widgets import (Button, Collapsible, Label, ListItem, ListView,
                              Static, TextArea)
 
 from .client import Client, load_health
@@ -60,6 +60,9 @@ Screen { background: transparent; }
 .user { border: round $border; padding: 0 1; margin: 1 6 0 0; }
 .assistant { padding: 0 1 0 2; border-left: tall $border; }
 .stream { padding: 0 1 0 2; border-left: tall $primary; }
+.thinking { background: transparent; border: none; padding: 0 1; margin: 0 1; }
+.thinking .thinking-text { color: $text-muted; text-style: italic; }
+CollapsibleTitle { color: $text-muted; text-style: italic; background: transparent; padding: 0; }
 .tool { border-left: thick $warning; padding: 0 1; margin: 0 2 0 1; }
 .note { color: $text-muted; padding: 0 2; text-style: italic; }
 .error { border-left: thick $error; padding: 0 1; margin: 0 2 0 1; color: $error; }
@@ -108,6 +111,27 @@ def _diff_text(diff: str, max_lines: int = 30) -> str:
         else:
             out.append(f"[dim]{esc}[/]")
     return "\n".join(out)
+
+
+
+class ThinkingBlock(Collapsible):
+    def __init__(self):
+        self._content_static = Static("", classes="thinking-text", markup=False)
+        super().__init__(self._content_static, title="thinking...", collapsed=False, classes="thinking")
+        self._buf: list[str] = []
+
+    def append_thinking(self, delta: str):
+        self._buf.append(delta)
+        chars = sum(len(x) for x in self._buf)
+        toks = max(1, chars // 4)
+        self.title = f"thinking ({toks:,} tokens)..."
+        self._content_static.update("".join(self._buf))
+
+    def finalize(self):
+        chars = sum(len(x) for x in self._buf)
+        toks = max(1, chars // 4)
+        self.title = f"thought for {toks:,} tokens"
+        self.collapsed = True
 
 
 class UserMsg(Static):
@@ -287,8 +311,16 @@ class PromptArea(TextArea):
         self.border_title = "›"
         self.past: list[str] = []
         self._hi: int | None = None
-        self.placeholder = "ask, plan, build…   (enter sends · ctrl+j newline · /help)"
+        # Same prefix as border_title so the first character is visually
+        # distinct (it's a glyph, not a letter) and survives the cursor's
+        # text-style: reverse without looking like a missing/odd letter.
+        # Combined with cursor_blink=False below, the placeholder no longer
+        # reads as a gray letter that blinks.
+        self.placeholder = "›  ask, plan, build…   (enter sends · ctrl+j newline · /help)"
         self.compact = True
+        # Don't blink the cursor: blinking + reverse on the placeholder
+        # letter made the placeholder look like a broken gray letter.
+        self.cursor_blink = False
 
     def on_key(self, event):
         if event.key == "enter":
@@ -350,6 +382,7 @@ class KernApp(App):
         self._stream_widget: Static | None = None
         self._stream_buf: list[str] = []
         self._stream_dirty = False
+        self._thinking_widget: ThinkingBlock | None = None
         self._tool_card: ToolCard | None = None
         self._todo_card: TodoCard | None = None
         self._skip_result = False
@@ -468,7 +501,18 @@ class KernApp(App):
         return v == "y"
 
     def _on_stream(self, kind: str, text: str):
-        if kind == "text":
+        if kind == "thinking":
+            if self._thinking_widget is None:
+                self._thinking_widget = ThinkingBlock()
+                self.chat.mount(self._thinking_widget)
+            self._thinking_widget.append_thinking(text)
+            self._verb = "thinking…"
+            self.chat.scroll_end(animate=False)
+            return
+        elif kind == "text":
+            if self._thinking_widget is not None:
+                self._thinking_widget.finalize()
+                self._thinking_widget = None
             if self._stream_widget is None:
                 self._stream_widget = Static(classes="stream", markup=False)
                 self.chat.mount(self._stream_widget)
@@ -520,6 +564,10 @@ class KernApp(App):
             self._chat_note(f"⚙ background process {text} started")
 
     def _flush_stream(self):
+        # finalize thinking block if active
+        if self._thinking_widget is not None:
+            self._thinking_widget.finalize()
+            self._thinking_widget = None
         # finalize the live stream widget in place (no remove/remount)
         w = self._stream_widget
         if w is None:
@@ -566,6 +614,7 @@ class KernApp(App):
         pump deadlocks. Completion arrives via Worker.StateChanged."""
         self.engine = self._engine()
         self._todo_card = None
+        self._thinking_widget = None
         self._verb = "thinking…"
         self.query_one("#status").display = True
         self._t0 = time.monotonic()
