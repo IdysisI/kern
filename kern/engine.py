@@ -23,6 +23,27 @@ from .client import Client, health_of
 from .journal import Session, create_session
 from .linker import CapabilityIndex, MCPClient, MountTable
 
+
+def _parse_xml_invoke(text: str) -> list[dict]:
+    clean = re.sub(r"\]<\]minimax\[?>?\[?", "", text)
+    calls = []
+    for m in re.finditer(r"""<invoke\s+name=['"]([^'"]+)['"]>(.*?)</invoke>""", clean, re.DOTALL):
+        name = m.group(1)
+        body = m.group(2)
+        args = {}
+        for param in re.finditer(r'<([a-zA-Z0-9_]+)>(.*?)</\1>', body, re.DOTALL):
+            k = param.group(1)
+            v = param.group(2).strip()
+            if v.isdigit():
+                v = int(v)
+            elif v.lower() == "true":
+                v = True
+            elif v.lower() == "false":
+                v = False
+            args[k] = v
+        calls.append({"id": f"invoke-{len(calls)}", "name": name, "arguments": args})
+    return calls
+
 FENCED_RE = re.compile(r"```tool\s*\n(\{.*?\})\s*```", re.S)
 
 
@@ -65,8 +86,7 @@ class Engine:
                                     time.strftime("%Y-%m-%d"), git, lines)
 
     def _tools(self) -> list[dict] | None:
-        h = health_of(self.model)
-        if self.forced_fenced or (h and not h.get("native_tools")):
+        if self.forced_fenced:
             return None
         return syscalls.SCHEMAS + self.mounts.extra_tools()
 
@@ -199,19 +219,22 @@ class Engine:
                 self.session.emit("tool_result", call_id="", text=f"engine error: {error}")
                 return f"[error from model endpoint: {error}]"
 
-            # fenced fallback parsing
-            if tools is None:
-                for m in FENCED_RE.finditer(raw_text):
-                    try:
-                        call = json.loads(m.group(1))
-                        calls.append({"id": f"fenced-{len(calls)}",
-                                      "name": call.get("name", ""),
-                                      "arguments": call.get("arguments", {})})
-                    except json.JSONDecodeError:
-                        pass
-                display = FENCED_RE.sub("", raw_text).strip()
-            else:
-                display = raw_text
+            # Fallback parsing: if model emitted ```tool {...}``` or XML <invoke name="...">
+            for m in FENCED_RE.finditer(raw_text):
+                try:
+                    call = json.loads(m.group(1))
+                    calls.append({"id": f"fenced-{len(calls)}",
+                                  "name": call.get("name", ""),
+                                  "arguments": call.get("arguments", {})})
+                except json.JSONDecodeError:
+                    pass
+            for call in _parse_xml_invoke(raw_text):
+                calls.append(call)
+
+            display = FENCED_RE.sub("", raw_text)
+            display = re.sub(r"\]<\]minimax\[?>?\[?", "", display)
+            display = re.sub(r"<​?\s*tool_call>.*?<​?\s*/\s*tool_call\s*>", "", display, flags=re.DOTALL)
+            display = display.strip()
 
             self.session.emit("assistant", text=display, tool_calls=calls)
             final_text = display or final_text

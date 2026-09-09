@@ -309,7 +309,7 @@ class Client:
         first = None
         text = ""
         err = ""
-        async for ev in self.stream_chat(model, [{"role": "user", "text": "Reply with exactly: KERN-OK"}], max_tokens=16):
+        async for ev in self.stream_chat(model, [{"role": "user", "text": "Reply with exactly: KERN-OK"}], max_tokens=256):
             if ev.kind == "text":
                 if first is None:
                     first = time.monotonic()
