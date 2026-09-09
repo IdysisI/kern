@@ -90,17 +90,6 @@ def _preview(text: str, lines: int = 8) -> str:
 
 
 def _diff_text(diff: str, max_lines: int = 30) -> str:
-    from textual.markup import escape
-
-
-def safe(s: str) -> str:
-    """Escape text for embedding inside Textual markup.
-
-    textual.markup.escape only backslash-escapes *well-formed* tags
-    ([a-z#/@]...), so a bare '[' before '=' or other chars slips through
-    and crashes markup parsing. We escape every '[' (after protecting
-    backslashes) and leave ']' alone — the parser only errors on '['."""
-    return s.replace("\\", "\\\\").replace("[", "\\[")
     out = []
     ls = diff.splitlines()
     for i, line in enumerate(ls):

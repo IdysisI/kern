@@ -118,6 +118,55 @@ class Client:
             yield ev
 
     # ---- openai-compatible -------------------------------------------------
+    @staticmethod
+    def _split_minimax_raw_tool_calls(text: str) -> tuple[str, list[dict]]:
+        """Strip MiniMax raw-mode tool-call tokens from streamed text.
+
+        When the hub emits MiniMax without reasoning_split, the upstream model
+        occasionally leaks its native tool-call format directly into delta.content
+        instead of the structured delta.tool_calls field. Visible form:
+
+          ]<]minimax>[<​tool_call> ]<]minimax>[]<]minimax>[150]<]minimax>[]<]minimax>
+          [573]<]minimax>[]<]minimax>[/home/marty/kern/kern/tui.py]<]minimax>[]<]minimax>
+          [ ]<]minimax>[</​tool_call>
+
+        Each value slot is bracketed by literal ']<]minimax>[]<]minimax>[' on the
+        open side and ']<]minimax>[]<]minimax>' on the close side. The first non-empty
+        slot is the function name; the rest are positional arguments. Returns
+        (cleaned_text, list_of_tool_call_dicts).
+        """
+        if "tool_call>" not in text:
+            return text, []
+        import re as _re
+        block_re = _re.compile(
+            r"<\u200b?\s*tool_call>(.*?)<\u200b?\s*/\s*tool_call\s*>",
+            _re.DOTALL,
+        )
+        # Each slot opens with ']<]minimax>[]<]minimax>[' and closes with
+        # ']<]minimax>[]<]minimax>'. Build the pattern from escaped literals.
+        _o = _re.escape("]<]minimax>[]<]minimax>[")
+        _c = _re.escape("]<]minimax>[]<]minimax>")
+        slot_re = _re.compile(_o + r"(.*?)" + _c, _re.DOTALL)
+        calls: list[dict] = []
+        cleaned = text
+        for idx, m in enumerate(block_re.finditer(text)):
+            body = m.group(1)
+            slots = [sm.group(1) for sm in slot_re.finditer(body)]
+            name = "tool"
+            arg_slots: list[str] = []
+            for s in slots:
+                if name == "tool" and s.strip():
+                    name = s.strip()
+                elif s.strip():
+                    arg_slots.append(s.strip())
+            args = json.dumps({"_positional": arg_slots}) if arg_slots else "{}"
+            calls.append({"id": f"mmcall_{idx}", "name": name, "arguments": args})
+            cleaned = cleaned.replace(m.group(0), "")
+        # Post-pass: strip any leftover bare MiniMax delimiter tokens.
+        cleaned = _re.sub(r"\s*\]<\]minimax>\[\s*", "\n", cleaned)
+        return cleaned, calls
+
+
 
     async def _stream_openai(self, model, messages, system, tools, max_tokens):
         msgs = ([{"role": "system", "content": system}] if system else []) + _ir_to_openai(messages)
@@ -127,6 +176,13 @@ class Client:
         }
         if tools:
             body["tools"] = tools
+        # MiniMax upstream requires reasoning_split to emit structured tool_calls;
+        # without it the model falls back to leaking raw ]<]minimax>[<tool_call>
+        # tokens into delta.content. Prime Agent/Hermes get this via the proxy —
+        # kern sets it itself so any MiniMax endpoint behaves.
+        low_m = model.lower()
+        if "minimax" in low_m or "mimo" in low_m:
+            body["reasoning_split"] = True
         headers = {"Authorization": "Bearer kern", "Content-Type": "application/json"}
         pending: dict[int, dict] = {}   # index -> partial tool call
         try:
@@ -151,7 +207,17 @@ class Client:
                         for choice in chunk.get("choices", []):
                             delta = choice.get("delta") or {}
                             if delta.get("content"):
-                                yield StreamEvent("text", text=delta["content"])
+                                clean, mm_calls = Client._split_minimax_raw_tool_calls(
+                                    delta["content"]
+                                )
+                                if clean:
+                                    yield StreamEvent("text", text=clean)
+                                for tc in mm_calls:
+                                    pending[tc["id"]] = {
+                                        "id": tc["id"],
+                                        "name": tc["name"],
+                                        "args": tc["arguments"],
+                                    }
                             for tc in delta.get("tool_calls") or []:
                                 slot = pending.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
                                 if tc.get("id"):
