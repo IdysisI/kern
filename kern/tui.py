@@ -13,6 +13,16 @@ import time
 from rich.markdown import Markdown as RichMarkdown
 from rich.table import Table as RichTable
 from textual.markup import escape
+
+
+def safe(s: str) -> str:
+    """Escape text for embedding inside Textual markup.
+
+    textual.markup.escape only backslash-escapes *well-formed* tags
+    ([a-z#/@]...), so a bare '[' before '=' or other chars slips through
+    and crashes markup parsing. We escape every '[' (after protecting
+    backslashes) and leave ']' alone — the parser only errors on '['."""
+    return s.replace("\\", "\\\\").replace("[", "\\[")
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -81,13 +91,23 @@ def _preview(text: str, lines: int = 8) -> str:
 
 def _diff_text(diff: str, max_lines: int = 30) -> str:
     from textual.markup import escape
+
+
+def safe(s: str) -> str:
+    """Escape text for embedding inside Textual markup.
+
+    textual.markup.escape only backslash-escapes *well-formed* tags
+    ([a-z#/@]...), so a bare '[' before '=' or other chars slips through
+    and crashes markup parsing. We escape every '[' (after protecting
+    backslashes) and leave ']' alone — the parser only errors on '['."""
+    return s.replace("\\", "\\\\").replace("[", "\\[")
     out = []
     ls = diff.splitlines()
     for i, line in enumerate(ls):
         if i >= max_lines:
             out.append(f"[dim]… {len(ls) - max_lines} more diff lines[/]")
             break
-        esc = escape(line)
+        esc = safe(line)
         if line.startswith("+++") or line.startswith("---"):
             out.append(f"[dim]{esc}[/]")
         elif line.startswith("+"):
@@ -103,7 +123,7 @@ def _diff_text(diff: str, max_lines: int = 30) -> str:
 
 class UserMsg(Static):
     def __init__(self, text):
-        super().__init__(escape(text), classes="user", markup=True)
+        super().__init__(safe(text), classes="user", markup=True)
 
 
 class ToolCard(Static):
@@ -128,8 +148,8 @@ class ToolCard(Static):
         self.result: str | None = None
         self.diff: str | None = None
         icon = TOOL_ICON.get(name, "▸")
-        self.update(f"[dim]⠿[/] [#e0af68]{icon}[/] [bold]{escape(name)}[/] "
-                    f"[dim]{escape(self._headline(name, args))}[/]")
+        self.update(f"[dim]⠿[/] [#e0af68]{icon}[/] [bold]{safe(name)}[/] "
+                    f"[dim]{safe(self._headline(name, args))}[/]")
 
     def set_result(self, result: str):
         self.result = result
@@ -145,12 +165,12 @@ class ToolCard(Static):
         ok = not self.result.startswith(("error", "denied"))
         mark = "[#9ece6a]✓[/]" if ok else "[#f7768e]✗[/]"
         icon = TOOL_ICON.get(self.tname, "▸")
-        head = (f"{mark} [#e0af68]{icon}[/] [bold]{escape(self.tname)}[/] "
-                f"[dim]{escape(self._headline(self.tname, self.args))}[/]\n")
+        head = (f"{mark} [#e0af68]{icon}[/] [bold]{safe(self.tname)}[/] "
+                f"[dim]{safe(self._headline(self.tname, self.args))}[/]\n")
         if self.diff:
             self.update(head + _diff_text(self.diff))
         else:
-            self.update(head + f"[dim]{escape(_preview(self.result))}[/]")
+            self.update(head + f"[dim]{safe(_preview(self.result))}[/]")
 
 
 class TodoCard(Static):
@@ -165,9 +185,9 @@ class TodoCard(Static):
             mark, style = {"done": ("✓", "#9ece6a"), "active": ("●", "#e0af68"),
                            "pending": ("○", "dim")}.get(st, ("○", "dim"))
             if st == "done":
-                lines.append(f"  [#9ece6a]{mark}[/] [dim]{escape(it.get('text', ''))}[/]")
+                lines.append(f"  [#9ece6a]{mark}[/] [dim]{safe(it.get('text', ''))}[/]")
             else:
-                lines.append(f"  [{style}]{mark}[/] {escape(it.get('text', ''))}")
+                lines.append(f"  [{style}]{mark}[/] {safe(it.get('text', ''))}")
         self.update("\n".join(lines))
 
 
@@ -186,7 +206,7 @@ class Approve(ModalScreen[str]):
             if self.diff:
                 yield Static(_diff_text(self.diff, 18), classes="diff", markup=True)
             else:
-                yield Static(escape(_preview(self.desc, 6)), classes="q", markup=True)
+                yield Static(safe(_preview(self.desc, 6)), classes="q", markup=True)
             with Horizontal():
                 yield Button("allow  y", id="y", variant="success")
                 yield Button("always a", id="a", variant="primary")
@@ -240,7 +260,7 @@ class SessionPicker(ModalScreen[str | None]):
             items = []
             for r in self.rows:
                 label = (f"[#9ece6a]{r['id']}[/]  [dim]{r['turns']} turns · "
-                         f"{escape(r['preview'] or '(empty)')}[/]")
+                         f"{safe(r['preview'] or '(empty)')}[/]")
                 items.append(ListItem(Label(label, markup=True)))
             yield ListView(*items)
 
@@ -312,6 +332,10 @@ class _ClearBlank(Blank):
 class KernApp(App):
     TITLE = "kern"
     CSS = CSS
+    # Textual 8 binds its own command palette (theme, screenshot, ...) to
+    # ctrl+p by default, and it wins over our model picker. Move it to the
+    # conventional ctrl+shift+p so ctrl+p stays the model picker.
+    COMMAND_PALETTE_BINDING = "ctrl+shift+p"
 
     def render(self):
         return _ClearBlank()
@@ -422,11 +446,11 @@ class KernApp(App):
         return self.query_one("#chat")
 
     def _chat_note(self, text: str):
-        self.chat.mount(Static(escape(text), classes="note", markup=True))
+        self.chat.mount(Static(safe(text), classes="note", markup=True))
         self.chat.scroll_end(animate=False)
 
     def _chat_error(self, text: str):
-        self.chat.mount(Static(escape(text), classes="error", markup=True))
+        self.chat.mount(Static(safe(text), classes="error", markup=True))
         self.chat.scroll_end(animate=False)
 
     def chat_text(self) -> str:
@@ -540,7 +564,7 @@ class KernApp(App):
             if self._queued_chip is None:
                 self._queued_chip = Static(classes="queued", markup=True)
                 self.chat.mount(self._queued_chip)
-            self._queued_chip.update(f"⏳ queued: {escape(text)}")
+            self._queued_chip.update(f"⏳ queued: {safe(text)}")
             self.chat.scroll_end(animate=False)
             return
         self.chat.mount(UserMsg(text))
