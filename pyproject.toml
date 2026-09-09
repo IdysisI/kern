@@ -1,0 +1,26 @@
+[project]
+name = "kern-agent"
+version = "0.2.0"
+description = "Kern — an OS-kernel-style agentic harness for one user-chosen model"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27",
+    "rich>=13",
+    "textual>=3",
+    "websockets>=13",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6", "qasync>=0.27", "mistune>=3", "pygments>=2"]
+
+[project.scripts]
+kern = "kern.__main__:main"
+kern-gui = "kern.gui:main"
+kern-serve = "kern.serve:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["kern"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

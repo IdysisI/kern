@@ -1,0 +1,267 @@
+"""kern.engine — the loop. stream -> parse -> verify -> execute -> record.
+
+Protocol adaptation: if the handshake says the model speaks native tools, we
+send schemas. Otherwise we fall back to fenced ```tool blocks in plain text —
+which works on ANY model, because every model can emit markdown.
+
+Mount interception: the model can write [mount: name] / [list capabilities] /
+[unmount: name] as plain lines; the engine executes them and feeds back the
+result as a note, so capability loading never depends on tool-call support.
+"""
+from __future__ import annotations
+
+import asyncio
+import inspect
+import json
+import re
+import subprocess
+import time
+from pathlib import Path
+
+from . import kernel, pager, syscalls
+from .client import Client, health_of
+from .journal import Session, create_session
+from .linker import CapabilityIndex, MCPClient, MountTable
+
+FENCED_RE = re.compile(r"```tool\s*\n(\{.*?\})\s*```", re.S)
+
+
+def _human_desc(name: str, args: dict) -> str:
+    return Engine._human_desc_static(name, args)
+MOUNT_RE = re.compile(r"^\[(mount|unmount|list capabilities)(?::\s*([^\]]+))?\]", re.M)
+
+
+class Engine:
+    def __init__(self, client: Client, model: str, session: Session,
+                 cwd: str, approve=None, stream_cb=None, subagent_depth: int = 0):
+        self.client = client
+        self.model = model
+        self.session = session
+        self.cwd = cwd
+        self.fs = syscalls.FS(cwd)
+        self.approve = approve or (lambda desc: True)
+        self.stream_cb = stream_cb or (lambda kind, text: None)
+        self.index = CapabilityIndex()
+        self.mounts = MountTable()
+        self.depth = subagent_depth
+        self.last_usage: dict = {}
+        self.usage_in = 0
+        self.usage_out = 0
+        self.tokens_streamed = 0
+        self.todo: list[dict] = []
+        self.forced_fenced = bool(__import__("os").environ.get("KERN_FORCE_FENCED"))
+
+    # ---- capability index + mounts ----------------------------------------
+
+    def _system(self) -> str:
+        git = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                             capture_output=True, text=True, cwd=self.cwd).stdout.strip() or "-"
+        lines = self.index.lines()
+        for name in self.mounts.skills:
+            lines.append(f"{name} (skill): MOUNTED")
+        for name in self.mounts.mcps:
+            lines.append(f"{name} (mcp): MOUNTED")
+        return kernel.system_prompt(self.cwd, self.model,
+                                    time.strftime("%Y-%m-%d"), git, lines)
+
+    def _tools(self) -> list[dict] | None:
+        h = health_of(self.model)
+        if self.forced_fenced or (h and not h.get("native_tools")):
+            return None
+        return syscalls.SCHEMAS + self.mounts.extra_tools()
+
+    async def _handle_mount_directives(self, text: str) -> list[str]:
+        notes = []
+        for action, target in MOUNT_RE.findall(text or ""):
+            if action == "list capabilities":
+                listing = "\n".join(self.index.lines()) or "(index empty)"
+                notes.append(f"capability index:\n{listing}")
+                continue
+            name = (target or "").strip()
+            cap = self.index.caps.get(name)
+            if not cap:
+                near = [c.name for c in self.index.search(name)]
+                notes.append(f"cannot mount '{name}': not in index"
+                             + (f". closest: {', '.join(near)}" if near else ""))
+                continue
+            if action == "unmount":
+                self.mounts.skills.pop(name, None)
+                client = self.mounts.mcps.pop(name, None)
+                if client:
+                    await client.stop()
+                notes.append(f"unmounted '{name}'")
+            elif cap.kind == "skill":
+                self.mounts.skills[name] = cap.ref
+                body = Path(cap.ref).read_text(errors="replace")[:6000]
+                notes.append(f"mounted skill '{name}'. Instructions follow:\n{body}")
+            else:
+                cfg = json.loads((Path.home() / ".kern" / "mcp.json").read_text())[name]
+                client = MCPClient(cfg["command"])
+                try:
+                    await client.start()
+                    self.mounts.mcps[name] = client
+                    names = ", ".join(t["name"] for t in client.tools)
+                    notes.append(f"mounted MCP '{name}'. Tools: {names}")
+                except Exception as e:
+                    notes.append(f"failed to start MCP '{name}': {e}")
+        return notes
+
+    # ---- tool dispatch ------------------------------------------------------
+
+    @staticmethod
+    def _human_desc_static(name: str, args: dict) -> str:
+        if name in ("read", "write", "edit"):
+            return f"{name} {args.get('path', '')}"
+        if name == "exec":
+            return f"$ {args.get('cmd', '')}"
+        if name == "fetch":
+            return f"fetch {args.get('url', '')}"
+        return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
+
+    async def _safe_call(self, name: str, args: dict) -> tuple[str, dict]:
+        try:
+            return await self._call_tool(name, args)
+        except Exception as e:
+            return f"error executing {name}: {type(e).__name__}: {e}", {}
+
+    async def _call_tool(self, name: str, args: dict) -> tuple[str, dict]:
+        if "__" in name and name.split("__")[0] in self.mounts.mcps:
+            return await self.mounts.call_mcp(name, args), {}
+        if name == "read":
+            return syscalls.tool_read(self.fs, **args)
+        if name == "write":
+            return syscalls.tool_write(self.fs, self.session, **args)
+        if name == "edit":
+            return syscalls.tool_edit(self.fs, self.session, **args)
+        if name == "exec":
+            return syscalls.tool_exec(self.fs, **args)
+        if name == "proc":
+            return syscalls.tool_proc(**args)
+        if name == "fetch":
+            return syscalls.tool_fetch(**args)
+        if name == "todo":
+            return syscalls.tool_todo(**args)
+        if name == "spawn":
+            report = await self._spawn(args.get("task", ""), args.get("context", ""))
+            return report, {}
+        return (f"error: unknown tool '{name}'. "
+                f"Core: read, write, edit, exec, proc, fetch, todo, spawn."), {}
+
+    async def _spawn(self, task: str, context: str) -> str:
+        if self.depth >= 2:
+            return "error: spawn depth limit reached. Answer directly."
+        child_session = create_session(cwd=self.cwd, parent=self.session.id)
+        child = Engine(self.client, self.model, child_session, self.cwd,
+                       approve=lambda *a: True, subagent_depth=self.depth + 1)
+        prompt = task + (f"\n\nContext from parent: {context}" if context else "")
+        report = await child.chat(prompt)
+        return report[:4000]
+
+    # ---- the loop ------------------------------------------------------------
+
+    async def chat(self, user_text: str) -> str:
+        self.session.emit("user", text=user_text)
+        return await self._loop()
+
+    async def _loop(self, max_steps: int = 30) -> str:
+        if not health_of(self.model) and not self.forced_fenced:
+            # never guess a model's protocol — measure it once, then remember
+            self.stream_cb("note", f"probing {self.model} capabilities…")
+            await self.client.probe(self.model)
+        final_text = ""
+        for _ in range(max_steps):
+            view = pager.materialize(self.session.events, self.session)
+            tools = self._tools()
+            system = self._system()
+            if tools is None:
+                system += ("\n\nTo act, emit a fenced block exactly like:\n"
+                           "```tool\n{\"name\": \"exec\", \"arguments\": {\"cmd\": \"ls\"}}\n```")
+
+            text_parts: list[str] = []
+            calls: list[dict] = []
+            error = ""
+            async for ev in self.client.stream_chat(self.model, view, system=system, tools=tools):
+                if ev.kind == "text":
+                    text_parts.append(ev.text)
+                    self.tokens_streamed += max(1, len(ev.text) // 4)
+                    self.stream_cb("text", ev.text)
+                elif ev.kind == "tool_call":
+                    calls.append(ev.tool_call)
+                elif ev.kind == "usage":
+                    self.last_usage = ev.usage
+                    self.usage_in += ev.usage.get("prompt_tokens", ev.usage.get("input_tokens", 0))
+                    self.usage_out += ev.usage.get("completion_tokens", ev.usage.get("output_tokens", 0))
+                elif ev.kind == "error":
+                    error = ev.error
+
+            raw_text = "".join(text_parts)
+            if error and not raw_text and not calls:
+                self.session.emit("tool_result", call_id="", text=f"engine error: {error}")
+                return f"[error from model endpoint: {error}]"
+
+            # fenced fallback parsing
+            if tools is None:
+                for m in FENCED_RE.finditer(raw_text):
+                    try:
+                        call = json.loads(m.group(1))
+                        calls.append({"id": f"fenced-{len(calls)}",
+                                      "name": call.get("name", ""),
+                                      "arguments": call.get("arguments", {})})
+                    except json.JSONDecodeError:
+                        pass
+                display = FENCED_RE.sub("", raw_text).strip()
+            else:
+                display = raw_text
+
+            self.session.emit("assistant", text=display, tool_calls=calls)
+            final_text = display or final_text
+
+            # mount directives (work in both protocols) — journaled AFTER the
+            # assistant event so the next turn never ends on a model message
+            notes = await self._handle_mount_directives(raw_text)
+            for note in notes:
+                self.session.emit("note", text=note)
+                self.stream_cb("note", note)
+
+            if not calls and not notes:
+                return final_text
+            if notes and not calls:
+                continue   # mount/list results just landed; let the model act on them
+
+            for call in calls:
+                name, args, cid = call["name"], call["arguments"], call["id"]
+                self.stream_cb("tool", json.dumps({"name": name, "arguments": args},
+                                                  ensure_ascii=False))
+                needs_ok = name in ("write", "edit", "exec") and not args.get("background")
+                if name == "exec" and syscalls.is_safe_readonly(str(args.get("cmd", ""))):
+                    needs_ok = False   # read-only inspection flows without a modal
+                ok = True
+                if needs_ok:
+                    preview = ""
+                    try:
+                        if name == "edit":
+                            preview = syscalls.preview_edit(self.fs, **args)
+                        elif name == "write":
+                            preview = syscalls.preview_write(self.fs, **args)
+                    except Exception:
+                        preview = ""
+                    desc = _human_desc(name, args)
+                    ok = self.approve(desc, preview or None)
+                    if inspect.isawaitable(ok):
+                        ok = await ok
+                if not ok:
+                    text, meta = "denied by user", {}
+                else:
+                    text, meta = await self._safe_call(name, args)
+                    text = syscalls.redact(str(text))
+                self.session.emit("tool_result", call_id=cid, name=name, text=str(text))
+                self.stream_cb("result", str(text))
+                if meta.get("diff"):
+                    self.stream_cb("diff", meta["diff"])
+                if meta.get("todo"):
+                    self.todo = meta["todo"]
+                    self.stream_cb("todo", json.dumps(meta["todo"]))
+                if meta.get("handle"):
+                    self.stream_cb("handle", meta["handle"])
+
+        return final_text + "\n[step limit reached]"

@@ -1,0 +1,52 @@
+[
+ {
+  "model": "gpt-5.4-mini",
+  "task": "write_and_run",
+  "ok": false,
+  "seconds": 300.0,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "TimeoutError: ",
+  "steps": 0
+ },
+ {
+  "model": "gpt-5.4-mini",
+  "task": "edit_existing",
+  "ok": false,
+  "seconds": 300.0,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "TimeoutError: ",
+  "steps": 0
+ },
+ {
+  "model": "gpt-5.4-mini",
+  "task": "debug_test",
+  "ok": false,
+  "seconds": 300.0,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "TimeoutError: ",
+  "steps": 0
+ },
+ {
+  "model": "gpt-5.4-mini",
+  "task": "fetch_and_answer",
+  "ok": false,
+  "seconds": 300.0,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "TimeoutError: ",
+  "steps": 0
+ },
+ {
+  "model": "gpt-5.4-mini",
+  "task": "plan_and_background",
+  "ok": false,
+  "seconds": 300.0,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "TimeoutError: ",
+  "steps": 0
+ }
+]
