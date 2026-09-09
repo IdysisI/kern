@@ -1,6 +1,0 @@
-fix: crash on session resume — escape all [ when embedding dynamic text in markup
-
-textual.markup.escape only escapes well-formed [tag] patterns, so a bare
-[ before = or other chars (common in grep/rg output, CSS comments) slipped
-through and broke markup parsing with MarkupError. Replace with safe() that
-escapes every [ (after protecting backslashes) and leaves ] alone.
