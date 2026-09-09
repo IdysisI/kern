@@ -117,16 +117,24 @@ def list_sessions() -> list[str]:
     return sorted(p.name for p in SESSIONS.iterdir() if p.is_dir())
 
 
-def session_previews(limit: int = 30) -> list[dict]:
-    """id, cwd, started, first user message — for the resume picker."""
+def session_previews(limit: int = 50) -> list[dict]:
+    """id, cwd, started, first user message — for the resume picker, sorted by last updated."""
     out = []
-    for sid in reversed(list_sessions()):
+    for sid in list_sessions():
         s = Session(sid)
+        if not s.events:
+            continue
         meta = s.meta()
         first_user = next((e.get("text", "") for e in s.events if e["kind"] == "user"), "")
         n_user = sum(1 for e in s.events if e["kind"] == "user")
-        out.append({"id": sid, "cwd": meta.get("cwd", "?"), "turns": n_user,
-                    "preview": first_user[:80], "ts": s.events[0]["ts"] if s.events else 0})
-        if len(out) >= limit:
-            break
-    return out
+        last_ts = s.events[-1].get("ts", s.log.stat().st_mtime if s.log.exists() else 0)
+        out.append({
+            "id": sid,
+            "cwd": meta.get("cwd", "?"),
+            "turns": n_user,
+            "preview": first_user[:80],
+            "ts": last_ts
+        })
+    # Sort by most recently active session first!
+    out.sort(key=lambda r: r["ts"], reverse=True)
+    return out[:limit]

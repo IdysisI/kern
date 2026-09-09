@@ -712,7 +712,10 @@ class KernApp(App):
             eng = self._engine()
             self._chat_note("\n".join(eng.index.lines()) or "(empty index)")
         elif cmd == "/resume":
-            self.action_resume()
+            if arg:
+                self._load_session(arg)
+            else:
+                self.action_resume()
         elif cmd == "/clear":
             self.action_clear()
         else:
