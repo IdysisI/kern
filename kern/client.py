@@ -85,10 +85,13 @@ class StallError(Exception):
 
 
 def default_max_output_tokens(model: str) -> int:
+    """Give models full, unconstrained output budgets for deep reasoning and large files."""
     low = model.lower()
-    if any(k in low for k in ("glm-5", "claude-", "deepseek", "minimax", "mimo", "gemini", "gpt-5", "gpt-4")):
-        return 32768
-    return 8192
+    if "gemini" in low:
+        # Gemini physical API ceiling for generation
+        return 65536
+    # 128k output ceiling for GLM-5, MiniMax, Claude, DeepSeek, GPT-5, etc.
+    return 128000
 
 
 def protocol_for(model: str) -> str:
