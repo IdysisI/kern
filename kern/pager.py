@@ -123,9 +123,17 @@ def materialize(events: list[dict], session) -> list[dict]:
             if rh:
                 seen_result_hashes[rh] = ev.get("n", i)
             if i in keep_inline:
-                # recent: keep inline (squashed if huge)
+                # recent: keep inline, squashed if huge — but never lose bytes:
+                # the full output goes to scratch/ with a recovery pointer.
+                out_text = _squash(text)
+                if len(text) > BIG:
+                    full = session.scratch / f"t{ev['n']}.txt"
+                    if not full.exists():
+                        session.offload(f"t{ev['n']}", text)
+                    out_text += (f"\n[full output: {full} — use read(path) "
+                                 f"with offset/limit to inspect any part]")
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
-                             "text": _squash(text)})
+                             "text": out_text})
             elif n - i > STALE_AGE and len(text) > STALE_MIN and not ev.get("paged"):
                 # old + bulky: offload to scratch, leave a pointer
                 path = session.offload(f"t{ev['n']}", text)
