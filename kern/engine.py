@@ -161,13 +161,15 @@ class Engine:
             return syscalls.tool_fetch(**args)
         if name == "search":
             return syscalls.tool_search(self.fs, **args)
+        if name == "memory":
+            return syscalls.tool_memory(self.session, self.cwd, **args)
         if name == "todo":
             return syscalls.tool_todo(**args)
         if name == "spawn":
             report = await self._spawn(args.get("task", ""), args.get("context", ""))
             return report, {}
         return (f"error: unknown tool '{name}'. "
-                f"Core: read, write, edit, exec, proc, fetch, search, todo, spawn."), {}
+                f"Core: read, write, edit, exec, proc, fetch, search, memory, todo, spawn."), {}
 
     async def _spawn(self, task: str, context: str) -> str:
         if self.depth >= 2:
@@ -255,6 +257,14 @@ class Engine:
                 raise RuntimeError("empty summary")
             upto_n = to_compact[-1]["n"] + 1
             dropped = self.session.compact_into(upto_n, summary.strip())
+            # L2 deposit: the summary lands in this project's memory tree
+            # (query-only: it is NOT injected anywhere — the model must ask)
+            try:
+                from kern.memory import MemoryTree
+                where = MemoryTree(self.cwd).absorb(self.session.id, summary.strip())
+                self.stream_cb("note", f"summary saved to {where}")
+            except Exception as me:
+                self.stream_cb("note", f"memory absorb failed: {me}")
             self.stream_cb("note", f"compacted: {dropped} events -> summary "
                                    f"({len(summary)} chars), {len(kept)} kept verbatim")
             self._compact_fails = 0
