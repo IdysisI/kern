@@ -212,6 +212,13 @@ class Engine:
         """
         if getattr(self, "_compact_fails", 0) >= 3:
             return False
+        # Never compact twice on the same turn's state: if a compact event
+        # landed after the last user message, give the model time to use the
+        # fresh summary before considering another pass.
+        last_user = max((i for i, ev in enumerate(self.session.events)
+                         if ev["kind"] == "user"), default=-1)
+        if any(ev["kind"] == "compact" for ev in self.session.events[last_user + 1:]):
+            return False
         b = pager.budget(self.session.events, self.session)
         if not b.get("should_compact"):
             return False
@@ -360,6 +367,10 @@ class Engine:
                 if not ok:
                     text, meta = "denied by user", {}
                 else:
+                    # Action receipt: record intent BEFORE the effect, so a
+                    # crash mid-call leaves a dangling intent the pager can
+                    # flag as "uncertain — verify before retry".
+                    self.session.emit("action", call_id=cid, name=name)
                     text, meta = await self._safe_call(name, args)
                     text = syscalls.redact(str(text))
                 self.session.emit("tool_result", call_id=cid, name=name, text=str(text),

@@ -16,6 +16,7 @@ for turn in range(15):
 view = pager.materialize(sess.events, sess)
 total_chars = sum(len(m.get("text", "")) for m in view)
 n_paged = sum(1 for m in view if "old tool result cleared" in m.get("text", ""))
+n_dup = sum(1 for m in view if "identical to tool result" in m.get("text", ""))
 n_full = sum(1 for m in view if m["role"] == "tool" and len(m.get("text", "")) > 5000)
 print(f"events: {len(sess.events)}")
 print(f"view messages: {len(view)}")
@@ -24,5 +25,5 @@ print(f"tool results paged to scratch: {n_paged}")
 print(f"tool results still >5k chars: {n_full}")
 print(f"scratch files: {len(list(sess.scratch.glob('*')))}")
 assert total_chars < 12000 * 3, f"context rot! {total_chars} chars"
-assert n_paged >= 10
+assert n_paged >= 10 or n_dup >= 10, f"neither paged ({n_paged}) nor deduped ({n_dup})"
 print("PASS: turn-15 context stays lean")

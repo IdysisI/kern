@@ -44,6 +44,14 @@ def _squash(text: str) -> str:
     return (text[:HEAD] + f"\n\n…[{(len(text) - HEAD - TAIL):,} bytes elided]…\n\n" + text[-TAIL:])
 
 
+def _rhash(text: str) -> str:
+    """Stable short hash for tool-result dedup. Empty/short results skip."""
+    if len(text) < 200:
+        return ""
+    import hashlib
+    return hashlib.md5(text.encode("utf-8", "replace")).hexdigest()
+
+
 def _clear_tool_args(tool_calls: list[dict]) -> list[dict]:
     """Tier 1b: strip bulky file bodies from assistant write/edit calls.
 
@@ -73,6 +81,7 @@ def materialize(events: list[dict], session) -> list[dict]:
 
     msgs: list[dict] = []
     n = len(events)
+    seen_result_hashes: dict[str, int] = {}   # dedup pass: identical tool outputs
     for i, ev in enumerate(events):
         kind = ev["kind"]
         if kind == "user":
@@ -86,8 +95,33 @@ def materialize(events: list[dict], session) -> list[dict]:
             if ev.get("tool_calls"):
                 m["tool_calls"] = _clear_tool_args(ev["tool_calls"])
             msgs.append(m)
+        elif kind == "action":
+            # intent receipt (written BEFORE a side-effectful tool runs).
+            # If no tool_result follows for this call_id, the run died
+            # mid-action: the effect may or may not have happened.
+            if not ev.get("reconciled") and not any(
+                    e.get("call_id") == ev.get("call_id") and e["kind"] == "tool_result"
+                    for e in events[i + 1:]):
+                msgs.append({"role": "user",
+                             "text": f"<system-note>⚠ action '{ev.get('name', '?')}' "
+                                     f"(call {ev.get('call_id')}) was dispatched but no "
+                                     f"result was recorded — the run was interrupted. "
+                                     f"Before retrying, VERIFY the actual state with "
+                                     f"read/exec; the effect may have partially or "
+                                     f"fully happened.</system-note>"})
+            continue
         elif kind == "tool_result":
             text = ev.get("text", "")
+            # dedup pass: identical outputs already in the view cost pure tokens
+            rh = _rhash(text)
+            if rh and rh in seen_result_hashes:
+                first_n = seen_result_hashes[rh]
+                msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
+                             "text": f"[identical to tool result #{first_n} — "
+                                     f"{len(text):,} bytes, read(path/scratch) if needed]"})
+                continue
+            if rh:
+                seen_result_hashes[rh] = ev.get("n", i)
             if i in keep_inline:
                 # recent: keep inline (squashed if huge)
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
@@ -150,6 +184,11 @@ Rules:
   9. next_step — the single most likely next action
 
 Keep it under {max_chars} characters. Be specific: paths, identifiers, error strings.
+- In files_touched, state the FINAL state of each file (what the code does now),
+  not just "I edited it". Include short direct quotes of critical lines/IDs where
+  precision matters (exact function names, ports, error strings).
+- current_state must be concrete enough that the agent can act WITHOUT re-reading
+  the dropped turns. If a file's exact content matters, say what to re-read.
 """
 
 
