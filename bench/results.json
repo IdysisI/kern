@@ -1,52 +1,62 @@
 [
  {
-  "model": "gpt-5.4-mini",
+  "model": "MiniMax-M3",
   "task": "write_and_run",
-  "ok": false,
-  "seconds": 300.0,
-  "tok_in": 0,
-  "tok_out": 0,
-  "error": "TimeoutError: ",
-  "steps": 0
+  "ok": true,
+  "seconds": 8.7,
+  "tok_in": 7554,
+  "tok_out": 133,
+  "error": "",
+  "steps": 2
  },
  {
-  "model": "gpt-5.4-mini",
+  "model": "MiniMax-M3",
   "task": "edit_existing",
-  "ok": false,
-  "seconds": 300.0,
-  "tok_in": 0,
-  "tok_out": 0,
-  "error": "TimeoutError: ",
-  "steps": 0
+  "ok": true,
+  "seconds": 7.0,
+  "tok_in": 10805,
+  "tok_out": 176,
+  "error": "",
+  "steps": 3
  },
  {
-  "model": "gpt-5.4-mini",
+  "model": "MiniMax-M3",
   "task": "debug_test",
-  "ok": false,
-  "seconds": 300.0,
-  "tok_in": 0,
-  "tok_out": 0,
-  "error": "TimeoutError: ",
-  "steps": 0
+  "ok": true,
+  "seconds": 17.7,
+  "tok_in": 17104,
+  "tok_out": 394,
+  "error": "",
+  "steps": 5
  },
  {
-  "model": "gpt-5.4-mini",
+  "model": "MiniMax-M3",
   "task": "fetch_and_answer",
-  "ok": false,
-  "seconds": 300.0,
-  "tok_in": 0,
-  "tok_out": 0,
-  "error": "TimeoutError: ",
-  "steps": 0
+  "ok": true,
+  "seconds": 3.7,
+  "tok_in": 4946,
+  "tok_out": 98,
+  "error": "",
+  "steps": 1
  },
  {
-  "model": "gpt-5.4-mini",
+  "model": "MiniMax-M3",
   "task": "plan_and_background",
-  "ok": false,
-  "seconds": 300.0,
-  "tok_in": 0,
-  "tok_out": 0,
-  "error": "TimeoutError: ",
-  "steps": 0
+  "ok": true,
+  "seconds": 25.8,
+  "tok_in": 29511,
+  "tok_out": 2805,
+  "error": "",
+  "steps": 7
+ },
+ {
+  "model": "MiniMax-M3",
+  "task": "giant_output",
+  "ok": true,
+  "seconds": 40.2,
+  "tok_in": 10962,
+  "tok_out": 609,
+  "error": "",
+  "steps": 3
  }
 ]

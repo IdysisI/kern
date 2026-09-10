@@ -112,7 +112,7 @@ async def main():
     models = sys.argv[1:] or DEFAULT_MODELS
     client = Client()
     results = []
-    sem = asyncio.Semaphore(4)
+    sem = asyncio.Semaphore(1)
 
     async def guarded(model, task):
         async with sem:
