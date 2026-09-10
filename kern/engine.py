@@ -159,13 +159,15 @@ class Engine:
             return syscalls.tool_proc(**args)
         if name == "fetch":
             return syscalls.tool_fetch(**args)
+        if name == "search":
+            return syscalls.tool_search(self.fs, **args)
         if name == "todo":
             return syscalls.tool_todo(**args)
         if name == "spawn":
             report = await self._spawn(args.get("task", ""), args.get("context", ""))
             return report, {}
         return (f"error: unknown tool '{name}'. "
-                f"Core: read, write, edit, exec, proc, fetch, todo, spawn."), {}
+                f"Core: read, write, edit, exec, proc, fetch, search, todo, spawn."), {}
 
     async def _spawn(self, task: str, context: str) -> str:
         if self.depth >= 2:
@@ -181,7 +183,79 @@ class Engine:
 
     async def chat(self, user_text: str) -> str:
         self.session.emit("user", text=user_text)
+        self._autocheckpoint()
         return await self._loop()
+
+    def _autocheckpoint(self) -> None:
+        """Snapshot dirty files of the cwd git repo (if any) so /undo can
+        restore both the journal AND the working tree. Silent on failure."""
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["git", "status", "--porcelain"], cwd=self.fs.cwd,
+                capture_output=True, text=True, timeout=5)
+            if out.returncode != 0:
+                return
+            files = [l[3:] for l in out.stdout.splitlines() if l.strip()]
+            files = [str(Path(self.fs.cwd) / f) for f in files
+                     if not f.startswith("bench/")][:50]
+            if files:
+                self.session.checkpoint(files)
+        except Exception:
+            pass
+
+    async def _maybe_compact(self) -> bool:
+        """Tier-2 compaction: if the materialized view exceeds KERN_COMPACT_AT,
+        ask the model to summarize the old turns into a single `compact` event
+        (user messages stay verbatim). Anchored merge: the summary REPLACES the
+        old turns instead of being appended. Circuit breaker: 3 failures -> off.
+        """
+        if getattr(self, "_compact_fails", 0) >= 3:
+            return False
+        b = pager.budget(self.session.events, self.session)
+        if not b.get("should_compact"):
+            return False
+        to_compact, kept = pager.compaction_view(self.session.events)
+        if not to_compact:
+            return False
+        self.stream_cb("note", f"compacting {len(to_compact)} old events "
+                               f"(~{b['approx_tokens']:,} tokens)…")
+        # Render the old events as plain text for the summarizer
+        lines = []
+        for ev in to_compact:
+            k = ev["kind"]
+            if k == "assistant":
+                lines.append(f"[assistant] {ev.get('text', '')[:1500]}")
+                for tc in ev.get("tool_calls", []):
+                    lines.append(f"  -> tool {tc.get('name')}({json.dumps(tc.get('arguments', {}), ensure_ascii=False)[:300]})")
+            elif k == "tool_result":
+                lines.append(f"[tool:{ev.get('name', '?')}] {ev.get('text', '')[:800]}")
+            elif k == "note":
+                lines.append(f"[note] {ev.get('text', '')[:300]}")
+        blob = "\n".join(lines)[:60000]
+        prompt = pager.COMPACT_PROMPT.format(max_chars=3000)
+        try:
+            summary = ""
+            async for ev in self.client.stream_chat(
+                    self.model, [{"role": "user", "text": prompt + "\n\n<events>\n" + blob + "\n</events>"}],
+                    system="You write concise, structured session summaries. Output only the <summary> block.",
+                    tools=None, max_tokens=4096):
+                if ev.kind == "text":
+                    summary += ev.text
+                elif ev.kind == "error":
+                    raise RuntimeError(ev.error)
+            if not summary.strip():
+                raise RuntimeError("empty summary")
+            upto_n = to_compact[-1]["n"] + 1
+            dropped = self.session.compact_into(upto_n, summary.strip())
+            self.stream_cb("note", f"compacted: {dropped} events -> summary "
+                                   f"({len(summary)} chars), {len(kept)} kept verbatim")
+            self._compact_fails = 0
+            return True
+        except Exception as e:
+            self._compact_fails = getattr(self, "_compact_fails", 0) + 1
+            self.stream_cb("note", f"compact failed ({self._compact_fails}/3): {e}")
+            return False
 
     async def _loop(self, max_steps: int = 30) -> str:
         if not health_of(self.model) and not self.forced_fenced:
@@ -190,6 +264,7 @@ class Engine:
             await self.client.probe(self.model)
         final_text = ""
         for _ in range(max_steps):
+            await self._maybe_compact()
             view = pager.materialize(self.session.events, self.session)
             tools = self._tools()
             system = self._system()
@@ -287,7 +362,8 @@ class Engine:
                 else:
                     text, meta = await self._safe_call(name, args)
                     text = syscalls.redact(str(text))
-                self.session.emit("tool_result", call_id=cid, name=name, text=str(text))
+                self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
+                                   diff=meta.get("diff") or None)
                 self.stream_cb("result", str(text))
                 if meta.get("diff"):
                     self.stream_cb("diff", meta["diff"])

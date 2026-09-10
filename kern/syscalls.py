@@ -27,11 +27,12 @@ from pathlib import Path
 SCHEMAS = [
     {"type": "function", "function": {
         "name": "read",
-        "description": "Read a slice of a file (numbered lines). Prefer slices over whole files.",
+        "description": "Read a slice of a file (numbered lines). Prefer slices over whole files. Set full=true to get the entire file (only if under 2000 lines).",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
             "offset": {"type": "integer", "description": "first line, 1-based (default 1)"},
-            "limit": {"type": "integer", "description": "max lines (default 200)"}},
+            "limit": {"type": "integer", "description": "max lines (default 200)"},
+            "full": {"type": "boolean", "description": "return whole file if under 2000 lines"}},
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "write",
@@ -41,9 +42,11 @@ SCHEMAS = [
             "required": ["path", "content"]}}},
     {"type": "function", "function": {
         "name": "edit",
-        "description": "Replace an exact unique string in a file. old_str must match exactly once, whitespace included; widen it with surrounding lines if it does not.",
+        "description": "Replace an exact unique string in a file. If old_str fails, use start_line/end_line (1-based, inclusive) to replace a line range instead.",
         "parameters": {"type": "object", "properties": {
-            "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"}},
+            "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"},
+            "start_line": {"type": "integer", "description": "first line to replace (1-based)"},
+            "end_line": {"type": "integer", "description": "last line to replace (inclusive)"}},
             "required": ["path", "old_str", "new_str"]}}},
     {"type": "function", "function": {
         "name": "exec",
@@ -68,6 +71,15 @@ SCHEMAS = [
             "url": {"type": "string"},
             "max_chars": {"type": "integer", "description": "default 12000"}},
             "required": ["url"]}}},
+    {"type": "function", "function": {
+        "name": "search",
+        "description": "Search file contents with ripgrep. Returns structured results: path:line:snippet. Use for finding patterns, TODOs, function definitions, etc. Faster than exec(rg) because results are pre-filtered and truncated.",
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "regex or literal string to search for"},
+            "path": {"type": "string", "description": "directory or file to search in (default: cwd)"},
+            "include": {"type": "string", "description": "glob filter, e.g. '*.py' or 'src/**/*.ts'"},
+            "max_results": {"type": "integer", "description": "max results to return (default 50)"}},
+            "required": ["pattern"]}}},
     {"type": "function", "function": {
         "name": "todo",
         "description": "Set the live task list for this turn's plan. Each item: {text, status: pending|active|done}. Update it as you progress.",
@@ -114,7 +126,11 @@ def _unified_diff(path: Path, old: str, new: str) -> str:
     return "\n".join(diff)
 
 
-def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200) -> tuple[str, dict]:
+def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
+              full: bool = False) -> tuple[str, dict]:
+    """Read a file. By default returns a numbered slice. If full=True and the
+    file is under 2000 lines, returns the entire content. Otherwise returns
+    the numbered slice (offset/limit)."""
     p = fs.resolve(path)
     if p.is_dir():
         entries = sorted(os.listdir(p))[:200]
@@ -123,6 +139,12 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200) -> tuple[str
         near = difflib.get_close_matches(str(p), [str(x) for x in p.parent.glob("*")], n=3)
         return (f"error: no such file: {p}"
                 + (f"\ndid you mean: {', '.join(near)}" if near else "")), {}
+    if full:
+        text = p.read_text(errors="replace")
+        if len(text.splitlines()) <= 2000:
+            return text, {}
+        return (f"error: file too large for full read ({len(text.splitlines())} lines). "
+                f"Use offset/limit instead."), {}
     return _numbered(p, offset, limit), {}
 
 
@@ -141,19 +163,48 @@ def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
     return msg, {"diff": diff, "path": str(p)}
 
 
-def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str) -> tuple[str, dict]:
+def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
+              start_line: int = 0, end_line: int = 0) -> tuple[str, dict]:
+    """Edit a file. By default replaces exact old_str with new_str.
+    If old_str fails and start_line/end_line are given, replaces that line
+    range with new_str instead (1-based, inclusive)."""
     p = fs.resolve(path)
     if not p.exists():
         return f"error: no such file: {p}. Use write() to create it.", {}
     src = p.read_text(errors="replace")
+    lines = src.splitlines()
+
+    # Line-range mode: use when old_str is empty or fails
+    if start_line > 0 and end_line > 0:
+        if start_line < 1 or end_line > len(lines) or start_line > end_line:
+            return (f"error: invalid line range {start_line}-{end_line} "
+                    f"(file has {len(lines)} lines)"), {}
+        new_lines = lines[:start_line - 1] + new_str.splitlines() + lines[end_line:]
+        new_src = "\n".join(new_lines)
+        session.checkpoint([str(p)])
+        p.write_text(new_src)
+        diff = _unified_diff(p, src, new_src)
+        msg = f"edited {p} (lines {start_line}-{end_line})"
+        if p.suffix == ".py":
+            ok, err = _py_compile(p)
+            if not ok:
+                msg += f"\nWARNING post-check failed:\n{err}"
+        return msg, {"diff": diff, "path": str(p)}
+
+    # Exact-string mode
+    if not old_str:
+        return ("error: old_str is empty. Use start_line/end_line to specify "
+                "a line range, or provide the exact string to replace."), {}
     count = src.count(old_str)
     if count == 0:
         hint = _fuzzy_hint(src, old_str)
         return (f"error: old_str not found in {p}. No changes made.\n"
-                f"Check whitespace/exact text. Closest region:\n{hint}"), {}
+                f"Check whitespace/exact text, or use start_line/end_line. "
+                f"Closest region:\n{hint}"), {}
     if count > 1:
         return (f"error: old_str matches {count} times in {p}. No changes made.\n"
-                f"Include more surrounding lines so it is unique."), {}
+                f"Include more surrounding lines so it is unique, or use "
+                f"start_line/end_line."), {}
     session.checkpoint([str(p)])
     new_src = src.replace(old_str, new_str, 1)
     p.write_text(new_src)
@@ -162,7 +213,7 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str) -> tuple[s
     if p.suffix == ".py":
         ok, err = _py_compile(p)
         if not ok:
-            msg += f"\nWARNING post-check failed — the file does not compile:\n{err}\nFix it with another edit()."
+            msg += f"\nWARNING post-check failed:\n{err}"
     return msg, {"diff": diff, "path": str(p)}
 
 
@@ -207,7 +258,9 @@ def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False) -> 
     out = (r.stdout or "") + (f"\n[stderr]\n{r.stderr}" if r.stderr else "")
     if len(out) > 8000:
         out = out[:3800] + f"\n\n…[{len(out)-7600:,} bytes elided]…\n\n" + out[-3800:]
-    return f"exit={r.returncode}\n{out}".rstrip(), {}
+    return (f"exit={r.returncode}\n{out}".rstrip(),
+            {"exit_code": r.returncode, "stdout": r.stdout or "",
+             "stderr": r.stderr or "", "timed_out": False})
 
 
 def tool_proc(handle: str, action: str, tail: int = 40) -> tuple[str, dict]:
@@ -386,3 +439,56 @@ def redact(text: str) -> str:
         else:
             text = rule.sub("[redacted-by-kern]", text)
     return text
+
+
+# ---- search tool ------------------------------------------------------------
+
+def tool_search(fs: FS, pattern: str, path: str = "",
+                include: str = "", max_results: int = 50) -> tuple[str, dict]:
+    """Search file contents with ripgrep. Returns structured results:
+    path:line:snippet. Much faster than exec(rg) because results are
+    pre-filtered, truncated, and returned as structured data."""
+    search_path = fs.resolve(path) if path else fs.cwd
+    if not search_path.exists():
+        return f"error: no such path: {search_path}", {}
+
+    cmd = ["rg", "--line-number", "--no-heading", "--color=never",
+           "--max-count", str(max_results)]
+    if include:
+        cmd.extend(["--glob", include])
+    cmd.extend([pattern, str(search_path)])
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=30, cwd=fs.cwd)
+    except FileNotFoundError:
+        return ("error: ripgrep (rg) not found. Install it or use exec(grep) instead."), {}
+    except subprocess.TimeoutExpired:
+        return "error: search timed out after 30s", {}
+
+    lines = r.stdout.splitlines()
+    if not lines:
+        return f"no matches for '{pattern}' in {search_path}", {}
+
+    # Truncate if too many results
+    truncated = len(lines) > max_results
+    if truncated:
+        lines = lines[:max_results]
+
+    # Format: path:line:snippet (truncate long snippets)
+    out = []
+    for line in lines:
+        # rg output is path:line:content
+        parts = line.split(":", 2)
+        if len(parts) >= 3:
+            snippet = parts[2].strip()
+            if len(snippet) > 120:
+                snippet = snippet[:117] + "..."
+            out.append(f"{parts[0]}:{parts[1]}: {snippet}")
+        else:
+            out.append(line[:120])
+
+    result = "\n".join(out)
+    if truncated:
+        result += f"\n… and {len(lines) - max_results} more results (truncated)"
+    return result, {}

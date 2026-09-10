@@ -15,7 +15,7 @@ for turn in range(15):
 
 view = pager.materialize(sess.events, sess)
 total_chars = sum(len(m.get("text", "")) for m in view)
-n_paged = sum(1 for m in view if "paged out" in m.get("text", ""))
+n_paged = sum(1 for m in view if "old tool result cleared" in m.get("text", ""))
 n_full = sum(1 for m in view if m["role"] == "tool" and len(m.get("text", "")) > 5000)
 print(f"events: {len(sess.events)}")
 print(f"view messages: {len(view)}")

@@ -55,6 +55,24 @@ Screen { background: transparent; }
 #prompt { border: round $border; color: $text; height: auto; max-height: 9; min-height: 3;
           background: transparent; }
 #prompt:focus { border: round $primary; }
+/* Cursor: a solid bright block, like a terminal caret.
+   Textual's :ansi default is text-style: reverse with ansi_default colors —
+   most terminals render "reverse of default" as BLACK, which read as a
+   black background eating the first placeholder letter. Instead we paint
+   the cursor cell with the foreground color (no reverse), so it's a solid
+   light block that blinks in place and never looks like a missing letter
+   or a black bar. Character under it is painted the same color (invisible). */
+#prompt .text-area--cursor {
+    background: $foreground;
+    color: $foreground;
+    text-style: none;
+}
+/* Cursor line: keep it transparent — Textual's default paints it $boost,
+   which resolves to near-black in :ansi and reads as a black bar behind
+   the typed text. */
+#prompt .text-area--cursor-line {
+    background: transparent;
+}
 #bar { dock: bottom; height: 1; color: $text-muted; padding: 0 2; }
 
 .user { border: round $border; padding: 0 1; margin: 1 6 0 0; }
@@ -173,10 +191,13 @@ class ToolCard(Static):
         self._redraw()
 
     def _redraw(self):
-        if self.result is None:
-            return
-        ok = not self.result.startswith(("error", "denied"))
-        mark = "[#9ece6a]✓[/]" if ok else "[#f7768e]✗[/]"
+        if self.result is None and self.diff is None:
+            return   # nothing to show yet — keep the pending look
+        if self.result is not None:
+            ok = not self.result.startswith(("error", "denied"))
+            mark = "[#9ece6a]✓[/]" if ok else "[#f7768e]✗[/]"
+        else:
+            mark = "[#e0af68]⠿[/]"   # diff arrived before the result — still running
         icon = TOOL_ICON.get(self.tname, "▸")
         head = (f"{mark} [#e0af68]{icon}[/] [bold]{safe(self.tname)}[/] "
                 f"[dim]{safe(self._headline(self.tname, self.args))}[/]\n")
@@ -311,22 +332,21 @@ class PromptArea(TextArea):
         self.border_title = "›"
         self.past: list[str] = []
         self._hi: int | None = None
-        # Same prefix as border_title so the first character is visually
-        # distinct (it's a glyph, not a letter) and survives the cursor's
-        # text-style: reverse without looking like a missing/odd letter.
-        # Combined with cursor_blink=False below, the placeholder no longer
-        # reads as a gray letter that blinks.
-        self.placeholder = "›  ask, plan, build…   (enter sends · ctrl+j newline · /help)"
+        self.placeholder = "ask, plan, build…   (enter sends · ctrl+j newline · /help)"
         self.compact = True
-        # Don't blink the cursor: blinking + reverse on the placeholder
-        # letter made the placeholder look like a broken gray letter.
-        self.cursor_blink = False
 
     def on_key(self, event):
         if event.key == "enter":
             event.prevent_default()
             event.stop()
             self.post_message(self.Submitted(self))
+        elif event.key == "shift+space":
+            # kitty keyboard protocol delivers shift+space as a named key
+            # with no character, so TextArea._on_key drops it (is_printable
+            # is False). Insert a space explicitly.
+            event.prevent_default()
+            event.stop()
+            self._replace_via_keyboard(" ", *self.selection)
         elif event.key == "up" and self.past and self.cursor_location[0] == 0:
             self._hi = len(self.past) - 1 if self._hi is None else max(0, self._hi - 1)
             self.load_text(self.past[self._hi])
@@ -678,9 +698,8 @@ class KernApp(App):
         if pick:
             self._load_session(pick)
 
-    def _load_session(self, sid: str):
-        """Replay a journal back into widgets — the log is the truth."""
-        self.session = Session(sid)
+    def _render_journal(self):
+        """Replay the current session's journal back into widgets."""
         for w in list(self.chat.children):
             w.remove()
         self._todo_card = None
@@ -702,11 +721,20 @@ class KernApp(App):
                 hit = calls_by_id.get(ev.get("call_id", ""))
                 if hit:
                     hit[2].set_result(ev.get("text", ""))
+                    if ev.get("diff"):
+                        hit[2].set_diff(ev["diff"])
             elif kind == "note":
                 self._chat_note("◈ " + ev.get("text", "").splitlines()[0])
+            elif kind == "compact":
+                self._chat_note(f"◈ session compacted ({ev.get('covers', '?')} events)")
         self._refresh_chrome()
-        self._chat_note(f"resumed {sid} — {len(self.session.events)} events replayed")
         self.chat.scroll_end(animate=False)
+
+    def _load_session(self, sid: str):
+        """Replay a journal back into widgets — the log is the truth."""
+        self.session = Session(sid)
+        self._render_journal()
+        self._chat_note(f"resumed {sid} — {len(self.session.events)} events replayed")
 
     # ---- slash commands ------------------------------------------------------
 
@@ -750,6 +778,34 @@ class KernApp(App):
         elif cmd == "/rewind" and arg.isdigit():
             restored = self.session.restore(int(arg))
             self._chat_note(f"restored: {restored}")
+        elif cmd == "/undo":
+            n = self.session.undo_to_last_user()
+            if n:
+                # also restore the working tree from the latest checkpoint
+                # taken at that user message, if one exists
+                try:
+                    ckpts = sorted(self.session.ckpt.glob("c*"),
+                                   key=lambda p: int(p.name[1:]))
+                    for c in reversed(ckpts):
+                        import json as _json
+                        man = _json.loads((c / "manifest.json").read_text())
+                        if man.get("event_n", 1 << 30) <= len(self.session.events):
+                            restored = self.session.restore(int(c.name[1:]))
+                            self._chat_note(
+                                f"↩ undo: dropped {n} events back to your last prompt"
+                                + (f"; files restored from {c.name}" if restored else ""))
+                            break
+                    else:
+                        self._chat_note(f"↩ undo: dropped {n} events (journal only)")
+                except Exception:
+                    self._chat_note(f"↩ undo: dropped {n} events (journal only)")
+            else:
+                self._chat_note("nothing to undo")
+            # rebuild the visible chat from the journal
+            for w in list(self.chat.children):
+                w.remove()
+            self._todo_card = None
+            self._render_journal()
         elif cmd == "/fork":
             child = self.session.fork(int(arg) if arg.isdigit() else None)
             self.session = child
@@ -798,7 +854,7 @@ class KernApp(App):
 
 HELP = ("/model <name> · ctrl-p model picker · /probe re-handshake\n"
         "/new fresh session · /resume (ctrl+r) pick an old session\n"
-        "/fork [n] branch · /rewind <n> checkpoint · /usage tokens+$\n"
+        "/fork [n] branch · /rewind <n> checkpoint · /undo last turn\n"
         "/context budget · /tools capability index · /clear screen\n"
         "in-chat mounts: [mount: name] · [list capabilities] · [unmount: name]")
 
