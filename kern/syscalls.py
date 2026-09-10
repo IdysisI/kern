@@ -309,12 +309,21 @@ def tool_proc(handle: str, action: str, tail: int = 40) -> tuple[str, dict]:
             proc.kill()
         return f"{handle} killed", {}
     if action == "logs":
+        # Non-blocking drain: a LIVE, quiet process never blocks the engine.
+        # (readline() on a live pipe hangs forever waiting for the next line.)
         try:
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                h["buf"] += line
+            fd = proc.stdout.fileno()
+            os.set_blocking(fd, False)
+            try:
+                while True:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
+                        break          # EOF: process exited
+                    h["buf"] += chunk.decode(errors="replace")
+            except BlockingIOError:
+                pass                    # live process, no more data right now
+            finally:
+                os.set_blocking(fd, True)
         except Exception:
             pass
         lines = h["buf"].splitlines()

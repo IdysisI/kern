@@ -58,6 +58,13 @@ TASKS = [
         "check": "test -f serve_check.py",
         "min_steps": 4,   # todo + write + exec(background) + proc/curl...
     },
+    {
+        "id": "giant_output",
+        "seed": {"bigdata.txt": "".join(f"line-{i:05d}: {'payload ' * 6}\n" for i in range(20000))},
+        "prompt": ("bigdata.txt is large. Find the exact content of line 12345 and write ONLY that line's "
+                   "number and text to found.txt, then verify found.txt matches bigdata.txt's line 12345."),
+        "check": "test -f found.txt && grep -q 'line-12344' found.txt",
+    },
 ]
 
 DEFAULT_MODELS = ["gemini-3.8-flash-api", "claude-haiku-4-5-20251001",
