@@ -96,7 +96,10 @@ def materialize(events: list[dict], session) -> list[dict]:
         elif kind == "assistant":
             m = {"role": "assistant", "text": ev.get("text", "")}
             if ev.get("tool_calls"):
-                m["tool_calls"] = _clear_tool_args(ev["tool_calls"])
+                # internal bookkeeping keys (kern_error, ...) never leave the journal
+                m["tool_calls"] = [{k: v for k, v in tc.items() if not k.startswith("_")
+                                    and k != "kern_error"}
+                                   for tc in _clear_tool_args(ev["tool_calls"])]
             msgs.append(m)
         elif kind == "action":
             # intent receipt (written BEFORE a side-effectful tool runs).

@@ -19,6 +19,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import random as _random
+import string as _string
+
+_GIANT_SECRET = "".join(_random.choices(_string.ascii_lowercase + _string.digits, k=12))
+
 from kern.client import Client
 from kern.engine import Engine
 from kern.journal import create_session
@@ -59,11 +64,16 @@ TASKS = [
         "min_steps": 4,   # todo + write + exec(background) + proc/curl...
     },
     {
+        # unpredictable secret buried mid-file: extrapolating the line pattern
+        # cannot pass; the model MUST retrieve the elided middle line
+        # (read offset/limit, or grep) — that is what this task tests.
         "id": "giant_output",
-        "seed": {"bigdata.txt": "".join(f"line-{i:05d}: {'payload ' * 6}\n" for i in range(20000))},
-        "prompt": ("bigdata.txt is large. Find the exact content of line 12345 and write ONLY that line's "
-                   "number and text to found.txt, then verify found.txt matches bigdata.txt's line 12345."),
-        "check": "test -f found.txt && grep -q 'line-12344' found.txt",
+        "seed": {"bigdata.txt": "".join(
+            (f"line-{i:05d}: secret-{_GIANT_SECRET}\n" if i == 12344
+             else f"line-{i:05d}: {'payload ' * 6}\n") for i in range(20000))},
+        "prompt": ("bigdata.txt is large. Find the exact content of line 12345 and write ONLY that line "
+                   "(number and full text) to found.txt. The line contains a unique marker you cannot guess."),
+        "check": "python3 -c \"import re,sys; f=open('found.txt').read(); b=open('bigdata.txt').read(); s=re.search(r'secret-[a-z0-9]+', b).group(); sys.exit(0 if s in f else 1)\"",
     },
 ]
 

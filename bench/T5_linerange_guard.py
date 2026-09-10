@@ -1,4 +1,6 @@
-"""T5 — line-range: refus si le contenu attendu a dérivé; fichier inchangé octet par octet."""
+"""T5v2 — line-range: précondition OBLIGATOIRE.
+Cas: contenu inchangé (succès), contenu dérivé (refus, intact), expected absent
+(refus propre, intact), et non-régression du mode old_str (pas de précondition)."""
 import sys, tempfile, pathlib
 sys.path.insert(0, "/home/marty/kern")
 from kern.journal import create_session
@@ -6,31 +8,34 @@ from kern.syscalls import tool_edit, FS
 
 tmp = pathlib.Path(tempfile.mkdtemp())
 target = tmp / "mod.py"
-target.write_text("alpha\nbeta\ngamma\ndelta\n")
-
+ORIG = "alpha\nbeta\ngamma\ndelta\n"
+target.write_text(ORIG)
 sess = create_session(cwd=str(tmp))
 fs = FS(str(tmp))
 
-# model read the file when it contained beta at line 2 — then the file drifted
-expected_stale = "beta"
-target.write_text("alpha\nBETA-CHANGED\ngamma\ndelta\n")   # concurrent change
+# 1) absent -> refus propre, fichier intact
+m1, _ = tool_edit(fs, sess, "mod.py", old_str="", new_str="x",
+                  start_line=2, end_line=2)
+assert m1.startswith("error") and "expected" in m1 and "REQUIRE" in m1, m1
+assert target.read_text() == ORIG, "FAIL: file modified without precondition!"
 
-msg, meta = tool_edit(fs, sess, "mod.py", old_str="", new_str="bravo",
-                      start_line=2, end_line=2, expected=expected_stale)
-assert msg.startswith("error: precondition failed"), msg
-assert "UNCHANGED" in msg or "unchanged" in msg.lower()
-assert "Current zone" in msg, "must give context for a re-read"
-assert target.read_text() == "alpha\nBETA-CHANGED\ngamma\ndelta\n", "FAIL: file was modified!"
+# 2) dérivé -> refus, intact, contexte pour re-lecture
+target.write_text("alpha\nBETA-DRIFTED\ngamma\ndelta\n")
+DRIFTED = target.read_text()
+m2, _ = tool_edit(fs, sess, "mod.py", old_str="", new_str="x",
+                  start_line=2, end_line=2, expected="beta")
+assert m2.startswith("error: precondition failed"), m2
+assert target.read_text() == DRIFTED, "FAIL: drifted file modified!"
 
-# matching expected -> edit applies, old lines returned for inspection
-msg2, meta2 = tool_edit(fs, sess, "mod.py", old_str="", new_str="bravo",
-                        start_line=2, end_line=2, expected="BETA-CHANGED")
-assert msg2.startswith("edited"), msg2
-assert "BETA-CHANGED" in msg2, "replaced lines must be returned"
+# 3) inchangé -> succès, lignes remplacées retournées
+target.write_text(ORIG)
+m3, _ = tool_edit(fs, sess, "mod.py", old_str="", new_str="bravo",
+                  start_line=2, end_line=2, expected="beta")
+assert m3.startswith("edited") and "beta" in m3, m3
 assert target.read_text().splitlines()[1] == "bravo"
 
-# no expected provided -> legacy behavior (back-compat), old lines still shown
-msg3, _ = tool_edit(fs, sess, "mod.py", old_str="", new_str="charlie",
-                    start_line=3, end_line=3)
-assert msg3.startswith("edited") and "gamma" in msg3
-print("PASS T5: stale expected -> refused, byte-identical file, context for re-read; fresh expected -> applied + shown")
+# 4) old_str mode: PAS de précondition exigée (auto-vérifié par le match exact)
+target.write_text(ORIG)
+m4, _ = tool_edit(fs, sess, "mod.py", old_str="gamma", new_str="charlie")
+assert m4.startswith("edited"), m4
+print("PASS T5v2: absent->refused+intact; drifted->refused+intact; unchanged->ok; old_str unaffected")

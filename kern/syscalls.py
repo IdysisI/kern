@@ -47,7 +47,7 @@ SCHEMAS = [
             "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"},
             "start_line": {"type": "integer", "description": "first line to replace (1-based)"},
             "end_line": {"type": "integer", "description": "last line to replace (inclusive)"},
-            "expected": {"type": "string", "description": "safety precondition for line-range mode: exact current content of lines start_line..end_line as read. If the file changed since your read, the edit is REFUSED without modification."}},
+            "expected": {"type": "string", "description": "REQUIRED for line-range mode: exact current content of lines start_line..end_line as you last read it. The edit is refused without modification if absent or if the file changed since your read."}},
             "required": ["path", "old_str", "new_str"]}}},
     {"type": "function", "function": {
         "name": "exec",
@@ -196,14 +196,22 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
     lines = src.splitlines()
 
     # Line-range mode: use when old_str is empty or fails.
-    # Precondition: `expected` must equal the CURRENT zone content — if the
-    # file drifted since the model's read, REFUSE without modifying.
+    # MANDATORY precondition: `expected` must be provided AND equal the CURRENT
+    # zone content. Without it the edit is REFUSED — this mode replaces lines
+    # by position, so a drifted file would be silently overwritten. Exact-match
+    # mode (old_str) needs no precondition: matching IS the verification.
     if start_line > 0 and end_line > 0:
         if start_line < 1 or end_line > len(lines) or start_line > end_line:
             return (f"error: invalid line range {start_line}-{end_line} "
                     f"(file has {len(lines)} lines)"), {}
+        if not expected:
+            return ("error: line-range edits REQUIRE the `expected` parameter — the exact "
+                    "current content of lines start_line..end_line as you last read it "
+                    "(precondition against overwriting a file that changed since your read). "
+                    "Re-read the file if unsure, then retry with expected=<those lines>. "
+                    "Alternatively use old_str exact-match mode, which is self-verifying."), {}
         current_zone = "\n".join(lines[start_line - 1:end_line])
-        if expected and current_zone != expected:
+        if current_zone != expected:
             return (f"error: precondition failed — lines {start_line}-{end_line} of {p} "
                     f"no longer match what you read (file changed). File UNCHANGED.\n"
                     f"Current zone:\n{_numbered_lines(lines, start_line, end_line)}\n"
@@ -247,7 +255,9 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
     return msg, {"diff": diff, "path": str(p)}
 
 
-# ---- background process registry -------------------------------------------
+# ---- background process registry ----------------
+MAX_LOG_DRAIN = 262144      # max bytes drained per logs call (256 KiB)
+LOG_BUF_CAP = 1048576       # in-memory log tail cap (1 MiB)---------------------------
 
 PROCS: dict[str, dict] = {}
 
@@ -277,7 +287,7 @@ def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False) -> 
         proc = subprocess.Popen(["bash", "-c", cmd], stdout=logf, stderr=subprocess.STDOUT,
                                 cwd=fs.cwd, env=env, text=True, start_new_session=True)
         hid = f"h{len(PROCS) + 1}"
-        PROCS[hid] = {"proc": proc, "cmd": cmd, "started": time.time(), "buf": ""}
+        PROCS[hid] = {"proc": proc, "cmd": cmd, "started": time.time(), "buf": "", "pending": b""}
         return f"started {hid} (pid {proc.pid}): {cmd}\nUse proc(handle=\"{hid}\", action=\"logs\") to inspect.", {"handle": hid}
     try:
         r = subprocess.run(argv, capture_output=True, text=True,
@@ -309,26 +319,53 @@ def tool_proc(handle: str, action: str, tail: int = 40) -> tuple[str, dict]:
             proc.kill()
         return f"{handle} killed", {}
     if action == "logs":
-        # Non-blocking drain: a LIVE, quiet process never blocks the engine.
-        # (readline() on a live pipe hangs forever waiting for the next line.)
+        # Non-blocking, BOUNDED drain: a live, quiet process never blocks the
+        # engine, and a continuously-writing process cannot monopolize the
+        # call (max MAX_LOG_DRAIN bytes per call) nor grow memory unbounded
+        # (buffer capped to LOG_BUF_CAP bytes; the head is dropped, never
+        # silently lost — the caller is told how much was discarded).
+        # Partial UTF-8 sequences split across reads are held over in
+        # h["pending"] and decoded on the next call.
         try:
             fd = proc.stdout.fileno()
             os.set_blocking(fd, False)
+            got = 0
             try:
-                while True:
-                    chunk = os.read(fd, 65536)
+                while got < MAX_LOG_DRAIN:
+                    chunk = os.read(fd, min(65536, MAX_LOG_DRAIN - got))
                     if not chunk:
                         break          # EOF: process exited
-                    h["buf"] += chunk.decode(errors="replace")
+                    got += len(chunk)
+                    h.setdefault("pending", b"")
+                    h["pending"] += chunk
+                    # decode what is safely decodable; keep a partial tail
+                    try:
+                        text = h["pending"].decode("utf-8")
+                        h["pending"] = b""
+                    except UnicodeDecodeError as ude:
+                        # keep the incomplete trailing sequence for next time
+                        keep = ude.start if 0 < ude.start < len(h["pending"]) else len(h["pending"]) - 4
+                        text = h["pending"][:max(0, keep)].decode("utf-8", errors="replace")
+                        h["pending"] = h["pending"][max(0, keep):]
+                    h["buf"] += text
             except BlockingIOError:
                 pass                    # live process, no more data right now
             finally:
                 os.set_blocking(fd, True)
+            if len(h["buf"]) > LOG_BUF_CAP:
+                dropped = len(h["buf"]) - LOG_BUF_CAP
+                h["buf"] = h["buf"][-LOG_BUF_CAP:]
+                h["dropped"] = h.get("dropped", 0) + dropped
         except Exception:
             pass
         lines = h["buf"].splitlines()
         body = "\n".join(lines[-tail:]) if lines else "(no output yet)"
-        return f"--- {handle} logs (last {min(tail, len(lines))} of {len(lines)} lines) ---\n{body}", {}
+        note = ""
+        if h.get("dropped"):
+            note = (f"\n[{h['dropped']:,} older bytes dropped from the in-memory tail — "
+                    f"the process output itself was consumed, not lost; redirect to a file "
+                    f"or read fewer lines if you need it all]")
+        return f"--- {handle} logs (last {min(tail, len(lines))} of {len(lines)} lines) ---\n{body}{note}", {}
     return f"error: unknown action '{action}'", {}
 
 
