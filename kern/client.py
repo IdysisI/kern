@@ -180,6 +180,34 @@ class Client:
 
 
 
+    @staticmethod
+    def _finalize_pending(pending: dict[int, dict]):
+        """Yield events for streamed tool calls whose JSON arguments were
+        assembled across chunks. A call whose arguments do not parse is NEVER
+        dropped silently: it is yielded with `kern_error` so the engine can
+        answer it with a proper tool_result (valid protocol path) and the model
+        can re-issue the call. A classified diagnostic error is also yielded.
+        No arbitrary repair is attempted."""
+        for slot in pending.values():
+            raw = slot["args"] or "{}"
+            cid = slot["id"] or "call_0"
+            name = slot["name"] or "?"
+            try:
+                args = json.loads(raw)
+                if not isinstance(args, dict):
+                    raise ValueError(f"arguments must be a JSON object, got {type(args).__name__}")
+                yield StreamEvent("tool_call", tool_call={"id": cid, "name": slot["name"], "arguments": args})
+            except (json.JSONDecodeError, ValueError) as e:
+                yield StreamEvent(
+                    "error",
+                    error=f"[tool={name} id={cid}] stage=arg-parse invalid-json: {e} "
+                          f"raw[:200]={raw[:200]!r}")
+                yield StreamEvent("tool_call", tool_call={
+                    "id": cid, "name": slot["name"], "arguments": {},
+                    "kern_error": (f"error: malformed tool arguments (stage=arg-parse, "
+                                   f"tool={name}): {e}. No repair attempted. "
+                                   f"Re-issue the tool call with valid JSON arguments.")})
+
     async def _stream_openai(self, model, messages, system, tools, max_tokens):
         msgs = ([{"role": "system", "content": system}] if system else []) + _ir_to_openai(messages)
         body: dict[str, Any] = {
@@ -202,7 +230,7 @@ class Client:
                 async with c.stream("POST", f"{self.base_url}/v1/chat/completions",
                                     headers=headers, json=body) as r:
                     if r.status_code != 200:
-                        yield StreamEvent("error", error=f"HTTP {r.status_code}: " + (await r.aread()).decode()[:400])
+                        yield StreamEvent("error", error=f"stage=transport http status={r.status_code}: " + (await r.aread()).decode()[:400])
                         return
                     async for line in _lines_with_stall(r, model):
                         if not line.startswith("data:"):
@@ -244,18 +272,13 @@ class Client:
                                     slot["name"] = fn["name"]
                                 if fn.get("arguments"):
                                     slot["args"] += fn["arguments"]
-            for slot in pending.values():
-                try:
-                    args = json.loads(slot["args"] or "{}")
-                except json.JSONDecodeError:
-                    yield StreamEvent("error", error=f"malformed tool args from model: {slot['args'][:200]}")
-                    continue
-                yield StreamEvent("tool_call", tool_call={"id": slot["id"] or "call_0", "name": slot["name"], "arguments": args})
+            for ev in Client._finalize_pending(pending):
+                yield ev
             yield StreamEvent("done")
         except StallError as e:
-            yield StreamEvent("error", error=str(e))
+            yield StreamEvent("error", error=f"stage=transport stall: {e}")
         except httpx.HTTPError as e:
-            yield StreamEvent("error", error=f"{type(e).__name__}: {e}")
+            yield StreamEvent("error", error=f"stage=transport {type(e).__name__}: {e}")
 
     # ---- anthropic native ---------------------------------------------------
 
@@ -279,7 +302,7 @@ class Client:
                 async with c.stream("POST", f"{self.base_url}/v1/messages",
                                     headers=headers, json=body) as r:
                     if r.status_code != 200:
-                        yield StreamEvent("error", error=f"HTTP {r.status_code}: " + (await r.aread()).decode()[:400])
+                        yield StreamEvent("error", error=f"stage=transport http status={r.status_code}: " + (await r.aread()).decode()[:400])
                         return
                     async for line in _lines_with_stall(r, model):
                         if not line.startswith("data:"):
@@ -316,9 +339,9 @@ class Client:
                             yield StreamEvent("error", error=json.dumps(ev.get("error", {}))[:400])
             yield StreamEvent("done")
         except StallError as e:
-            yield StreamEvent("error", error=str(e))
+            yield StreamEvent("error", error=f"stage=transport stall: {e}")
         except httpx.HTTPError as e:
-            yield StreamEvent("error", error=f"{type(e).__name__}: {e}")
+            yield StreamEvent("error", error=f"stage=transport {type(e).__name__}: {e}")
 
     # ---- capability handshake ------------------------------------------------
 

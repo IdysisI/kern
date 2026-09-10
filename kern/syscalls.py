@@ -46,7 +46,8 @@ SCHEMAS = [
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"},
             "start_line": {"type": "integer", "description": "first line to replace (1-based)"},
-            "end_line": {"type": "integer", "description": "last line to replace (inclusive)"}},
+            "end_line": {"type": "integer", "description": "last line to replace (inclusive)"},
+            "expected": {"type": "string", "description": "safety precondition for line-range mode: exact current content of lines start_line..end_line as read. If the file changed since your read, the edit is REFUSED without modification."}},
             "required": ["path", "old_str", "new_str"]}}},
     {"type": "function", "function": {
         "name": "exec",
@@ -173,8 +174,18 @@ def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
     return msg, {"diff": diff, "path": str(p)}
 
 
+def _numbered_lines(lines: list[str], start: int, end: int, cap: int = 30) -> str:
+    """Numbered view of a zone (for refusal/success messages), capped."""
+    zone = lines[start - 1:end]
+    total = len(zone)
+    if total > cap:
+        zone = zone[:cap] + [f"… (+{total - cap} more lines)"]
+    return "\n".join(f"{i:5d}\t{l}" for i, l in enumerate(zone, start=start))
+
+
 def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
-              start_line: int = 0, end_line: int = 0) -> tuple[str, dict]:
+              start_line: int = 0, end_line: int = 0,
+              expected: str = "") -> tuple[str, dict]:
     """Edit a file. By default replaces exact old_str with new_str.
     If old_str fails and start_line/end_line are given, replaces that line
     range with new_str instead (1-based, inclusive)."""
@@ -184,17 +195,26 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
     src = p.read_text(errors="replace")
     lines = src.splitlines()
 
-    # Line-range mode: use when old_str is empty or fails
+    # Line-range mode: use when old_str is empty or fails.
+    # Precondition: `expected` must equal the CURRENT zone content — if the
+    # file drifted since the model's read, REFUSE without modifying.
     if start_line > 0 and end_line > 0:
         if start_line < 1 or end_line > len(lines) or start_line > end_line:
             return (f"error: invalid line range {start_line}-{end_line} "
                     f"(file has {len(lines)} lines)"), {}
+        current_zone = "\n".join(lines[start_line - 1:end_line])
+        if expected and current_zone != expected:
+            return (f"error: precondition failed — lines {start_line}-{end_line} of {p} "
+                    f"no longer match what you read (file changed). File UNCHANGED.\n"
+                    f"Current zone:\n{_numbered_lines(lines, start_line, end_line)}\n"
+                    f"Re-read the file, then retry with updated expected/new_str."), {}
         new_lines = lines[:start_line - 1] + new_str.splitlines() + lines[end_line:]
         new_src = "\n".join(new_lines)
         session.checkpoint([str(p)])
         p.write_text(new_src)
         diff = _unified_diff(p, src, new_src)
-        msg = f"edited {p} (lines {start_line}-{end_line})"
+        zone = _numbered_lines(lines, start_line, end_line)
+        msg = f"edited {p} (lines {start_line}-{end_line})\nreplaced:\n{zone}"
         if p.suffix == ".py":
             ok, err = _py_compile(p)
             if not ok:

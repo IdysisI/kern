@@ -87,8 +87,11 @@ def materialize(events: list[dict], session) -> list[dict]:
         if kind == "user":
             msgs.append({"role": "user", "text": ev["text"]})
         elif kind == "compact":
+            facts = ev.get("facts") or ""
+            block = (f"<execution-facts covers=\"{ev.get('covers', '?')}\">\n"
+                     f"{facts}\n</execution-facts>\n") if facts else ""
             msgs.append({"role": "user",
-                         "text": f"<session-summary covers=\"{ev.get('covers', '?')}\">\n"
+                         "text": block + f"<session-summary covers=\"{ev.get('covers', '?')}\">\n"
                                  f"{ev.get('text', '')}\n</session-summary>"})
         elif kind == "assistant":
             m = {"role": "assistant", "text": ev.get("text", "")}

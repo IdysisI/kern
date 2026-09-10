@@ -139,7 +139,7 @@ class Session:
                if d.name[1:].isdigit() and (d / "manifest.json").exists()]
         return max(ids) if ids else None
 
-    def compact_into(self, upto_n: int, summary: str) -> int:
+    def compact_into(self, upto_n: int, summary: str, facts: str = "") -> int:
         """Replace events [0..upto_n) that are NOT user messages with a single
         `compact` event carrying the summary. User messages are kept verbatim
         (golden rule). Returns the number of events dropped.
@@ -156,7 +156,7 @@ class Session:
             for ev in dropped:
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
         compact_ev = {"n": 0, "ts": time.time(), "kind": "compact",
-                      "text": summary, "covers": len(dropped)}
+                      "text": summary, "facts": facts, "covers": len(dropped)}
         self.events = [compact_ev] + kept + recent
         # renumber and rewrite the log
         for i, ev in enumerate(self.events):

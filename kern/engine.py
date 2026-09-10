@@ -230,6 +230,42 @@ class Engine:
         self.stream_cb("note", f"compacting {len(to_compact)} old events "
                                f"(~{b['approx_tokens']:,} tokens)…")
         # Render the old events as plain text for the summarizer
+        # Mechanical execution-facts ledger, derived from journal receipts.
+        # Ground truth for "what actually happened" — independent of the LLM
+        # summary (which explains decisions, not facts). Refs stay consultable:
+        # dropped events live in compacted-*.jsonl in the session dir.
+        calls_by_id: dict[str, dict] = {}
+        for ev in to_compact:
+            for tc in ev.get("tool_calls", []) or []:
+                a = tc.get("arguments") or {}
+                if isinstance(a, dict) and a.get("path"):
+                    calls_by_id[tc.get("id", "")] = {
+                        "name": tc.get("name"), "path": str(a.get("path")),
+                        "arglen": len(json.dumps(a, ensure_ascii=False))}
+        facts: list[str] = []
+        seen_results: set[str] = set()
+        for ev in to_compact:
+            if ev["kind"] == "tool_result":
+                cid = ev.get("call_id", "")
+                seen_results.add(cid)
+                info = calls_by_id.get(cid, {})
+                path = info.get("path") or ""
+                t = str(ev.get("text", ""))
+                status = ("error" if t.startswith("error")
+                          else "denied" if t.startswith("denied")
+                          else "ok")
+                detail = t[:120].replace("\n", " ")
+                facts.append(f"{ev.get('name', '?')}{' ' + path if path else ''} -> {status}"
+                             + (f" | {detail}" if status != "ok" else "")
+                             + f" (ev n={ev.get('n')})")
+        for cid, info in calls_by_id.items():
+            if cid not in seen_results:
+                facts.append(f"{info['name']} {info['path']} -> uncertain "
+                             f"(dispatched, no result; arglen={info['arglen']})")
+        facts_text = ("From journal receipts (mechanical, not summarized). "
+                      "Full details: compacted-*.jsonl + scratch/ in the session dir.\n" +
+                      "\n".join(facts[-60:]) +
+                      (f"\n(+{max(0, len(facts) - 60)} earlier ops)" if len(facts) > 60 else ""))
         lines = []
         for ev in to_compact:
             k = ev["kind"]
@@ -256,7 +292,7 @@ class Engine:
             if not summary.strip():
                 raise RuntimeError("empty summary")
             upto_n = to_compact[-1]["n"] + 1
-            dropped = self.session.compact_into(upto_n, summary.strip())
+            dropped = self.session.compact_into(upto_n, summary.strip(), facts=facts_text)
             # L2 deposit: the summary lands in this project's memory tree
             # (query-only: it is NOT injected anywhere — the model must ask)
             try:
@@ -311,8 +347,13 @@ class Engine:
                     self.usage_out += ev.usage.get("completion_tokens", ev.usage.get("output_tokens", 0))
                 elif ev.kind == "error":
                     error = ev.error
+                    # never silent: a stream error in a MIXED turn (text and/or
+                    # valid calls present) must still be journaled and shown.
+                    self.stream_cb("note", f"⚠ {error}")
 
             raw_text = "".join(text_parts)
+            if error:
+                self.session.emit("note", text=f"stream error [{self.model}]: {error}")
             if error and not raw_text and not calls:
                 self.session.emit("tool_result", call_id="", text=f"engine error: {error}")
                 return f"[error from model endpoint: {error}]"
@@ -357,6 +398,13 @@ class Engine:
                 name, args, cid = call["name"], call["arguments"], call["id"]
                 self.stream_cb("tool", json.dumps({"name": name, "arguments": args},
                                                   ensure_ascii=False))
+                if call.get("kern_error"):
+                    # surfaced through the valid protocol path: the assistant
+                    # tool_call gets its tool_result; nothing was executed.
+                    self.session.emit("tool_result", call_id=cid, name=name,
+                                      text=str(call["kern_error"]))
+                    self.stream_cb("result", str(call["kern_error"]))
+                    continue
                 needs_ok = name in ("write", "edit", "exec") and not args.get("background")
                 if name == "exec" and syscalls.is_safe_readonly(str(args.get("cmd", ""))):
                     needs_ok = False   # read-only inspection flows without a modal
