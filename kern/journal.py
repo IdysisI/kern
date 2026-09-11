@@ -147,14 +147,13 @@ class Session:
         The pre-compact tail is saved to compacted-<ts>.jsonl first, so the
         operation is reversible by hand."""
         old, recent = self.events[:upto_n], self.events[upto_n:]
-        # dangling actions (dispatched, never got a result) are UNRESOLVED
-        # STATE, not history: they survive compaction like user messages so
-        # the pager keeps flagging them as "uncertain — verify before retry".
+        # dangling actions + work-state (todo/objective) are STATE, not
+        # history: they survive compaction like user messages. The Slate
+        # must never scroll away — that is its whole purpose.
         answered = {ev.get("call_id") for ev in old if ev["kind"] == "tool_result"}
-        dangling = [ev for ev in old if ev["kind"] == "action"
-                     and ev.get("call_id") not in answered]
+        KEEP_KINDS = {"user", "todo", "objective"}
         droppable = [ev for ev in old
-                     if ev["kind"] != "user"
+                     if ev["kind"] not in KEEP_KINDS
                      and not (ev["kind"] == "action" and ev.get("call_id") not in answered)]
         dropped = droppable
         kept = [ev for ev in old if ev not in droppable]

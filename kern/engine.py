@@ -72,8 +72,6 @@ class Engine:
         self.usage_out = 0
         self.tokens_streamed = 0
         self.todo: list[dict] = []
-        self._reread_noted: dict[str, bool] = {}
-        self._noted_deploy_mode = False
         self.forced_fenced = bool(__import__("os").environ.get("KERN_FORCE_FENCED"))
 
     # ---- capability index + mounts ----------------------------------------
@@ -141,30 +139,6 @@ class Engine:
         if name == "fetch":
             return f"fetch {args.get('url', '')}"
         return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
-
-    def _reread_note(self, name: str, args: dict) -> None:
-        """Anti-circling: if this read/search targets something the model has
-        already read >=3 times in the recent window, append a soft nudge.
-        Deterministic, non-blocking — just makes the loop visible to the model."""
-        if name not in ("read", "search"):
-            return
-        key = str(args.get("path") or args.get("pattern") or "")[:80]
-        if not key:
-            return
-        repeats = 0
-        for ev in self.session.events[-40:]:
-            if ev.get("kind") != "assistant":
-                continue
-            for tc in ev.get("tool_calls") or []:
-                if tc.get("name") == name:
-                    k2 = str((tc.get("arguments") or {}).get("path")
-                             or (tc.get("arguments") or {}).get("pattern") or "")[:80]
-                    if k2 == key:
-                        repeats += 1
-        if repeats >= 3 and not getattr(self, "_reread_noted", {}).get(key):
-            getattr(self, "_reread_noted", {})[key] = True
-            self.stream_cb("note", f"kern fact: read #{repeats} of '{key}' this session; "
-                                   f"earlier results are still in the conversation view.")
 
     def _prior_execution(self, name: str, args: dict) -> str | None:
 
@@ -244,29 +218,9 @@ class Engine:
 
     async def chat(self, user_text: str) -> str:
         self.session.emit("user", text=user_text)
+        self.session.emit("objective", text=user_text[:400])
         self._autocheckpoint()
         return await self._loop()
-
-    def _deploy_mode_note(self, path: str) -> None:
-        """Self-edit only, stated as a fact on the tool result: the file just
-        edited was loaded by this process at launch. No preaching — one line,
-        once per session, only when mechanically certain."""
-        if getattr(self, "_noted_deploy_mode", False):
-            return
-        try:
-            rp = Path(path)
-            if not rp.is_absolute():
-                rp = Path(self.fs.cwd) / rp
-            here = Path(__file__).resolve().parent
-            if not str(rp.resolve()).startswith(str(here)):
-                return                       # not this process's package: nothing to state
-            self._noted_deploy_mode = True
-            self.session.emit("note", text=(
-                f"kern fact: {rp.name} was loaded by this process at launch — "
-                f"the change takes effect on the next kern restart."))
-            self.stream_cb("note", f"◈ {rp.name} applies on next kern restart")
-        except Exception:
-            pass
 
     def _autocheckpoint(self) -> None:
 
@@ -487,8 +441,6 @@ class Engine:
                     self.stream_cb("result", str(call["kern_error"]))
                     continue
                 prior = self._prior_execution(name, args)
-                if not call.get("kern_error"):
-                    self._reread_note(name, args)
                 needs_ok = name in ("write", "edit", "exec") and not args.get("background")
                 if name == "exec" and syscalls.is_safe_readonly(str(args.get("cmd", ""))):
                     needs_ok = False   # read-only inspection flows without a modal
@@ -520,8 +472,6 @@ class Engine:
                             f"executed earlier this session — prior result: "
                             f"{prior[:120]!r}. You have just re-run it; side effects "
                             f"may have been repeated.]\n{text}")
-                if name in ("write", "edit") and not str(text).startswith("error"):
-                    self._deploy_mode_note(str(args.get("path", "")))
                 self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
                                    diff=meta.get("diff") or None)
                 self.stream_cb("result", str(text))
@@ -529,6 +479,7 @@ class Engine:
                     self.stream_cb("diff", meta["diff"])
                 if meta.get("todo"):
                     self.todo = meta["todo"]
+                    self.session.emit("todo", items=meta["todo"])
                     self.stream_cb("todo", json.dumps(meta["todo"]))
                 if meta.get("handle"):
                     self.stream_cb("handle", meta["handle"])

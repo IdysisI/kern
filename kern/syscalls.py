@@ -357,6 +357,8 @@ def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False) -> 
         return (f"error: timed out after {timeout}s. Re-run with a longer timeout, "
                 f"a narrower command, or background=true."), {}
     out = (r.stdout or "") + (f"\n[stderr]\n{r.stderr}" if r.stderr else "")
+    if not out.strip():
+        out = "(command ran successfully, no output)"
     if len(out) > 8000:
         out = out[:3800] + f"\n\n…[{len(out)-7600:,} bytes elided]…\n\n" + out[-3800:]
     return (f"exit={r.returncode}\n{out}".rstrip(),

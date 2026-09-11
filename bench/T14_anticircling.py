@@ -16,7 +16,7 @@ import kern.kernel as KK
 # A) le prompt contient le fait launched
 sp = KK.system_prompt("/tmp", "m", "2026-09-11", "main", [])
 assert "launched:" in sp, "FAIL A: pas de fait launched dans le prompt"
-assert "RESTART of this process" in sp or "installed copy" in sp, sp[-300:]
+assert "source at" in sp or "installed copy at" in sp, sp[-300:]
 assert "Establish HOW" not in sp and "Re-reading" not in sp, "FAIL A: instructions restantes"
 print("A) fait launched dans le prompt:", sp[sp.find("launched:"):][:90], "...")
 

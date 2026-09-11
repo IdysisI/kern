@@ -73,14 +73,48 @@ def _clear_tool_args(tool_calls: list[dict]) -> list[dict]:
     return out
 
 
+def _slate(events: list[dict]) -> str:
+    """Build the always-visible work-state block from the journal:
+    objective (last user message, verbatim, capped) + current todo."""
+    objective = ""
+    todo = None
+    for ev in events:
+        if ev["kind"] == "objective":
+            objective = ev.get("text", "")
+        elif ev["kind"] == "todo":
+            todo = ev.get("items")
+    if todo:
+        lines = ["<work-state>"]
+        if objective:
+            lines.append(f"objective: {objective}")
+        lines.append("todo:")
+        for i, item in enumerate(todo, 1):
+            mark = {"done": "x", "active": ">", "pending": " "}.get(item.get("status", "pending"), " ")
+            text = str(item.get("text", ""))[:80]
+            lines.append(f" {mark} {i}. {text}")
+        lines.append("</work-state>")
+        return "\n".join(lines)
+    if objective:
+        return f"<work-state>\nobjective: {objective}\n(no plan yet — multi-step? set one with todo())\n</work-state>"
+    return ""
+
+
 def materialize(events: list[dict], session) -> list[dict]:
     """journal events -> IR messages (role/text/tool_calls/tool_call_id)."""
     # Tier 1c: find the indices of the most recent tool_results to keep inline
     tool_result_idx = [i for i, ev in enumerate(events) if ev["kind"] == "tool_result"]
     keep_inline = set(tool_result_idx[-KEEP_RECENT_TOOL_RESULTS:])
 
+    # ---- THE SLATE: the model's own work state, always at the top ----------
+    # Feedforward, computational, zero requests: objective + live todo list.
+    # The model maintains them (todo() tool / user messages); the harness
+    # guarantees they never scroll out of the view. This is the anchor that
+    # prevents re-derivation and circling (see session 20260911-131749).
+    slate = _slate(events)
     msgs: list[dict] = []
     n = len(events)
+    if slate:
+        msgs.append({"role": "user", "text": slate})
     seen_result_hashes: dict[str, int] = {}   # dedup pass: identical tool outputs
     for i, ev in enumerate(events):
         kind = ev["kind"]
