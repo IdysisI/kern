@@ -113,7 +113,7 @@ async def run_one(client: Client, model: str, task: dict) -> dict:
         else:
             ok = bool(reply) and "error" not in reply.lower()[:40]
     shutil.rmtree(workdir, ignore_errors=True)
-    return {"model": model, "task": task["id"], "ok": ok, "seconds": round(dt, 1),
+    return {"model": model, "task": task["id"], "sid": sess.id, "ok": ok, "seconds": round(dt, 1),
             "tok_in": eng.usage_in, "tok_out": eng.usage_out, "error": err,
             "steps": steps}
 

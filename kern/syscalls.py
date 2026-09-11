@@ -161,10 +161,10 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
 
 def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
     p = fs.resolve(path)
-    old = p.read_text(errors="replace") if p.exists() else ""
     session.checkpoint([str(p)])
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content)
+    res = _locked_update(p, lambda _src: content)
+    old, _new = res if res else ("", content)
     diff = _unified_diff(p, old, content)
     msg = f"wrote {p} ({len(content)} bytes)"
     if p.suffix == ".py":
@@ -172,6 +172,40 @@ def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
         if not ok:
             msg += f"\nWARNING post-check failed — the file does not compile:\n{err}\nFix it with edit()."
     return msg, {"diff": diff, "path": str(p)}
+
+
+def _locked_update(p: Path, fn) -> tuple[str, str] | None:
+    """Whole read-modify-write cycle under an exclusive sidecar lock.
+    fn(src) -> new_src, or None to refuse (file untouched). Returns
+    (old_src, new_src) on success. The atomic rename makes a crash
+    mid-write leave the target intact. Limit: only writers that also take
+    this lock (kern tools) are serialized — a non-cooperating external
+    process can still race; the edit precondition catches the common case
+    by refusing on drifted content."""
+    import fcntl
+    lock = p.with_name(p.name + ".kern-lock")
+    tmp = p.with_name(p.name + ".kern-tmp")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            src = p.read_text(errors="replace") if p.exists() else ""
+            new = fn(src)
+            if new is None:
+                return None
+            if new != src:
+                with open(tmp, "w") as f:
+                    f.write(new)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, p)
+            return src, new
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 def _numbered_lines(lines: list[str], start: int, end: int, cap: int = 30) -> str:
@@ -210,18 +244,39 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
                     "(precondition against overwriting a file that changed since your read). "
                     "Re-read the file if unsure, then retry with expected=<those lines>. "
                     "Alternatively use old_str exact-match mode, which is self-verifying."), {}
-        current_zone = "\n".join(lines[start_line - 1:end_line])
-        if current_zone != expected:
-            return (f"error: precondition failed — lines {start_line}-{end_line} of {p} "
-                    f"no longer match what you read (file changed). File UNCHANGED.\n"
-                    f"Current zone:\n{_numbered_lines(lines, start_line, end_line)}\n"
-                    f"Re-read the file, then retry with updated expected/new_str."), {}
-        new_lines = lines[:start_line - 1] + new_str.splitlines() + lines[end_line:]
-        new_src = "\n".join(new_lines)
+        # verify + compute under the lock: a concurrent kern edit between the
+        # model's read and this call cannot slip in (precondition re-checked
+        # on the FRESH content inside _locked_update)
+        refused: list[str] = []
+
+        def _apply(fresh: str) -> str | None:
+            flines = fresh.splitlines()
+            if end_line > len(flines):
+                refused.append("range")
+                return None
+            fresh_zone = "\n".join(flines[start_line - 1:end_line])
+            if fresh_zone != expected:
+                refused.append("precondition")
+                return None
+            new_lines = flines[:start_line - 1] + new_str.splitlines() + flines[end_line:]
+            return "\n".join(new_lines)
+
         session.checkpoint([str(p)])
-        p.write_text(new_src)
-        diff = _unified_diff(p, src, new_src)
-        zone = _numbered_lines(lines, start_line, end_line)
+        res = _locked_update(p, _apply)
+        if res is None:
+            if refused and refused[0] == "precondition":
+                flines = src.splitlines()
+                return (f"error: precondition failed — lines {start_line}-{end_line} of {p} "
+                        f"no longer match what you read (file changed). File UNCHANGED.\n"
+                        f"Current zone:\n{_numbered_lines(flines, start_line, min(end_line, len(flines)))}\n"
+                        f"Re-read the file, then retry with updated expected/new_str."), {}
+            flines = src.splitlines()
+            return (f"error: invalid line range {start_line}-{end_line} "
+                    f"(file now has {len(flines)} lines)"), {}
+        src2, new_src = res
+        diff = _unified_diff(p, src2, new_src)
+        flines = src2.splitlines()
+        zone = _numbered_lines(flines, start_line, end_line)
         msg = f"edited {p} (lines {start_line}-{end_line})\nreplaced:\n{zone}"
         if p.suffix == ".py":
             ok, err = _py_compile(p)
@@ -233,20 +288,26 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
     if not old_str:
         return ("error: old_str is empty. Use start_line/end_line to specify "
                 "a line range, or provide the exact string to replace."), {}
-    count = src.count(old_str)
-    if count == 0:
-        hint = _fuzzy_hint(src, old_str)
-        return (f"error: old_str not found in {p}. No changes made.\n"
-                f"Check whitespace/exact text, or use start_line/end_line. "
-                f"Closest region:\n{hint}"), {}
-    if count > 1:
+    def _apply(src: str) -> str | None:
+        count = src.count(old_str)
+        if count == 0 or count > 1:
+            return None            # refused; details built by the caller below
+        return src.replace(old_str, new_str, 1)
+
+    session.checkpoint([str(p)])
+    res = _locked_update(p, _apply)
+    if res is None:
+        count = src.count(old_str)
+        if count == 0:
+            hint = _fuzzy_hint(src, old_str)
+            return (f"error: old_str not found in {p}. No changes made.\n"
+                    f"Check whitespace/exact text, or use start_line/end_line. "
+                    f"Closest region:\n{hint}"), {}
         return (f"error: old_str matches {count} times in {p}. No changes made.\n"
                 f"Include more surrounding lines so it is unique, or use "
                 f"start_line/end_line."), {}
-    session.checkpoint([str(p)])
-    new_src = src.replace(old_str, new_str, 1)
-    p.write_text(new_src)
-    diff = _unified_diff(p, src, new_src)
+    src2, new_src = res
+    diff = _unified_diff(p, src2, new_src)
     msg = f"edited {p} (+{len(new_str)} -{len(old_str)} bytes)"
     if p.suffix == ".py":
         ok, err = _py_compile(p)

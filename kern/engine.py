@@ -138,6 +138,36 @@ class Engine:
             return f"fetch {args.get('url', '')}"
         return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
 
+    def _prior_execution(self, name: str, args: dict) -> str | None:
+        """Replay visibility: if an IDENTICAL (name, canonical args) call was
+        already executed in this session, return its result snippet. We do NOT
+        block the re-run (a repeat may be legitimate) — we make it visible so
+        the model knows side effects may repeat."""
+        try:
+            canon = json.dumps(args, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            return None
+        want: dict[str, str] = {}          # call_id -> result text
+        for ev in self.session.events:
+            if ev.get("kind") == "tool_result" and str(ev.get("text", "")).strip():
+                want[ev.get("call_id", "")] = str(ev.get("text", ""))
+        done: set[str] = set()
+        for ev in self.session.events:
+            if ev.get("kind") != "assistant":
+                continue
+            for tc in ev.get("tool_calls") or []:
+                if tc.get("name") != name or tc.get("id") in done:
+                    continue
+                try:
+                    same = json.dumps(tc.get("arguments") or {}, sort_keys=True,
+                                      ensure_ascii=False) == canon
+                except Exception:
+                    continue
+                if same and tc.get("id") in want:
+                    done.add(tc.get("id"))
+                    return want[tc.get("id")]
+        return None
+
     async def _safe_call(self, name: str, args: dict) -> tuple[str, dict]:
         try:
             return await self._call_tool(name, args)
@@ -405,6 +435,7 @@ class Engine:
                                       text=str(call["kern_error"]))
                     self.stream_cb("result", str(call["kern_error"]))
                     continue
+                prior = self._prior_execution(name, args)
                 needs_ok = name in ("write", "edit", "exec") and not args.get("background")
                 if name == "exec" and syscalls.is_safe_readonly(str(args.get("cmd", ""))):
                     needs_ok = False   # read-only inspection flows without a modal
@@ -431,6 +462,11 @@ class Engine:
                     self.session.emit("action", call_id=cid, name=name)
                     text, meta = await self._safe_call(name, args)
                     text = syscalls.redact(str(text))
+                if prior is not None:
+                    text = (f"[kern replay warning: an identical {name} call was already "
+                            f"executed earlier this session — prior result: "
+                            f"{prior[:120]!r}. You have just re-run it; side effects "
+                            f"may have been repeated.]\n{text}")
                 self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
                                    diff=meta.get("diff") or None)
                 self.stream_cb("result", str(text))

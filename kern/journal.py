@@ -147,8 +147,17 @@ class Session:
         The pre-compact tail is saved to compacted-<ts>.jsonl first, so the
         operation is reversible by hand."""
         old, recent = self.events[:upto_n], self.events[upto_n:]
-        dropped = [ev for ev in old if ev["kind"] != "user"]
-        kept = [ev for ev in old if ev["kind"] == "user"]
+        # dangling actions (dispatched, never got a result) are UNRESOLVED
+        # STATE, not history: they survive compaction like user messages so
+        # the pager keeps flagging them as "uncertain — verify before retry".
+        answered = {ev.get("call_id") for ev in old if ev["kind"] == "tool_result"}
+        dangling = [ev for ev in old if ev["kind"] == "action"
+                     and ev.get("call_id") not in answered]
+        droppable = [ev for ev in old
+                     if ev["kind"] != "user"
+                     and not (ev["kind"] == "action" and ev.get("call_id") not in answered)]
+        dropped = droppable
+        kept = [ev for ev in old if ev not in droppable]
         if not dropped:
             return 0
         # archive the dropped tail before rewriting

@@ -45,6 +45,11 @@ DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
 TOOL_ICON = {"read": "◱", "write": "✎", "edit": "✎", "exec": "▶", "spawn": "⑂",
              "fetch": "◈", "todo": "☰", "proc": "⚙"}
 
+# Compact braille spinner: used as the moving cursor at the tail of streamed
+# text, in the waiting placeholder, and in the thinking block title. Stays a
+# single column wide so it never jitters the layout.
+STREAMING_CURSOR = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
 CSS = """
 /* theme-token based + transparent: the terminal's own background shows through */
 Screen { background: transparent; }
@@ -86,6 +91,7 @@ CollapsibleTitle { color: $text-muted; text-style: italic; background: transpare
 .error { border-left: thick $error; padding: 0 1; margin: 0 2 0 1; color: $error; }
 .todo { border: round $border; padding: 0 1; margin: 0 6 0 1; }
 .queued { color: $warning; padding: 0 2; text-style: italic; }
+.waiting { color: $text-muted; padding: 0 2; text-style: italic; }
 
 Approve { align: center middle; }
 #dlg { width: 84; height: auto; max-height: 26; background: $surface;
@@ -402,6 +408,7 @@ class KernApp(App):
         self._stream_widget: Static | None = None
         self._stream_buf: list[str] = []
         self._stream_dirty = False
+        self._waiting_widget: Static | None = None
         self._thinking_widget: ThinkingBlock | None = None
         self._tool_card: ToolCard | None = None
         self._todo_card: TodoCard | None = None
@@ -533,6 +540,7 @@ class KernApp(App):
             if self._thinking_widget is not None:
                 self._thinking_widget.finalize()
                 self._thinking_widget = None
+            self._waiting_widget = self._dismiss_waiting()
             if self._stream_widget is None:
                 self._stream_widget = Static(classes="stream", markup=False)
                 self.chat.mount(self._stream_widget)
