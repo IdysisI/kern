@@ -45,10 +45,11 @@ DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
 TOOL_ICON = {"read": "◱", "write": "✎", "edit": "✎", "exec": "▶", "spawn": "⑂",
              "fetch": "◈", "todo": "☰", "proc": "⚙"}
 
-# Rotating circle: the moving cursor at the tail of streamed text, the waiting
-# placeholder, the status bar, and pending tool cards. Four quarter-fill frames
-# = one smooth revolution; single column wide so it never jitters the layout.
-STREAMING_CURSOR = "◐◓◑◒"
+# Rotating ring: the moving cursor at the tail of streamed text, the waiting
+# placeholder, the status bar, and pending tool cards. A full circle of dots
+# with one gap that walks around it — 8 frames, 45° per step, one smooth
+# revolution per second at 8fps. Single column wide, never jitters the layout.
+STREAMING_CURSOR = "⣾⣽⣻⢿⡿⣟⣯⣷"
 
 CSS = """
 /* theme-token based + transparent: the terminal's own background shows through */
@@ -425,6 +426,10 @@ class KernApp(App):
         self.cwd = cwd or os.getcwd()
         self.client = Client()
         self.session = create_session(cwd=self.cwd)
+        # remote (daemon) mode: sessions owned by the daemon survive this
+        # terminal. None until attached.
+        self.remote = None
+        self._remote_running = False
         self.turn_worker = None
         self._stream_widget: Static | None = None
         self._stream_buf: list[str] = []
@@ -454,9 +459,148 @@ class KernApp(App):
         self.query_one("#status").display = False
         self._refresh_chrome()
         self.set_interval(0.12, self._on_tick)
-        self._welcome()
+        if not os.environ.get("KERN_LOCAL"):
+            self.run_worker(self._daemon_entry(), name="daemon", exclusive=False)
+        else:
+            self._welcome()
         self.query_one("#prompt").focus()
         self.run_worker(self._load_catalog(), name="catalog", exclusive=False)
+
+    # ---- remote (daemon) mode: sessions outlive this terminal ----------------
+
+    async def _daemon_entry(self):
+        """Connect (auto-spawn) the daemon, then offer: active / idle / new.
+        On any failure, fall back to local mode silently."""
+        try:
+            self.remote = await self._connect_daemon()
+        except Exception as e:
+            self._chat_note(f"daemon unavailable ({type(e).__name__}) — local mode: "
+                            "closing this terminal will end the session.")
+            self._welcome()
+            return
+        rows = [{"id": "__new__", "turns": "0", "preview": "start a fresh session"}]
+        try:
+            await self.remote.send(json.dumps({"method": "sessions"}))
+            raw = json.loads(await asyncio.wait_for(self.remote.recv(), timeout=5))
+            listing = raw.get("result", {}).get("sessions", {})
+        except Exception:
+            listing = {}
+        for sid, info in listing.items():
+            if sid == self.session.id:
+                continue
+            rows.append({"id": sid,
+                         "turns": "ACTIVE" if info.get("active") else "idle",
+                         "preview": (info.get("preview", "") or "?").split("|")[0]})
+        pick = await self.push_screen_wait(SessionPicker(rows))
+        if not pick:
+            self._welcome()
+            return
+        if pick == "__new__":
+            await self.remote.send(json.dumps(
+                {"method": "new", "cwd": self.cwd, "model": self.model}))
+            raw = json.loads(await asyncio.wait_for(self.remote.recv(), timeout=5))
+            sid = raw.get("result", {}).get("attached")
+        else:
+            sid = pick
+        if not sid:
+            self._welcome()
+            return
+        await self._attach_remote(sid)
+
+    async def _connect_daemon(self, tries=4):
+        import websockets as _ws
+        import sys as _sys
+        last = None
+        for i in range(tries):
+            try:
+                return await _ws.connect(KERN_DAEMON_URI, open_timeout=1.5)
+            except Exception as e:
+                last = e
+                if i == 0:
+                    log = open(os.path.expanduser("~/.kern/daemon.log"), "ab")
+                    subprocess.Popen([_sys.executable, "-m", "kern.daemon"],
+                                     start_new_session=True, stdout=log, stderr=log)
+                await asyncio.sleep(0.5 + 0.5 * i)
+        raise last
+
+    async def _attach_remote(self, sid: str):
+        """Attach to a daemon session: replay the journal from disk, then
+        stream live events. Closing this terminal DETACHES only."""
+        import json as _json
+        self.session = Session(sid)
+        await self.remote.send(_json.dumps({"method": "attach", "session": sid,
+                                            "model": self.model}))
+        raw = _json.loads(await asyncio.wait_for(self.remote.recv(), timeout=5))
+        att = raw.get("result", {})
+        self.model = att.get("model", self.model)
+        self._render_journal()
+        self._chat_note(f"◈ attached to {sid} — this terminal is a VIEW; closing it "
+                        "does NOT stop the agent. ctrl+c interrupts, ctrl+d detaches.")
+        self.run_worker(self._remote_reader(), name="remote", exclusive=True)
+        if att.get("running"):
+            self._remote_running = True
+            self._remote_turn_started()
+
+    async def _remote_reader(self):
+        """Pump daemon -> widgets. Exits silently on detach/close."""
+        import json as _json
+        try:
+            async for raw in self.remote:
+                msg = _json.loads(raw)
+                ev = msg.get("event")
+                if ev in ("text", "thinking", "tool", "result", "diff",
+                          "note", "todo", "handle"):
+                    self._on_stream(ev, msg.get("text", ""))
+                elif ev == "turn_start":
+                    self._remote_running = True
+                    self._remote_turn_started()
+                elif ev == "turn_end":
+                    self._remote_running = False
+                    self._flush_stream()
+                    self._dismiss_waiting()
+                    if msg.get("reply"):
+                        self.chat.mount(Static(RichMarkdown(msg["reply"], justify="left"),
+                                               classes="assistant"))
+                    if self._queue:
+                        nxt = self._queue.pop(0)
+                        self._remote_send_chat(nxt)
+                    else:
+                        self._chat_note("■ turn finished (session idle)")
+                elif ev == "approve_request":
+                    await self._remote_approve(msg.get("id"), msg.get("desc"),
+                                               msg.get("diff"))
+                elif ev == "busy":
+                    self._chat_note("⚠ " + str(msg.get("text", "")))
+                elif ev == "error":
+                    self._chat_note("⚠ " + str(msg.get("error", "")))
+        except Exception:
+            pass   # detached or daemon gone; session lives on regardless
+
+    def _remote_turn_started(self):
+        self._t0 = time.monotonic()
+        self._verb = "thinking…"
+        self.query_one("#status").display = True
+        self._dismiss_waiting()
+        self._waiting_widget = Static(
+            f"{STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
+        self.chat.mount(self._waiting_widget)
+        self.chat.scroll_end(animate=False)
+
+    def _remote_send_chat(self, text: str):
+        import json as _json
+        asyncio.ensure_future(self.remote.send(
+            _json.dumps({"method": "chat", "text": text})))
+
+    async def _remote_approve(self, aid, desc, diff):
+        import json as _json
+        if self._always:
+            await self.remote.send(_json.dumps({"method": "approve", "id": aid, "allow": True}))
+            return
+        v = await self.push_screen_wait(Approve(desc, diff))
+        if v == "a":
+            self._always = True
+        await self.remote.send(_json.dumps({"method": "approve",
+                                            "id": aid, "allow": v in ("y", "a")}))
 
     async def _load_catalog(self):
         try:
@@ -492,7 +636,10 @@ class KernApp(App):
         right = self._ctx_info()
         if self._turn_running():
             el = time.monotonic() - self._t0
-            frame = self._SPIN[int(el * 8) % len(self._SPIN)]
+            # One frame per tick: the ring rotates exactly 45° every 0.12s —
+            # never aliases, never skips, so the revolution reads as smooth.
+            self._spin_i = (getattr(self, "_spin_i", -1) + 1) % len(self._SPIN)
+            frame = self._SPIN[self._spin_i]
             tok = getattr(self.engine, "tokens_streamed", 0)
             self.query_one("#status").update(
                 f" {frame} {self._verb}  {el:0.1f}s · {tok:,} tok")
@@ -686,6 +833,19 @@ class KernApp(App):
         if text.startswith("/"):
             await self._slash(text)
             return
+        if self.remote is not None:
+            self.chat.mount(UserMsg(text))
+            self.chat.scroll_end(animate=False)
+            if self._remote_running:
+                self._queue.append(text)
+                if self._queued_chip is None:
+                    self._queued_chip = Static(classes="queued", markup=True)
+                    self.chat.mount(self._queued_chip)
+                self._queued_chip.update(f"⏳ queued: {safe(text)}")
+                self.chat.scroll_end(animate=False)
+            else:
+                self._remote_send_chat(text)
+            return
         if self._turn_running():
             self._queue.append(text)
             if self._queued_chip is None:
@@ -706,6 +866,7 @@ class KernApp(App):
         self._todo_card = None
         self._thinking_widget = None
         self._verb = "thinking…"
+        self._spin_i = -1   # ring starts from frame 0 on every turn
         self.query_one("#status").display = True
         self._dismiss_waiting()
         self._waiting_widget = Static(
@@ -745,6 +906,10 @@ class KernApp(App):
         return w is not None and w.is_running
 
     def action_interrupt(self):
+        if self.remote is not None:
+            if self._remote_running:
+                asyncio.ensure_future(self.remote.send('{"method": "interrupt"}'))
+            return
         if self._turn_running():
             self.turn_worker.cancel()
         elif self.query_one("#prompt").text.strip():
@@ -817,6 +982,29 @@ class KernApp(App):
     async def _slash(self, text: str):
         cmd, _, arg = text.partition(" ")
         arg = arg.strip()
+        if self.remote is not None and cmd not in ("/help", "/sessions"):
+            # daemon owns the session: only harmless/local commands pass,
+            # mutations are forwarded where the daemon supports them.
+            import json as _json
+            if cmd == "/model" and arg:
+                self.model = arg
+                await self.remote.send(_json.dumps({"method": "model", "model": arg}))
+                self._refresh_chrome()
+                self._chat_note(f"model → {arg} (daemon session)")
+            elif cmd == "/context":
+                await self.remote.send(_json.dumps({"method": "context"}))
+            elif cmd == "/new":
+                await self.remote.send(_json.dumps({"method": "new", "cwd": self.cwd,
+                                                    "model": self.model}))
+                raw = json.loads(await asyncio.wait_for(self.remote.recv(), timeout=5))
+                sid = raw.get("result", {}).get("attached")
+                if sid:
+                    await self._attach_remote(sid)
+            else:
+                self._chat_note(f"⚠ '{cmd}' is not forwarded in daemon mode — the "
+                                "daemon owns this session. /model /context /new "
+                                "/sessions work; detach (ctrl+d) for local control.")
+            return
         if cmd == "/help":
             self._chat_note(HELP)
         elif cmd == "/model" and arg:
@@ -892,8 +1080,12 @@ class KernApp(App):
         elif cmd == "/tools":
             eng = self._engine()
             self._chat_note("\n".join(eng.index.lines()) or "(empty index)")
+        elif cmd == "/sessions" and self.remote is not None:
+            await self._daemon_entry()
         elif cmd == "/resume":
-            if arg:
+            if self.remote is not None:
+                await self._daemon_entry()
+            elif arg:
                 self._load_session(arg)
             else:
                 self.action_resume()

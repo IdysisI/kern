@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import math
 import os
 import sys
 import time
@@ -85,20 +86,26 @@ def esc(s: str) -> str:
 # ---------------------------------------------------------------- widgets ---
 
 class Spinner(QLabel):
-    FRAMES = "⠋⠙⠹⠸⠼⠴⦾⣿"
+    """One dot that breathes — size and brightness rise and fall on a slow sine."""
+    DOTS = ("·", "∙", "•")  # small → large → small
+    PERIOD = 2.4             # seconds per breath
+    STEP = 0.06              # timer interval
 
     def __init__(self):
         super().__init__("")
-        self._timer = QTimer(self, timeout=self._tick, interval=90)
-        self._i = 0
-        self._verb = "thinking…"
+        self._timer = QTimer(self, timeout=self._tick,
+                             interval=int(self.STEP * 1000))
         self._t0 = 0.0
+        self._verb = "thinking…"
+        self._dim_rgb = tuple(int(DIM[i:i + 2], 16) for i in (1, 3, 5))
+        self._lit_rgb = tuple(int(CYAN[i:i + 2], 16) for i in (1, 3, 5))
         self.hide()
 
     def start(self, verb="thinking…"):
         self._verb = verb
         self._t0 = time.monotonic()
         self._timer.start()
+        self._tick()
         self.show()
 
     def stop(self):
@@ -109,9 +116,12 @@ class Spinner(QLabel):
         self._verb = v
 
     def _tick(self):
-        self._i = (self._i + 1) % len(self.FRAMES)
         el = time.monotonic() - self._t0
-        self.setText(f'<span style="color:{CYAN}">{self.FRAMES[self._i]}</span> '
+        p = (math.sin(2 * math.pi * el / self.PERIOD - math.pi / 2) + 1) / 2
+        dot = self.DOTS[min(int(p * len(self.DOTS)), len(self.DOTS) - 1)]
+        col = "#%02x%02x%02x" % tuple(
+            round(a + (b - a) * p) for a, b in zip(self._dim_rgb, self._lit_rgb))
+        self.setText(f'<span style="color:{col}">{dot}</span> '
                      f'<span style="color:{DIM}">{self._verb} {el:.1f}s</span>')
 
 
