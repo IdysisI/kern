@@ -622,6 +622,13 @@ class KernApp(App):
             return
         if not self._explicit_model and res.get("model"):
             self.model = res["model"]
+        self._todo_card = None
+        self._tool_card = None
+        self._thinking_widget = None
+        self._stream_widget = None
+        self._stream_buf = []
+        self._dismiss_waiting()
+        self._remote_running = False
         self._refresh_chrome()
         self._render_journal()
         self._chat_note(f"◈ attached to {sid} — this terminal is a VIEW; closing it "
@@ -1065,7 +1072,10 @@ class KernApp(App):
         self.run_worker(self._model_picker(), name="picker", exclusive=False)
 
     def action_resume(self):
-        self.run_worker(self._resume_picker(), name="resume", exclusive=False)
+        if self.remote is not None:
+            self.run_worker(self._show_sessions_picker(), name="resume", exclusive=False)
+        else:
+            self.run_worker(self._resume_picker(), name="resume", exclusive=False)
 
     async def _resume_picker(self):
         rows = session_previews()
@@ -1074,7 +1084,10 @@ class KernApp(App):
             return
         pick = await self.push_screen_wait(SessionPicker(rows))
         if pick:
-            self._load_session(pick)
+            if self.remote is not None:
+                await self._attach_remote(pick)
+            else:
+                self._load_session(pick)
 
     def _render_journal(self):
         """Replay the current session's journal back into widgets."""

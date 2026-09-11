@@ -238,15 +238,24 @@ async def handler(ws):
             elif m == "sessions":
                 await ws.send(reply({"sessions": REG.listing()}))
             elif m == "new":
-                worker = REG.new(msg.get("cwd", os.getcwd()), msg.get("model"))
+                new_worker = REG.new(msg.get("cwd", os.getcwd()), msg.get("model"))
+                if worker is not None and worker is not new_worker:
+                    worker.clients.discard(ws)
+                worker = new_worker
                 worker.clients.add(ws)
                 await ws.send(reply({"attached": worker.session.id, "model": worker.model}))
             elif m == "attach":
                 requested_model = msg.get("model")
-                worker = REG.ensure(msg["session"], requested_model)
+                new_worker = REG.ensure(msg["session"], requested_model)
+                if worker is not None and worker is not new_worker:
+                    worker.clients.discard(ws)
+                worker = new_worker
                 if requested_model:
                     worker.model = requested_model
                 worker.clients.add(ws)
+                # LIMIT 1: auto-resume an open turn left by a daemon crash
+                # (user message journaled, no turn_end marker after it).
+                await worker.resume()
                 await ws.send(reply({
                     "attached": worker.session.id,
                     "running": worker.running,
@@ -287,7 +296,13 @@ async def handler(ws):
                 res = await worker.rewind(cid)
                 await ws.send(reply(res))
             elif m == "fork":
+                old_sid = worker.session.id
                 res = await worker.fork(msg.get("at"))
+                # re-key the registry: the worker now owns the CHILD journal.
+                # Without this, attaching to child_sid would spawn a SECOND
+                # worker over the same events.jsonl (split-brain corruption).
+                REG.workers[res["session"]] = worker
+                REG.workers.pop(old_sid, None)
                 await ws.send(reply(res))
             elif m == "replay":
                 for ev in worker.session.events:
