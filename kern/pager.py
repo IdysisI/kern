@@ -259,21 +259,49 @@ paths, identifiers, error strings; concrete enough to act without re-reading dro
 
 
 
-def compaction_view(events: list[dict], keep_last_turns: int = 10) -> tuple[list[dict], list[dict]]:
-    """Split events into (to_compact, kept_verbatim).
+def _ev_tokens(ev: dict) -> int:
+    """Rough token estimate of one journal event."""
+    t = len(str(ev.get("text", "")))
+    for tc in ev.get("tool_calls", []) or []:
+        try:
+            t += len(json.dumps(tc.get("arguments", {}), ensure_ascii=False))
+        except Exception:
+            t += 64
+    return t // 4 + 8
 
-    kept_verbatim = everything from the (N - keep_last_turns)-th user message
-    onward. to_compact = everything before that point, EXCEPT user messages,
-    which are always kept verbatim (golden rule).
-    """
-    user_idx = [i for i, ev in enumerate(events) if ev["kind"] == "user"]
-    if len(user_idx) < 2:
+
+def compaction_view(events: list[dict], keep_recent_tokens: int = 12000) -> tuple[list[dict], list[dict]]:
+    """ADAPTIVE window: keep the most recent events verbatim up to
+    keep_recent_tokens (aligned to the OLDEST user message that fits);
+    everything older is compacted. Fixes the 'Continue' treadmill loop where
+    a fixed 10-turn window protects exactly the bulk that must be compacted
+    (compaction dropped 1 event of a 69k-token context and refired forever).
+
+    The current turn (last user message onward) is ALWAYS protected: we
+    never compact mid-flight events. Golden rule unchanged: user messages
+    never compacted (compact_into keeps them)."""
+    if not events:
         return [], events
-    cut = user_idx[max(0, len(user_idx) - keep_last_turns)]
-    if cut == 0:
+    # suffix token sums, from the end, noting user-message boundaries
+    suff = 0
+    boundaries: list[tuple[int, int]] = []          # (user_idx, tokens user_idx..end)
+    for i in range(len(events) - 1, -1, -1):
+        suff += _ev_tokens(events[i])
+        if events[i]["kind"] == "user":
+            boundaries.append((i, suff))
+    if not boundaries:
+        return [], events                            # no user message: nothing to cut around
+    # walk boundaries most-recent -> older; pick the OLDEST that fits the window
+    chosen = boundaries[-1][0]
+    for ui, tk in reversed(boundaries):              # most recent first, tk increasing
+        if tk > keep_recent_tokens:
+            break
+        chosen = ui
+    if chosen <= 0:
         return [], events
-    old, recent = events[:cut], events[cut:]
+    old = events[:chosen]
     if not any(ev["kind"] != "user" for ev in old):
         return [], events
+    to_compact = [ev for ev in old if ev["kind"] != "user"]
     kept_from_old = [ev for ev in old if ev["kind"] == "user"]
-    return ([ev for ev in old if ev["kind"] != "user"], kept_from_old + recent)
+    return to_compact, kept_from_old + events[chosen:]

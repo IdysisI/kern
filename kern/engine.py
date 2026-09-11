@@ -337,6 +337,26 @@ class Engine:
         self.stream_cb("note", f"compacted: {dropped} events -> summary "
                                f"({len(summary)} chars), user msgs + state kept verbatim")
         self._compact_fails = 0
+        # DEEPENING PASSES: if the budget is STILL over the threshold (the
+        # protected window itself was the bulk), shrink the window and compact
+        # again with the same summary. Prevents the compact->refire->compact
+        # treadmill observed on 'Continue' sessions.
+        for window in (4000, 1200):
+            b = pager.budget(self.session.events, self.session)
+            if not b.get("should_compact"):
+                break
+            to_c2, _k = pager.compaction_view(self.session.events, keep_recent_tokens=window)
+            if not to_c2:
+                break
+            dropped += self.session.compact_into(to_c2[-1]["n"] + 1, summary,
+                                                 facts=self._build_facts(to_c2))
+            self.stream_cb("note", f"deep compact (window {window} tok): "
+                                   f"{dropped} events dropped so far")
+        b = pager.budget(self.session.events, self.session)
+        if b.get("should_compact"):
+            self.stream_cb("note", f"⚠ context still ~{b['approx_tokens']:,} tokens after "
+                                   "compaction — the current turn itself is the bulk. "
+                                   "Consider /new or uploading smaller artifacts.")
         return True
 
     async def _dedicated_compaction(self, to_compact: list[dict], kept: list[dict]) -> bool:
@@ -584,4 +604,4 @@ class Engine:
 
         if getattr(self, "_compact_pending", False):
             await self._finish_pending_compaction()
-        return final_text + "\n[step limit reached]"
+        return final_text + "\n[step limit reached — 30 tool iterations this turn; send another message to continue]"
