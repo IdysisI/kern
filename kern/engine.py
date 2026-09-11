@@ -220,7 +220,34 @@ class Engine:
         self.session.emit("user", text=user_text)
         self.session.emit("objective", text=user_text[:400])
         self._autocheckpoint()
-        return await self._loop()
+        return await self._run_marked()
+
+    async def resume(self) -> str:
+        """Continue an OPEN turn (daemon died mid-flight). The user message is
+        already journaled; the pager flags any dangling actions as uncertain,
+        so the model verifies state instead of blindly replaying side effects."""
+        if not self.session.turn_is_open():
+            raise RuntimeError("no open turn to resume")
+        self._autocheckpoint()
+        return await self._run_marked()
+
+    async def _run_marked(self) -> str:
+        """_loop() + journal a turn_end marker so the turn is CLOSED: an
+        interrupt/undo/rewind must never look like a crash to auto-resume."""
+        reason = "done"
+        try:
+            return await self._loop()
+        except asyncio.CancelledError:
+            reason = "interrupted"
+            raise
+        except Exception:
+            reason = "error"
+            raise
+        finally:
+            try:
+                self.session.emit("turn_end", reason=reason)
+            except Exception:
+                pass   # a dead journal must not mask the real error
 
     def _autocheckpoint(self) -> None:
 

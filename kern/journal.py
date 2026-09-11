@@ -130,6 +130,7 @@ class Session:
             with open(self.log, "w") as f:
                 for ev in self.events:
                     f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        self.emit("turn_end", reason="rewind")   # deliberate stop, not a crash
         return restored
 
     def last_checkpoint(self) -> int | None:
@@ -196,6 +197,7 @@ class Session:
         with open(self.log, "w") as f:
             for ev in self.events:
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+        self.emit("turn_end", reason="undo")   # deliberate stop, not a crash
         return len(tail)
 
     def fork(self, at_n: int | None = None) -> "Session":
@@ -203,7 +205,23 @@ class Session:
         upto = at_n if at_n is not None else len(self.events)
         for ev in self.events[:upto]:
             child.emit(**{k: v for k, v in ev.items() if k not in ("n", "ts")})
+        if child.turn_is_open():
+            # a fork cut mid-turn must NOT look like a crash to auto-resume
+            child.emit("turn_end", reason="fork")
         return child
+
+    def turn_is_open(self) -> bool:
+        """True when the last user message has no turn_end marker after it —
+        the turn died mid-flight (daemon crash / kill -9) and can be resumed.
+        Deliberate stops (ctrl+c interrupt, /undo, /rewind) journal a
+        turn_end too, so they never auto-resume."""
+        last_user = -1
+        for i, ev in enumerate(self.events):
+            if ev["kind"] == "user":
+                last_user = i
+        if last_user < 0:
+            return False
+        return not any(ev["kind"] == "turn_end" for ev in self.events[last_user + 1:])
 
     def meta(self) -> dict:
         for ev in self.events:

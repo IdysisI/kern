@@ -24,6 +24,8 @@ import subprocess
 import time
 from pathlib import Path
 
+KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))
+
 SCHEMAS = [
     {"type": "function", "function": {
         "name": "read",
@@ -183,9 +185,12 @@ def _locked_update(p: Path, fn) -> tuple[str, str] | None:
     process can still race; the edit precondition catches the common case
     by refusing on drifted content."""
     import fcntl
-    lock = p.with_name(p.name + ".kern-lock")
+    import hashlib
+    lock_dir = KERN_HOME / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_key = hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:16]
+    lock = lock_dir / f"{lock_key}.lock"
     tmp = p.with_name(p.name + ".kern-tmp")
-    lock.parent.mkdir(parents=True, exist_ok=True)
     with open(lock, "w") as lf:
         fcntl.flock(lf, fcntl.LOCK_EX)
         try:

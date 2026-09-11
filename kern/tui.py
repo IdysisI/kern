@@ -15,6 +15,7 @@ import time
 
 KERN_DAEMON_PORT = int(os.environ.get("KERN_SERVE_PORT", "8766"))
 KERN_DAEMON_URI = os.environ.get("KERN_SERVE_URI", f"ws://127.0.0.1:{KERN_DAEMON_PORT}")
+DAEMON_VERSION = "0.2.2" 
 
 from rich.markdown import Markdown as RichMarkdown
 from rich.table import Table as RichTable
@@ -436,6 +437,12 @@ class KernApp(App):
         # terminal. None until attached.
         self.remote = None
         self._remote_running = False
+        self._rpc_seq = 0
+        self._pending_rpc: dict[int, asyncio.Future] = {}
+        self._explicit_model = model is not None or "KERN_MODEL" in os.environ
+        self._usage_in = 0
+        self._usage_out = 0
+        self._tokens_streamed = 0
         self.turn_worker = None
         self._stream_widget: Static | None = None
         self._stream_buf: list[str] = []
@@ -474,44 +481,21 @@ class KernApp(App):
 
     # ---- remote (daemon) mode: sessions outlive this terminal ----------------
 
-    async def _daemon_entry(self):
-        """Connect (auto-spawn) the daemon, then offer: active / idle / new.
-        On any failure, fall back to local mode silently."""
+    async def _remote_rpc(self, method: str, timeout: float = 10.0, **kwargs) -> dict:
+        """Send RPC request and await its response. Handled strictly by the single
+        background _remote_reader loop to guarantee zero websocket concurrency errors."""
+        if self.remote is None:
+            raise RuntimeError("not connected to daemon")
+        self._rpc_seq += 1
+        req_id = self._rpc_seq
+        fut = asyncio.get_running_loop().create_future()
+        self._pending_rpc[req_id] = fut
         try:
-            self.remote = await self._connect_daemon()
-        except Exception as e:
-            self._chat_note(f"daemon unavailable ({type(e).__name__}) — local mode: "
-                            "closing this terminal will end the session.")
-            self._welcome()
-            return
-        rows = [{"id": "__new__", "turns": "0", "preview": "start a fresh session"}]
-        try:
-            await self.remote.send(json.dumps({"method": "sessions"}))
-            raw = json.loads(await asyncio.wait_for(self.remote.recv(), timeout=5))
-            listing = raw.get("result", {}).get("sessions", {})
-        except Exception:
-            listing = {}
-        for sid, info in listing.items():
-            if sid == self.session.id:
-                continue
-            rows.append({"id": sid,
-                         "turns": "ACTIVE" if info.get("active") else "idle",
-                         "preview": (info.get("preview", "") or "?").split("|")[0]})
-        pick = await self.push_screen_wait(SessionPicker(rows))
-        if not pick:
-            self._welcome()
-            return
-        if pick == "__new__":
-            await self.remote.send(json.dumps(
-                {"method": "new", "cwd": self.cwd, "model": self.model}))
-            raw = json.loads(await asyncio.wait_for(self.remote.recv(), timeout=5))
-            sid = raw.get("result", {}).get("attached")
-        else:
-            sid = pick
-        if not sid:
-            self._welcome()
-            return
-        await self._attach_remote(sid)
+            msg = {"method": method, "req_id": req_id, **kwargs}
+            await self.remote.send(json.dumps(msg, ensure_ascii=False))
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._pending_rpc.pop(req_id, None)
 
     async def _connect_daemon(self, tries=4):
         import websockets as _ws
@@ -519,7 +503,23 @@ class KernApp(App):
         last = None
         for i in range(tries):
             try:
-                return await _ws.connect(KERN_DAEMON_URI, open_timeout=1.5)
+                ws = await _ws.connect(KERN_DAEMON_URI, open_timeout=1.5)
+                # Check daemon version to ensure it is not running stale code
+                try:
+                    await ws.send(json.dumps({"method": "version", "req_id": 999999}))
+                    raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+                    ver = raw.get("result", {}).get("version")
+                    if ver != DAEMON_VERSION:
+                        try:
+                            await ws.send(json.dumps({"method": "shutdown"}))
+                            await ws.close()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.5)
+                        continue
+                except Exception:
+                    pass
+                return ws
             except Exception as e:
                 last = e
                 if i == 0:
@@ -529,33 +529,133 @@ class KernApp(App):
                 await asyncio.sleep(0.5 + 0.5 * i)
         raise last
 
+    async def _daemon_entry(self):
+        """Connect (auto-spawn) daemon and attach to session.
+        If active running sessions exist, show picker to resume.
+        Otherwise attach/start cleanly without blocking modal popup."""
+        try:
+            self.remote = await self._connect_daemon()
+        except Exception as e:
+            self.remote = None
+            self._chat_note(f"daemon unavailable ({type(e).__name__}) — local mode: "
+                            "closing this terminal will end the session.")
+            self._welcome()
+            return
+
+        # Start the reader worker FIRST so RPC responses are handled immediately
+        self.run_worker(self._remote_reader(), name="remote", exclusive=True)
+
+        try:
+            res = await self._remote_rpc("sessions", timeout=4.0)
+            listing = res.get("sessions", {})
+        except Exception:
+            listing = {}
+
+        # If any session is currently ACTIVE (running in the background),
+        # prompt the user with the session picker so they can resume it.
+        active_sids = [sid for sid, info in listing.items() if info.get("active")]
+        if active_sids:
+            rows = [{"id": "__new__", "turns": "0", "preview": "start a fresh session"}]
+            for sid in active_sids:
+                info = listing[sid]
+                rows.append({"id": sid, "turns": "ACTIVE",
+                             "preview": (info.get("preview", "") or "?").split("|")[0]})
+            for sid, info in listing.items():
+                if sid not in active_sids and sid != self.session.id:
+                    rows.append({"id": sid, "turns": "idle",
+                                 "preview": (info.get("preview", "") or "?").split("|")[0]})
+
+            pick = await self.push_screen_wait(SessionPicker(rows))
+            if pick and pick != "__new__":
+                await self._attach_remote(pick)
+                return
+
+        # Default path: start fresh session on daemon with user's model & cwd
+        try:
+            res = await self._remote_rpc("new", cwd=self.cwd, model=self.model, timeout=5.0)
+            sid = res.get("attached")
+            if sid:
+                self.session = Session(sid)
+                if not self._explicit_model and res.get("model"):
+                    self.model = res["model"]
+                self._refresh_chrome()
+                self._welcome()
+                return
+        except Exception as e:
+            self._chat_error(f"failed to start session on daemon: {e}")
+
+        self._welcome()
+
+    async def _show_sessions_picker(self):
+        try:
+            res = await self._remote_rpc("sessions", timeout=4.0)
+            listing = res.get("sessions", {})
+        except Exception as e:
+            self._chat_error(f"could not list sessions: {e}")
+            return
+        rows = [{"id": "__new__", "turns": "0", "preview": "start a fresh session"}]
+        for sid, info in listing.items():
+            if sid == self.session.id:
+                continue
+            rows.append({
+                "id": sid,
+                "turns": "ACTIVE" if info.get("active") else "idle",
+                "preview": (info.get("preview", "") or "?").split("|")[0]
+            })
+        pick = await self.push_screen_wait(SessionPicker(rows))
+        if pick == "__new__":
+            await self._slash("/new")
+        elif pick:
+            await self._attach_remote(pick)
+
     async def _attach_remote(self, sid: str):
         """Attach to a daemon session: replay the journal from disk, then
         stream live events. Closing this terminal DETACHES only."""
-        import json as _json
         self.session = Session(sid)
-        await self.remote.send(_json.dumps({"method": "attach", "session": sid,
-                                            "model": self.model}))
-        raw = _json.loads(await asyncio.wait_for(self.remote.recv(), timeout=5))
-        att = raw.get("result", {})
-        self.model = att.get("model", self.model)
+        req_kwargs = {"session": sid}
+        if self._explicit_model:
+            req_kwargs["model"] = self.model
+        try:
+            res = await self._remote_rpc("attach", timeout=6.0, **req_kwargs)
+        except Exception as e:
+            self._chat_error(f"could not attach to {sid}: {e}")
+            return
+        if not self._explicit_model and res.get("model"):
+            self.model = res["model"]
+        self._refresh_chrome()
         self._render_journal()
         self._chat_note(f"◈ attached to {sid} — this terminal is a VIEW; closing it "
                         "does NOT stop the agent. ctrl+c interrupts, ctrl+d detaches.")
-        self.run_worker(self._remote_reader(), name="remote", exclusive=True)
-        if att.get("running"):
+        if res.get("running"):
             self._remote_running = True
             self._remote_turn_started()
 
     async def _remote_reader(self):
-        """Pump daemon -> widgets. Exits silently on detach/close."""
-        import json as _json
+        """Pump daemon -> widgets and resolve pending RPC futures."""
         try:
             async for raw in self.remote:
-                msg = _json.loads(raw)
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    continue
+
+                # 1. Resolve pending RPC reply
+                req_id = msg.get("req_id")
+                if req_id is not None and req_id in self._pending_rpc:
+                    fut = self._pending_rpc[req_id]
+                    if not fut.done():
+                        if "error" in msg:
+                            fut.set_exception(RuntimeError(msg["error"]))
+                        else:
+                            fut.set_result(msg.get("result", msg))
+                    continue
+
+                # 2. Live stream events
                 ev = msg.get("event")
                 if ev in ("text", "thinking", "tool", "result", "diff",
                           "note", "todo", "handle"):
+                    if ev == "text":
+                        self._tokens_streamed += max(1, len(msg.get("text", "")) // 4)
                     self._on_stream(ev, msg.get("text", ""))
                 elif ev == "turn_start":
                     self._remote_running = True
@@ -564,23 +664,32 @@ class KernApp(App):
                     self._remote_running = False
                     self._flush_stream()
                     self._dismiss_waiting()
+                    if msg.get("usage"):
+                        u = msg["usage"]
+                        self._usage_in += u.get("in", 0)
+                        self._usage_out += u.get("out", 0)
                     if msg.get("reply"):
                         self.chat.mount(Static(RichMarkdown(msg["reply"], justify="left"),
                                                classes="assistant"))
                     if self._queue:
                         nxt = self._queue.pop(0)
+                        self.chat.mount(UserMsg(nxt))
+                        self.chat.scroll_end(animate=False)
                         self._remote_send_chat(nxt)
                     else:
                         self._chat_note("■ turn finished (session idle)")
                 elif ev == "approve_request":
-                    await self._remote_approve(msg.get("id"), msg.get("desc"),
-                                               msg.get("diff"))
+                    self.run_worker(
+                        self._remote_approve(msg.get("id"), msg.get("desc"), msg.get("diff")),
+                        name="approve", exclusive=False
+                    )
                 elif ev == "busy":
                     self._chat_note("⚠ " + str(msg.get("text", "")))
                 elif ev == "error":
                     self._chat_note("⚠ " + str(msg.get("error", "")))
         except Exception:
-            pass   # detached or daemon gone; session lives on regardless
+            if self.remote is not None:
+                self._chat_note("◈ disconnected from daemon (session continues in background)")
 
     def _remote_turn_started(self):
         self._t0 = time.monotonic()
@@ -593,20 +702,38 @@ class KernApp(App):
         self.chat.scroll_end(animate=False)
 
     def _remote_send_chat(self, text: str):
-        import json as _json
-        asyncio.ensure_future(self.remote.send(
-            _json.dumps({"method": "chat", "text": text})))
+        self._remote_running = True
+        self._remote_turn_started()
+        asyncio.create_task(self._remote_send_chat_async(text))
+
+    async def _remote_send_chat_async(self, text: str):
+        try:
+            if self.remote is None:
+                self._remote_running = False
+                self._start_turn(text)
+                return
+            await self.remote.send(json.dumps({"method": "chat", "text": text}, ensure_ascii=False))
+        except Exception as e:
+            self._remote_running = False
+            self._dismiss_waiting()
+            self._chat_error(f"failed to send to daemon ({e}) — running locally:")
+            self.remote = None
+            self._start_turn(text)
 
     async def _remote_approve(self, aid, desc, diff):
-        import json as _json
         if self._always:
-            await self.remote.send(_json.dumps({"method": "approve", "id": aid, "allow": True}))
+            try:
+                await self.remote.send(json.dumps({"method": "approve", "id": aid, "allow": True}))
+            except Exception:
+                pass
             return
         v = await self.push_screen_wait(Approve(desc, diff))
         if v == "a":
             self._always = True
-        await self.remote.send(_json.dumps({"method": "approve",
-                                            "id": aid, "allow": v in ("y", "a")}))
+        try:
+            await self.remote.send(json.dumps({"method": "approve", "id": aid, "allow": v in ("y", "a")}))
+        except Exception:
+            pass
 
     async def _load_catalog(self):
         try:
@@ -646,10 +773,12 @@ class KernApp(App):
             # 0.12s, never jumping, so the breath reads as one slow pulse.
             self._spin_i = (getattr(self, "_spin_i", -1) + 1) % len(self._SPIN)
             frame = self._SPIN[self._spin_i]
-            tok = getattr(self.engine, "tokens_streamed", 0)
+            tok = getattr(getattr(self, "engine", None), "tokens_streamed", getattr(self, "_tokens_streamed", 0))
             self.query_one("#status").update(
                 f" {frame} {self._verb}  {el:0.1f}s · {tok:,} tok")
-            right += f"  ↑{self.engine.usage_in:,} ↓{self.engine.usage_out:,}"
+            u_in = getattr(getattr(self, "engine", None), "usage_in", getattr(self, "_usage_in", 0))
+            u_out = getattr(getattr(self, "engine", None), "usage_out", getattr(self, "_usage_out", 0))
+            right += f"  ↑{u_in:,} ↓{u_out:,}"
             # live updates: streamed text, waiting placeholder, running cards
             self._paint_stream(frame)
             if self._waiting_widget is not None:
@@ -908,6 +1037,8 @@ class KernApp(App):
             self._start_turn(nxt)
 
     def _turn_running(self) -> bool:
+        if self.remote is not None:
+            return self._remote_running
         w = getattr(self, "turn_worker", None)
         return w is not None and w.is_running
 
@@ -988,33 +1119,16 @@ class KernApp(App):
     async def _slash(self, text: str):
         cmd, _, arg = text.partition(" ")
         arg = arg.strip()
-        if self.remote is not None and cmd not in ("/help", "/sessions"):
-            # daemon owns the session: only harmless/local commands pass,
-            # mutations are forwarded where the daemon supports them.
-            import json as _json
-            if cmd == "/model" and arg:
-                self.model = arg
-                await self.remote.send(_json.dumps({"method": "model", "model": arg}))
-                self._refresh_chrome()
-                self._chat_note(f"model → {arg} (daemon session)")
-            elif cmd == "/context":
-                await self.remote.send(_json.dumps({"method": "context"}))
-            elif cmd == "/new":
-                await self.remote.send(_json.dumps({"method": "new", "cwd": self.cwd,
-                                                    "model": self.model}))
-                raw = json.loads(await asyncio.wait_for(self.remote.recv(), timeout=5))
-                sid = raw.get("result", {}).get("attached")
-                if sid:
-                    await self._attach_remote(sid)
-            else:
-                self._chat_note(f"⚠ '{cmd}' is not forwarded in daemon mode — the "
-                                "daemon owns this session. /model /context /new "
-                                "/sessions work; detach (ctrl+d) for local control.")
-            return
         if cmd == "/help":
             self._chat_note(HELP)
         elif cmd == "/model" and arg:
             self.model = arg
+            self._explicit_model = True
+            if self.remote is not None:
+                try:
+                    await self._remote_rpc("model", model=arg)
+                except Exception as e:
+                    self._chat_error(f"could not set daemon model: {e}")
             self._refresh_chrome()
             self._chat_note(f"model → {arg}")
         elif cmd in ("/models",):
@@ -1024,81 +1138,134 @@ class KernApp(App):
             r = await self.client.probe(self.model)
             self._chat_note(str(r))
         elif cmd == "/new":
-            for w in list(self.chat.children):
-                w.remove()
-            self.session = create_session(cwd=self.cwd)
-            self._todo_card = None
-            self._refresh_chrome()
-            self._chat_note(f"fresh session {self.session.id} — zero carry-over")
-        elif cmd == "/context":
-            self._chat_note(str(budget(self.session.events, self.session)))
-        elif cmd == "/usage":
-            eng = getattr(self, "engine", None)
-            if not eng:
-                self._chat_note("no turns yet")
-            else:
-                pricing = (self._catalog.get(self.model, {}).get("pricing") or {})
-                cost = (eng.usage_in * pricing.get("prompt", 0)
-                        + eng.usage_out * pricing.get("completion", 0))
-                self._chat_note(
-                    f"model {self.model}\n"
-                    f"tokens: ↑{eng.usage_in:,} in · ↓{eng.usage_out:,} out\n"
-                    f"cost so far: ${cost:.4f}" if pricing else
-                    f"tokens: ↑{eng.usage_in:,} in · ↓{eng.usage_out:,} out")
-        elif cmd == "/rewind" and arg.isdigit():
-            restored = self.session.restore(int(arg))
-            self._chat_note(f"restored: {restored}")
-        elif cmd == "/undo":
-            n = self.session.undo_to_last_user()
-            if n:
-                # also restore the working tree from the latest checkpoint
-                # taken at that user message, if one exists
+            if self.remote is not None:
                 try:
-                    ckpts = sorted(self.session.ckpt.glob("c*"),
-                                   key=lambda p: int(p.name[1:]))
-                    for c in reversed(ckpts):
-                        import json as _json
-                        man = _json.loads((c / "manifest.json").read_text())
-                        if man.get("event_n", 1 << 30) <= len(self.session.events):
-                            restored = self.session.restore(int(c.name[1:]))
-                            self._chat_note(
-                                f"↩ undo: dropped {n} events back to your last prompt"
-                                + (f"; files restored from {c.name}" if restored else ""))
-                            break
-                    else:
-                        self._chat_note(f"↩ undo: dropped {n} events (journal only)")
-                except Exception:
-                    self._chat_note(f"↩ undo: dropped {n} events (journal only)")
+                    res = await self._remote_rpc("new", cwd=self.cwd, model=self.model, timeout=10.0)
+                    sid = res.get("attached")
+                    if sid:
+                        self.session = Session(sid)
+                        for w in list(self.chat.children):
+                            w.remove()
+                        self._todo_card = None
+                        self._refresh_chrome()
+                        self._chat_note(f"fresh session {sid} — zero carry-over")
+                except Exception as e:
+                    self._chat_error(f"new session failed: {e}")
             else:
-                self._chat_note("nothing to undo")
-            # rebuild the visible chat from the journal
-            for w in list(self.chat.children):
-                w.remove()
-            self._todo_card = None
-            self._render_journal()
+                for w in list(self.chat.children):
+                    w.remove()
+                self.session = create_session(cwd=self.cwd)
+                self._todo_card = None
+                self._refresh_chrome()
+                self._chat_note(f"fresh session {self.session.id} — zero carry-over")
+        elif cmd == "/context":
+            if self.remote is not None:
+                try:
+                    res = await self._remote_rpc("context")
+                    self._chat_note(str(res))
+                except Exception as e:
+                    self._chat_error(f"context failed: {e}")
+            else:
+                self._chat_note(str(budget(self.session.events, self.session)))
+        elif cmd == "/usage":
+            u_in = getattr(getattr(self, "engine", None), "usage_in", self._usage_in)
+            u_out = getattr(getattr(self, "engine", None), "usage_out", self._usage_out)
+            pricing = (self._catalog.get(self.model, {}).get("pricing") or {})
+            cost = (u_in * pricing.get("prompt", 0) + u_out * pricing.get("completion", 0))
+            self._chat_note(
+                f"model {self.model}\n"
+                f"tokens: ↑{u_in:,} in · ↓{u_out:,} out\n"
+                f"cost so far: ${cost:.4f}" if pricing else
+                f"tokens: ↑{u_in:,} in · ↓{u_out:,} out")
+        elif cmd == "/undo":
+            if self.remote is not None:
+                try:
+                    res = await self._remote_rpc("undo", timeout=20.0)
+                    n = res.get("dropped", 0)
+                    restored = res.get("restored", [])
+                    self.session = Session(self.session.id)
+                    self._render_journal()
+                    self._chat_note(
+                        f"↩ undo: dropped {n} events back to your last prompt"
+                        + (f"; files restored: {len(restored)}" if restored else ""))
+                except Exception as e:
+                    self._chat_error(f"undo failed: {e}")
+            else:
+                n = self.session.undo_to_last_user()
+                if n:
+                    try:
+                        ckpts = sorted(self.session.ckpt.glob("c*"),
+                                       key=lambda p: int(p.name[1:]))
+                        for c in reversed(ckpts):
+                            man = json.loads((c / "manifest.json").read_text())
+                            if man.get("event_n", 1 << 30) <= len(self.session.events):
+                                restored = self.session.restore(int(c.name[1:]))
+                                self._chat_note(
+                                    f"↩ undo: dropped {n} events back to your last prompt"
+                                    + (f"; files restored from {c.name}" if restored else ""))
+                                break
+                        else:
+                            self._chat_note(f"↩ undo: dropped {n} events (journal only)")
+                    except Exception:
+                        self._chat_note(f"↩ undo: dropped {n} events (journal only)")
+                else:
+                    self._chat_note("nothing to undo")
+                self._render_journal()
+        elif cmd == "/rewind" and arg.isdigit():
+            if self.remote is not None:
+                try:
+                    res = await self._remote_rpc("rewind", id=int(arg), timeout=15.0)
+                    self.session = Session(self.session.id)
+                    self._render_journal()
+                    self._chat_note(f"restored: {res.get('restored', [])}")
+                except Exception as e:
+                    self._chat_error(f"rewind failed: {e}")
+            else:
+                restored = self.session.restore(int(arg))
+                self.session = Session(self.session.id)
+                self._render_journal()
+                self._chat_note(f"restored: {restored}")
         elif cmd == "/fork":
-            child = self.session.fork(int(arg) if arg.isdigit() else None)
-            self.session = child
-            for w in list(self.chat.children):
-                w.remove()
-            self._refresh_chrome()
-            self._chat_note(f"forked → {child.id}")
+            if self.remote is not None:
+                try:
+                    res = await self._remote_rpc("fork", at=int(arg) if arg.isdigit() else None, timeout=10.0)
+                    sid = res.get("session")
+                    if sid:
+                        self.session = Session(sid)
+                        self._render_journal()
+                        self._refresh_chrome()
+                        self._chat_note(f"forked → {sid}")
+                except Exception as e:
+                    self._chat_error(f"fork failed: {e}")
+            else:
+                child = self.session.fork(int(arg) if arg.isdigit() else None)
+                self.session = child
+                self._render_journal()
+                self._refresh_chrome()
+                self._chat_note(f"forked → {child.id}")
         elif cmd == "/tools":
             eng = self._engine()
             self._chat_note("\n".join(eng.index.lines()) or "(empty index)")
-        elif cmd == "/sessions" and self.remote is not None:
-            await self._daemon_entry()
-        elif cmd == "/resume":
+        elif cmd == "/sessions":
             if self.remote is not None:
-                await self._daemon_entry()
-            elif arg:
-                self._load_session(arg)
+                await self._show_sessions_picker()
             else:
                 self.action_resume()
+        elif cmd == "/resume":
+            if self.remote is not None:
+                if arg:
+                    await self._attach_remote(arg)
+                else:
+                    await self._show_sessions_picker()
+            else:
+                if arg:
+                    self._load_session(arg)
+                else:
+                    self.action_resume()
         elif cmd == "/clear":
             self.action_clear()
         else:
-            self._chat_note("unknown command — /help")
+            self._chat_note(f"unknown command '{cmd}' — /help")
 
     async def _model_picker(self):
         health = load_health()
@@ -1122,6 +1289,12 @@ class KernApp(App):
         pick = await self.push_screen_wait(ModelPicker(rows, self.model))
         if pick:
             self.model = pick
+            self._explicit_model = True
+            if self.remote is not None:
+                try:
+                    await self._remote_rpc("model", model=pick)
+                except Exception as e:
+                    self._chat_error(f"could not set daemon model: {e}")
             self._refresh_chrome()
             self._chat_note(f"model → {pick}")
 

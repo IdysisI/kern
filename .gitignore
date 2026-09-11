@@ -6,3 +6,6 @@ __pycache__/
 *.svg
 *.png
 /tmp/
+
+*.kern-lock
+*.kern-tmp
