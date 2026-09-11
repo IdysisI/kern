@@ -291,9 +291,12 @@ def compaction_view(events: list[dict], keep_recent_tokens: int = 12000) -> tupl
             boundaries.append((i, suff))
     if not boundaries:
         return [], events                            # no user message: nothing to cut around
-    # walk boundaries most-recent -> older; pick the OLDEST that fits the window
-    chosen = boundaries[-1][0]
-    for ui, tk in reversed(boundaries):              # most recent first, tk increasing
+    # boundaries is already ordered most-recent first (boundaries[0]) to
+    # oldest (boundaries[-1]). tk is strictly increasing as we walk backward.
+    # Default to boundaries[0][0]: at minimum, protect the current turn if
+    # even the latest turn exceeds the budget.
+    chosen = boundaries[0][0]
+    for ui, tk in boundaries:                       # most recent first, tk increasing
         if tk > keep_recent_tokens:
             break
         chosen = ui
