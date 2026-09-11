@@ -163,9 +163,8 @@ class Engine:
                         repeats += 1
         if repeats >= 3 and not getattr(self, "_reread_noted", {}).get(key):
             getattr(self, "_reread_noted", {})[key] = True
-            self.stream_cb("note", f"kern: you have now targeted '{key}' {repeats} times in "
-                                   f"the recent window — earlier results are in your view. "
-                                   f"Re-reading rarely adds information; act on what you have.")
+            self.stream_cb("note", f"kern fact: read #{repeats} of '{key}' this session; "
+                                   f"earlier results are still in the conversation view.")
 
     def _prior_execution(self, name: str, args: dict) -> str | None:
 
@@ -249,55 +248,23 @@ class Engine:
         return await self._loop()
 
     def _deploy_mode_note(self, path: str) -> None:
-        """One note per session after the first successful write/edit. The
-        GENERAL anti-circling lesson from session 20260911-131749: edited code
-        is not running code. Three branches, sharpest first:
-        1. self-edit: the file lives in the very package this process runs ->
-           the user must RESTART to see it (say so explicitly).
-        2. an installed copy of this project exists outside the repo ->
-           IF the user launches that copy, a reinstall is needed; ASK which
-           way they run it before concluding.
-        3. generic: any running process won't hot-reload the edit."""
+        """Self-edit only, stated as a fact on the tool result: the file just
+        edited was loaded by this process at launch. No preaching — one line,
+        once per session, only when mechanically certain."""
         if getattr(self, "_noted_deploy_mode", False):
             return
         try:
-            import shutil
             rp = Path(path)
             if not rp.is_absolute():
                 rp = Path(self.fs.cwd) / rp
-            rp = rp.resolve()
-            self_dir = os.environ.get(
-                "KERN_SELF_DIR", str(Path(__file__).resolve().parent))
-            argv = " ".join(sys.argv[-3:])[:80]
-            if str(rp).startswith(str(Path(self_dir))):
-                self._noted_deploy_mode = True
-                msg = (f"kern: you just edited the very package this process is running "
-                       f"(launched as: {argv}). Running processes do NOT hot-reload source: "
-                       f"the user will see this change only after they RESTART. Tell them "
-                       f"clearly instead of investigating the code.")
-            else:
-                try:
-                    import tomllib
-                    pp = Path(self.fs.cwd) / "pyproject.toml"
-                    pkg = (tomllib.loads(pp.read_text()).get("project") or {}).get("name", "") if pp.is_file() else ""
-                except Exception:
-                    pkg = ""
-                exe = shutil.which(pkg.replace("-agent", "").replace("-", "")) if pkg else None
-                if exe and not str(Path(exe).resolve()).startswith(str(Path(self.fs.cwd))):
-                    self._noted_deploy_mode = True
-                    msg = (f"kern: source edited. An installed copy of '{pkg}' exists at "
-                           f"{exe} — IF the user launches that copy it is stale until "
-                           f"reinstall (`uv tool install --force .`); if they run from source, "
-                           f"a RESTART is enough. Establish how they launch it BEFORE "
-                           f"assuming either.")
-                else:
-                    self._noted_deploy_mode = True
-                    msg = ("kern: source edited. Running processes do not hot-reload edits — "
-                           "the user must restart/reload to see the change. If they later "
-                           "report 'it didn't change', first ask how they run the project "
-                           "(dev server? installed binary? this very process?).")
-            self.session.emit("note", text=msg)
-            self.stream_cb("note", "◈ " + msg.splitlines()[0])
+            here = Path(__file__).resolve().parent
+            if not str(rp.resolve()).startswith(str(here)):
+                return                       # not this process's package: nothing to state
+            self._noted_deploy_mode = True
+            self.session.emit("note", text=(
+                f"kern fact: {rp.name} was loaded by this process at launch — "
+                f"the change takes effect on the next kern restart."))
+            self.stream_cb("note", f"◈ {rp.name} applies on next kern restart")
         except Exception:
             pass
 

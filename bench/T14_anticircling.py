@@ -1,8 +1,8 @@
-"""T14v2 — anti-circling GÉNÉRAL: 'code édité ≠ code en cours d'exécution'.
-Branche 1: self-edit (fichier dans le package que CE processus exécute) -> note RESTART explicite.
-Branche 2: copie installée hors repo -> note conditionnelle (demande le mode de lancement).
-Branche 3: générique -> note restart/reload pour N'IMPORTE QUEL fichier de n'importe quel repo.
-+ note de relecture répétée (inchangée)."""
+"""T14v3 — faits, pas instructions:
+A) le prompt système contient la ligne `launched:` (comment CE process tourne)
+B) self-edit -> note factuelle une-ligne "applies on next kern restart" (une fois/session)
+C) relecture #4 de la même cible -> fait neutre "read #4 ...; earlier results in view"
+D) éditer un fichier hors du package courant -> AUCUNE note deploy (rien à énoncer)"""
 import asyncio, json, os, sys, tempfile, pathlib
 sys.path.insert(0, "/home/marty/kern")
 from kern.client import load_health, save_health
@@ -11,72 +11,73 @@ save_health(h)
 from kern.journal import create_session
 from kern.engine import Engine
 from kern.client import StreamEvent
+import kern.kernel as KK
+
+# A) le prompt contient le fait launched
+sp = KK.system_prompt("/tmp", "m", "2026-09-11", "main", [])
+assert "launched:" in sp, "FAIL A: pas de fait launched dans le prompt"
+assert "RESTART of this process" in sp or "installed copy" in sp, sp[-300:]
+assert "Establish HOW" not in sp and "Re-reading" not in sp, "FAIL A: instructions restantes"
+print("A) fait launched dans le prompt:", sp[sp.find("launched:"):][:90], "...")
 
 notes = []
 def cb(kind, text):
     if kind == "note": notes.append(text)
 
 class FC:
-    def __init__(self): self.n = 0
+    def __init__(self, path="src/app.py"): self.path = path; self.n = 0
     async def probe(self, model): return None
     async def stream_chat(self, model, messages, system=None, tools=None, max_tokens=None):
         self.n += 1
         if self.n == 1:
             yield StreamEvent("tool_call", tool_call={"id": "e1", "name": "write",
-                                                     "arguments": {"path": "src/app.py", "content": "x"}})
+                                                      "arguments": {"path": self.path, "content": "x"}})
             yield StreamEvent("done")
         else:
             yield StreamEvent("text", text="done"); yield StreamEvent("done")
 
-def run(tmp, extra_env=None):
-    sess = create_session(cwd=str(tmp))
-    eng = Engine(FC(), "fake-model", sess, str(tmp), approve=lambda d, p=None: True, stream_cb=cb)
-    asyncio.run(eng.chat("write it"))
-    jn = [e.get("text","") for e in sess.events if e["kind"] == "note"]
-    return notes, jn
-
-# Branche 3: repo lambda SANS pyproject -> note générique
-tmp3 = pathlib.Path(tempfile.mkdtemp())
-(tmp3 / "src").mkdir()
-os.environ.pop("KERN_SELF_DIR", None)
-os.environ.pop("KERN_FAKEBIN", None)
+# B) self-edit (fichier dans le package kern réellement en cours) -> note factuelle
+kern_pkg_file = str(pathlib.Path(KK.__file__).parent / "some_test_file.py")
+sess = create_session(cwd="/tmp")
 notes.clear()
-_, jn3 = run(tmp3)
-assert any("hot-reload" in n for n in jn3), f"FAIL branche 3: {jn3[:2]}"
-print("3) note générique (repo lambda):", jn3[0][:70], "...")
+eng = Engine(FC(kern_pkg_file), "fake-model", sess, "/tmp", approve=lambda d, p=None: True, stream_cb=cb)
+asyncio.run(eng.chat("write kern pkg file"))
+jn = [e.get("text","") for e in sess.events if e["kind"] == "note"]
+assert any("loaded by this process at launch" in n and "restart" in n for n in jn), f"FAIL B: {jn[:2]}"
+print("B) note self-edit factuelle:", [n[:80] for n in jn if "restart" in n][0], "...")
 
-# Branche 1: self-edit — KERN_SELF_DIR pointe dans le repo
-tmp1 = pathlib.Path(tempfile.mkdtemp())
-(tmp1 / "src").mkdir()
-(tmp1 / "pyproject.toml").write_text('[project]\nname = "someapp"\n')
-os.environ["KERN_SELF_DIR"] = str(tmp1 / "src")
-notes.clear()
-_, jn1 = run(tmp1)
-assert any("RESTART" in n for n in jn1), f"FAIL branche 1: {jn1[:2]}"
-assert any("launched as" in n for n in jn1)
-print("1) note self-edit (RESTART explicite):", [n[:70] for n in jn1 if "RESTART" in n][0], "...")
+# unicité par session
+asyncio.run(eng.chat("second write"))
+jn2 = [e.get("text","") for e in sess.events if e["kind"] == "note" and "loaded by this process" in e.get("text","")]
+assert len(jn2) == 1, f"FAIL B2: doublon ({len(jn2)})"
+print("B2) une seule fois par session — OK")
 
-# Branche 2: copie installée hors repo (self_dir ailleurs) -> note conditionnelle
-import shutil
-tmp2 = pathlib.Path(tempfile.mkdtemp())
-(tmp2 / "src").mkdir()
-(tmp2 / "pyproject.toml").write_text('[project]\nname = "someapp"\n')
-outside = pathlib.Path(tempfile.mkdtemp(prefix="fakebin-"))
-(outside / "someapp").write_text("#!/bin/sh\n"); (outside / "someapp").chmod(0o755)
-os.environ["KERN_SELF_DIR"] = "/nonexistent-elsewhere"
-os.environ["PATH"] = f"{outside}:" + os.environ["PATH"]
+# D) fichier hors package -> AUCUNE note deploy
+tmp = pathlib.Path(tempfile.mkdtemp()); (tmp / "src").mkdir()
+sess2 = create_session(cwd=str(tmp))
 notes.clear()
-_, jn2 = run(tmp2)
-assert any("installed copy" in n and "BEFORE assuming" in n for n in jn2), f"FAIL branche 2: {jn2[:2]}"
-print("2) note copie installée (conditionnelle):", [n[:70] for n in jn2 if "installed copy" in n][0], "...")
+eng2 = Engine(FC(), "fake-model", sess2, str(tmp), approve=lambda d, p=None: True, stream_cb=cb)
+asyncio.run(eng2.chat("write random repo file"))
+jn3 = [e.get("text","") for e in sess2.events if e["kind"] == "note"]
+assert not jn3, f"FAIL D: note intempestive: {jn3[:2]}"
+print("D) repo lambda -> aucune note deploy (le fait `launched` du prompt suffit) — OK")
 
-# Une seule note par session
+# C) relecture répétée -> fait neutre
+class FCR:
+    def __init__(self): self.n = 0
+    async def probe(self, model): return None
+    async def stream_chat(self, model, messages, system=None, tools=None, max_tokens=None):
+        self.n += 1
+        if self.n <= 4:
+            yield StreamEvent("tool_call", tool_call={"id": f"r{self.n}", "name": "read",
+                                                      "arguments": {"path": "/tmp/same.txt"}})
+            yield StreamEvent("done")
+        else:
+            yield StreamEvent("text", text="done"); yield StreamEvent("done")
+sess3 = create_session(cwd="/tmp")
 notes.clear()
-sess = create_session(cwd=str(tmp3))
-eng = Engine(FC(), "fake-model", sess, str(tmp3), approve=lambda d, p=None: True, stream_cb=cb)
-asyncio.run(eng.chat("again"))
-asyncio.run(eng.chat("and again"))
-jn_all = [e.get("text","") for e in sess.events if e["kind"] == "note" and "hot-reload" in e.get("text","")]
-assert len(jn_all) == 1, f"FAIL: doublons ({len(jn_all)})"
-print("4) une seule note par session — OK")
-print("PASS T14v2")
+eng3 = Engine(FCR(), "fake-model", sess3, "/tmp", approve=lambda d, p=None: True, stream_cb=cb)
+asyncio.run(eng3.chat("reads"))
+assert any(n.startswith("kern fact: read #") for n in notes), f"FAIL C: {notes[:3]}"
+print("C) fait relecture:", [n[:60] for n in notes if "read #" in n][0], "...")
+print("PASS T14v3")

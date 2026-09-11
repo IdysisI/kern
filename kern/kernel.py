@@ -9,6 +9,8 @@ Two hard rules:
      capabilities cost less context than 5 preloaded MCP servers elsewhere.
 """
 from __future__ import annotations
+import sys
+from pathlib import Path
 
 KERNEL = """You are Kern, an agent that lives in the user's terminal and works on their machine.
 
@@ -23,8 +25,6 @@ Working style:
 - Before editing, read the relevant slice first. Make edits with exact unique anchors.
 - If a tool returns an error, it tells you what failed and shows the correct shape. Read it, adapt, retry once — don't repeat the identical call.
 - Be concise. No preambles, no recaps of what you just did, no flattery.
-- Recent tool results stay in your view. Re-reading a file you already read, or re-deriving a conclusion you already reached, is wasted work — act on what you have.
-- Edited code is not running code. When the user says a change "didn't do anything", the top suspects are: (1) their running process predates your edit (restart needed), (2) they launch an installed/built copy (reinstall/rebuild needed). Establish HOW they run the project before investigating the code itself.
 
 Beyond the core tools there is a capability index (tools, MCP servers, skills) you can mount on demand with the tools_mount note — ask for it by writing: [mount: name]. To see everything mountable, write: [list capabilities]. Mounted capabilities stay for the rest of the session unless you write [unmount: name]."""
 
@@ -34,6 +34,7 @@ cwd: {cwd}
 date: {date}
 model: {model}
 git: {git}
+launched: {launched}
 </session>"""
 
 CAP_BLOCK = """
@@ -42,10 +43,28 @@ CAP_BLOCK = """
 </capability-index>"""
 
 
+def _launch_fact() -> str:
+    """A fact, not an instruction: how THIS process was started, and whether
+    the files it runs come from the repo the user is editing or from an
+    installed copy. The model reasons with it whenever it becomes relevant
+    (e.g. 'my change didn't show up') — no prompt rules needed."""
+    try:
+        argv = " ".join(sys.argv)[:120] or "?"
+        here = Path(__file__).resolve().parent          # the kern package running now
+        if any(str(here) in p for p in sys.path):
+            mode = "running from source (edits apply after RESTART of this process)"
+        else:
+            mode = "running from an installed copy (source edits need a reinstall to apply)"
+        return f"{argv} — {mode}"
+    except Exception:
+        return "?"
+
+
 def system_prompt(cwd: str, model: str, date: str, git: str, cap_lines: list[str]) -> str:
     """Static kernel first (cache-stable), small volatile suffix last."""
     parts = [KERNEL]
     if cap_lines:
         parts.append(CAP_BLOCK.format(n=len(cap_lines), lines="\n".join(sorted(cap_lines))))
-    parts.append(SESSION_BLOCK.format(cwd=cwd, date=date, model=model, git=git))
+    parts.append(SESSION_BLOCK.format(cwd=cwd, date=date, model=model, git=git,
+                                      launched=_launch_fact()))
     return "\n".join(parts)
