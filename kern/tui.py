@@ -7,8 +7,14 @@ The engine stays headless; this file is rendering and input only.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import subprocess
+import sys
 import time
+
+KERN_DAEMON_PORT = int(os.environ.get("KERN_SERVE_PORT", "8766"))
+KERN_DAEMON_URI = os.environ.get("KERN_SERVE_URI", f"ws://127.0.0.1:{KERN_DAEMON_PORT}")
 
 from rich.markdown import Markdown as RichMarkdown
 from rich.table import Table as RichTable
@@ -33,7 +39,7 @@ from textual.renderables.blank import Blank
 from textual.screen import ModalScreen
 from textual.worker import Worker
 from textual.widgets import (Button, Collapsible, Label, ListItem, ListView,
-                             Static, TextArea)
+                             Markdown, Static, TextArea)
 
 from .client import Client, load_health
 from .engine import Engine
