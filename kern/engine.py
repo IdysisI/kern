@@ -46,7 +46,7 @@ def _parse_xml_invoke(text: str) -> list[dict]:
         calls.append({"id": f"invoke-{len(calls)}", "name": name, "arguments": args})
     return calls
 
-FENCED_RE = re.compile(r"```tool\s*\n(\{.*?\})\s*```", re.S)
+FENCED_RE = re.compile(r"```tool\s*\n(.*?)\s*```", re.S)
 
 
 def _human_desc(name: str, args: dict) -> str:
@@ -62,7 +62,7 @@ class Engine:
         self.session = session
         self.cwd = cwd
         self.fs = syscalls.FS(cwd)
-        self.approve = approve or (lambda desc: True)
+        self.approve = approve or (lambda *a, **k: True)
         self.stream_cb = stream_cb or (lambda kind, text: None)
         self.index = CapabilityIndex()
         self.mounts = MountTable()
@@ -84,13 +84,29 @@ class Engine:
             lines.append(f"{name} (skill): MOUNTED")
         for name in self.mounts.mcps:
             lines.append(f"{name} (mcp): MOUNTED")
-        return kernel.system_prompt(self.cwd, self.model,
-                                    time.strftime("%Y-%m-%d"), git, lines)
+        sys_text = kernel.system_prompt(self.cwd, self.model,
+                                        time.strftime("%Y-%m-%d"), git, lines)
+        if getattr(self, "_compact_pending", False):
+            sys_text += ("\n\nIMPORTANT — CONTEXT OVER BUDGET. Your FIRST output in this reply "
+                         "must be a <summary>...</summary> block covering the WHOLE conversation "
+                         "so far, then continue the task normally in the same reply. Older events "
+                         "will be replaced by your summary right after this turn.\n" + pager.COMPACT_RECIPE)
+        return sys_text
 
     def _tools(self) -> list[dict] | None:
         if self.forced_fenced:
             return None
-        return syscalls.SCHEMAS + self.mounts.extra_tools()
+        h = health_of(self.model)
+        # If model has been probed and native_tools is explicitly False, use fenced mode
+        if h and h.get("ok") and not h.get("native_tools", True):
+            return None
+        tools = syscalls.SCHEMAS + self.mounts.extra_tools()
+        # py REPL is CAPABILITY-GATED: the probe measures whether this model
+        # actually uses it correctly; models that never proved it do not even
+        # see the schema. KERN_FORCE_PY overrides.
+        if not (h.get("py_repl") or os.environ.get("KERN_FORCE_PY")):
+            tools = [t for t in tools if t.get("function", {}).get("name") != "py"]
+        return tools
 
     async def _handle_mount_directives(self, text: str) -> list[str]:
         notes = []
@@ -196,6 +212,8 @@ class Engine:
             return syscalls.tool_search(self.fs, **args)
         if name == "memory":
             return syscalls.tool_memory(self.session, self.cwd, **args)
+        if name == "py":
+            return syscalls.tool_py(self.session, **args)
         if name == "todo":
             return syscalls.tool_todo(**args)
         if name == "spawn":
@@ -209,7 +227,8 @@ class Engine:
             return "error: spawn depth limit reached. Answer directly."
         child_session = create_session(cwd=self.cwd, parent=self.session.id)
         child = Engine(self.client, self.model, child_session, self.cwd,
-                       approve=lambda *a: True, subagent_depth=self.depth + 1)
+                       approve=self.approve, stream_cb=self.stream_cb,
+                       subagent_depth=self.depth + 1)
         prompt = task + (f"\n\nContext from parent: {context}" if context else "")
         report = await child.chat(prompt)
         return report[:4000]
@@ -268,34 +287,10 @@ class Engine:
         except Exception:
             pass
 
-    async def _maybe_compact(self) -> bool:
-        """Tier-2 compaction: if the materialized view exceeds KERN_COMPACT_AT,
-        ask the model to summarize the old turns into a single `compact` event
-        (user messages stay verbatim). Anchored merge: the summary REPLACES the
-        old turns instead of being appended. Circuit breaker: 3 failures -> off.
-        """
-        if getattr(self, "_compact_fails", 0) >= 3:
-            return False
-        # Never compact twice on the same turn's state: if a compact event
-        # landed after the last user message, give the model time to use the
-        # fresh summary before considering another pass.
-        last_user = max((i for i, ev in enumerate(self.session.events)
-                         if ev["kind"] == "user"), default=-1)
-        if any(ev["kind"] == "compact" for ev in self.session.events[last_user + 1:]):
-            return False
-        b = pager.budget(self.session.events, self.session)
-        if not b.get("should_compact"):
-            return False
-        to_compact, kept = pager.compaction_view(self.session.events)
-        if not to_compact:
-            return False
-        self.stream_cb("note", f"compacting {len(to_compact)} old events "
-                               f"(~{b['approx_tokens']:,} tokens)…")
-        # Render the old events as plain text for the summarizer
-        # Mechanical execution-facts ledger, derived from journal receipts.
-        # Ground truth for "what actually happened" — independent of the LLM
-        # summary (which explains decisions, not facts). Refs stay consultable:
-        # dropped events live in compacted-*.jsonl in the session dir.
+    def _build_facts(self, to_compact: list[dict]) -> str:
+        """Mechanical execution-facts ledger, derived from journal receipts.
+        Ground truth for 'what actually happened' — independent of the LLM
+        narrative. Dropped events live in compacted-*.jsonl in the session dir."""
         calls_by_id: dict[str, dict] = {}
         for ev in to_compact:
             for tc in ev.get("tool_calls", []) or []:
@@ -324,10 +319,29 @@ class Engine:
             if cid not in seen_results:
                 facts.append(f"{info['name']} {info['path']} -> uncertain "
                              f"(dispatched, no result; arglen={info['arglen']})")
-        facts_text = ("From journal receipts (mechanical, not summarized). "
-                      "Full details: compacted-*.jsonl + scratch/ in the session dir.\n" +
-                      "\n".join(facts[-60:]) +
-                      (f"\n(+{max(0, len(facts) - 60)} earlier ops)" if len(facts) > 60 else ""))
+        return ("From journal receipts (mechanical, not summarized). "
+                "Full details: compacted-*.jsonl + scratch/ in the session dir.\n" +
+                "\n".join(facts[-60:]) +
+                (f"\n(+{max(0, len(facts) - 60)} earlier ops)" if len(facts) > 60 else ""))
+
+    def _apply_compaction(self, upto_n: int, summary: str, to_compact: list[dict]) -> bool:
+        """Shared tail: facts + compact_into + memory deposit + notes."""
+        facts_text = self._build_facts(to_compact)
+        dropped = self.session.compact_into(upto_n, summary, facts=facts_text)
+        try:
+            from kern.memory import MemoryTree
+            where = MemoryTree(self.cwd).absorb(self.session.id, summary)
+            self.stream_cb("note", f"summary saved to {where}")
+        except Exception as me:
+            self.stream_cb("note", f"memory absorb failed: {me}")
+        self.stream_cb("note", f"compacted: {dropped} events -> summary "
+                               f"({len(summary)} chars), user msgs + state kept verbatim")
+        self._compact_fails = 0
+        return True
+
+    async def _dedicated_compaction(self, to_compact: list[dict], kept: list[dict]) -> bool:
+        """FALLBACK only: one dedicated summarization request (costs a credit
+        under per-request billing; the piggyback path avoids it)."""
         lines = []
         for ev in to_compact:
             k = ev["kind"]
@@ -351,26 +365,70 @@ class Engine:
                     summary += ev.text
                 elif ev.kind == "error":
                     raise RuntimeError(ev.error)
-            if not summary.strip():
+            m = re.search(r"<summary>(.*?)</summary>", summary, re.DOTALL)
+            summary = (m.group(1) if m else summary).strip()
+            if not summary:
                 raise RuntimeError("empty summary")
             upto_n = to_compact[-1]["n"] + 1
-            dropped = self.session.compact_into(upto_n, summary.strip(), facts=facts_text)
-            # L2 deposit: the summary lands in this project's memory tree
-            # (query-only: it is NOT injected anywhere — the model must ask)
-            try:
-                from kern.memory import MemoryTree
-                where = MemoryTree(self.cwd).absorb(self.session.id, summary.strip())
-                self.stream_cb("note", f"summary saved to {where}")
-            except Exception as me:
-                self.stream_cb("note", f"memory absorb failed: {me}")
-            self.stream_cb("note", f"compacted: {dropped} events -> summary "
-                                   f"({len(summary)} chars), {len(kept)} kept verbatim")
-            self._compact_fails = 0
-            return True
+            return self._apply_compaction(upto_n, summary, to_compact)
         except Exception as e:
             self._compact_fails = getattr(self, "_compact_fails", 0) + 1
             self.stream_cb("note", f"compact failed ({self._compact_fails}/3): {e}")
             return False
+
+    async def _maybe_compact(self) -> bool:
+        """Tier-2 compaction, PIGGYBACK-FIRST: when the view exceeds
+        KERN_COMPACT_AT, we do NOT spend a dedicated request. The next reply of
+        the CURRENT turn is instructed (via the system prompt) to open with a
+        <summary> block; the harness extracts it after the turn and compacts.
+        Zero extra requests; the model summarizes from the full live context,
+        which is strictly better than a truncated blob. Fallback: dedicated
+        request (see _dedicated_compaction) if the model ignores the directive.
+        Circuit breaker: 3 failures -> off."""
+        if getattr(self, "_compact_fails", 0) >= 3:
+            return False
+        if getattr(self, "_compact_pending", False):
+            return True            # already flagged for this turn
+        last_user = max((i for i, ev in enumerate(self.session.events)
+                         if ev["kind"] == "user"), default=-1)
+        if any(ev["kind"] == "compact" for ev in self.session.events[last_user + 1:]):
+            return False
+        b = pager.budget(self.session.events, self.session)
+        if not b.get("should_compact"):
+            return False
+        to_compact, kept = pager.compaction_view(self.session.events)
+        if not to_compact:
+            return False
+        self._compact_pending = True
+        self._compact_scope = to_compact
+        self.stream_cb("note", f"context over budget (~{b['approx_tokens']:,} tokens) — "
+                               "the model will write the session summary in-reply this turn")
+        return True
+
+    async def _finish_pending_compaction(self) -> None:
+        """End of turn: extract the <summary> the model wrote in-reply and
+        compact. If it didn't write one, fall back to the dedicated request."""
+        if not getattr(self, "_compact_pending", False):
+            return
+        to_compact = getattr(self, "_compact_scope", None)
+        self._compact_pending = False
+        if not to_compact:
+            return
+        m = None
+        for ev in self.session.events:
+            if ev["kind"] == "assistant":
+                mm = re.search(r"<summary>(.*?)</summary>", ev.get("text", ""), re.DOTALL)
+                if mm:
+                    m = mm
+        if m is not None:
+            summary = m.group(1).strip()
+            if summary:
+                upto_n = to_compact[-1]["n"] + 1
+                self._apply_compaction(upto_n, summary, to_compact)
+                return
+        # model ignored the directive -> dedicated request (costs one credit)
+        self.stream_cb("note", "in-reply summary missing — using dedicated compaction request")
+        await self._dedicated_compaction(to_compact, None)
 
     async def _loop(self, max_steps: int = 30) -> str:
         if not health_of(self.model) and not self.forced_fenced:
@@ -427,8 +485,17 @@ class Engine:
                     calls.append({"id": f"fenced-{len(calls)}",
                                   "name": call.get("name", ""),
                                   "arguments": call.get("arguments", {})})
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as err:
+                    bad_snippet = m.group(1)[:200]
+                    calls.append({
+                        "id": f"fenced-{len(calls)}",
+                        "name": "invalid_tool_json",
+                        "arguments": {},
+                        "kern_error": (f"error: invalid JSON in ```tool block ({err}). "
+                                       f"Block was:\n{bad_snippet}\n"
+                                       f"Correct shape:\n```tool\n"
+                                       f'{{"name": "...", "arguments": {{...}}}}\n```')
+                    })
             for call in _parse_xml_invoke(raw_text):
                 calls.append(call)
 
@@ -451,7 +518,11 @@ class Engine:
                 if truncated and not display:
                     msg = "⚠ Le modèle a atteint sa limite de tokens de sortie (max_tokens) pendant son raisonnement."
                     self.session.emit("note", text=msg)
+                    if getattr(self, "_compact_pending", False):
+                        await self._finish_pending_compaction()
                     return msg
+                if getattr(self, "_compact_pending", False):
+                    await self._finish_pending_compaction()
                 return final_text
             if notes and not calls:
                 continue   # mount/list results just landed; let the model act on them
@@ -468,7 +539,7 @@ class Engine:
                     self.stream_cb("result", str(call["kern_error"]))
                     continue
                 prior = self._prior_execution(name, args)
-                needs_ok = name in ("write", "edit", "exec") and not args.get("background")
+                needs_ok = name in ("write", "edit", "exec", "py") and not args.get("background")
                 if name == "exec" and syscalls.is_safe_readonly(str(args.get("cmd", ""))):
                     needs_ok = False   # read-only inspection flows without a modal
                 ok = True
@@ -511,4 +582,6 @@ class Engine:
                 if meta.get("handle"):
                     self.stream_cb("handle", meta["handle"])
 
+        if getattr(self, "_compact_pending", False):
+            await self._finish_pending_compaction()
         return final_text + "\n[step limit reached]"

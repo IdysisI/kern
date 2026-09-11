@@ -83,6 +83,11 @@ def _slate(events: list[dict]) -> str:
             objective = ev.get("text", "")
         elif ev["kind"] == "todo":
             todo = ev.get("items")
+    if not objective:
+        for ev in reversed(events):
+            if ev.get("kind") == "user" and ev.get("text"):
+                objective = ev.get("text", "").strip()[:400]
+                break
     if todo:
         lines = ["<work-state>"]
         if objective:
@@ -238,6 +243,20 @@ Keep it under {max_chars} characters. Be specific: paths, identifiers, error str
 - current_state must be concrete enough that the agent can act WITHOUT re-reading
   the dropped turns. If a file's exact content matters, say what to re-read.
 """
+
+COMPACT_RECIPE = """Summary sections (write <summary>...</summary>):
+  1. primary_intent — what the user wants overall
+  2. files_touched — paths + final state of each (one line each, quote critical lines)
+  3. decisions — design/approach decisions taken and WHY
+  4. errors_encountered — failures and how they were resolved (or not)
+  5. pending_tasks — what is NOT done yet
+  6. current_state — the exact state the work is in right now
+  7. key_facts — anything the user stated that must not be forgotten
+  8. tools_in_use — mounted capabilities that matter
+  9. next_step — the single most likely next action
+Rules: never restate user messages (they stay verbatim automatically); be specific —
+paths, identifiers, error strings; concrete enough to act without re-reading dropped turns."""
+
 
 
 def compaction_view(events: list[dict], keep_last_turns: int = 10) -> tuple[list[dict], list[dict]]:

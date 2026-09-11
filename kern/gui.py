@@ -440,11 +440,15 @@ class KernWindow(QMainWindow):
         self.model = name
 
     def _bar_tick(self):
-        b = budget(self.session.events, self.session)
+        curr_len = len(self.session.events)
+        if curr_len != getattr(self, "_last_events_len", -1):
+            self._cached_tokens = budget(self.session.events, self.session)["approx_tokens"]
+            self._last_events_len = curr_len
+        tokens = getattr(self, "_cached_tokens", 0)
         extra = ""
         if hasattr(self, "_engine") and self._engine:
             extra = f" · ↑{self._engine.usage_in:,} ↓{self._engine.usage_out:,}"
-        self.bar.setText(f"{self.cwd} · ctx≈{b['approx_tokens']:,} tok{extra} · {self.session.id}")
+        self.bar.setText(f"{self.cwd} · ctx≈{tokens:,} tok{extra} · {self.session.id}")
 
     # ---- chat helpers ----------------------------------------------------------
 

@@ -375,6 +375,39 @@ class Client:
                     tools=echo_tool, max_tokens=256):
                 if ev.kind == "tool_call" and ev.tool_call["name"] == "echo":
                     result["native_tools"] = True
+        if result["ok"] and result["native_tools"]:
+            # CAPABILITY TEST — py REPL: does this model USE the interpreter
+            # correctly? One extra request, once per model, cached forever.
+            # Models that fail never see the py tool (no schema bloat).
+            py_tool = [{"type": "function", "function": {
+                "name": "py",
+                "description": "Run Python code in a persistent interpreter.",
+                "parameters": {"type": "object",
+                               "properties": {"code": {"type": "string"}},
+                               "required": ["code"]}}}]
+            result["py_repl"] = False
+            got_call = False
+            py_code = ""
+            async for ev in self.stream_chat(
+                    model,
+                    [{"role": "user", "text":
+                      "Use the py tool to compute 6*7 in Python, then reply with only the number."}],
+                    tools=py_tool, max_tokens=512):
+                if ev.kind == "tool_call" and ev.tool_call["name"] == "py":
+                    got_call = True
+                    py_code = str((ev.tool_call.get("arguments") or {}).get("code", ""))
+                elif ev.kind == "text" and got_call and "42" in ev.text:
+                    # model ran code (or would) AND read the result correctly
+                    pass
+            # competence = it emitted a syntactically valid py call (compile
+            # check is cheap and deterministic; a model that can't emit a
+            # valid call would misuse the tool)
+            if got_call:
+                try:
+                    compile(py_code, "<probe>", "exec")
+                    result["py_repl"] = True
+                except SyntaxError:
+                    result["py_repl"] = False
         h = load_health()
         h[model] = result
         save_health(h)

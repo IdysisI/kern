@@ -21,6 +21,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -93,6 +95,13 @@ SCHEMAS = [
             "text": {"type": "string"},
             "topic": {"type": "string", "description": "topic slug for remember()"}},
             "required": ["action"]}}},
+    {"type": "function", "function": {
+        "name": "py",
+        "description": "Run Python code in a persistent interpreter: variables, imports and functions survive across py() calls for the whole session (fresh after a restart). One call can loop, compute, and batch many file transformations — prefer ONE py() call over many edit() calls for repetitive work. Print what you need (output capped).",
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string"},
+            "timeout": {"type": "integer", "description": "seconds, default 60, max 300"}},
+            "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "todo",
         "description": "Set the live task list for this turn's plan. Each item: {text, status: pending|active|done}. Update it as you progress.",
@@ -528,6 +537,95 @@ def tool_memory(session, cwd: str, action: str, pattern: str = "",
         return f"error: {type(e).__name__}: {e}", {}
 
 
+_PY_TLS = threading.local()   # per-thread capture routing
+
+
+class _RoutedStream:
+    """sys.stdout/stderr proxy: the py worker thread writes to its capture
+    buffer; every OTHER thread (engine, TUI, main) writes to the real stream.
+    Fixes the process-wide redirect leak: a timed-out py call used to leave
+    sys.stdout pointing at a dead buffer, silencing the entire app."""
+
+    def __init__(self, real, attr: str):
+        self._real = real
+        self._attr = attr
+
+    def write(self, s):
+        buf = getattr(_PY_TLS, self._attr, None)
+        if buf is not None:
+            buf.write(s)
+        else:
+            self._real.write(s)
+        return len(s)
+
+    def flush(self):
+        buf = getattr(_PY_TLS, self._attr, None)
+        if buf is None:
+            self._real.flush()
+
+    def __getattr__(self, item):
+        return getattr(self._real, item)
+
+
+_PY_ROUTER_INSTALLED = False
+
+
+def _install_py_router():
+    """Install the thread-routing proxies ONCE per process. Idempotent."""
+    global _PY_ROUTER_INSTALLED
+    if _PY_ROUTER_INSTALLED:
+        return
+    sys.stdout = _RoutedStream(sys.stdout, "buf")
+    sys.stderr = _RoutedStream(sys.stderr, "err")
+    _PY_ROUTER_INSTALLED = True
+
+
+def tool_py(session, code: str, timeout: int = 60) -> tuple[str, dict]:
+    """Persistent Python REPL: state lives on the session object, survives
+    across calls within this engine's lifetime, dies with the process.
+    Bounded: daemon thread + join(timeout) so a hung call can't freeze the
+    engine or block process exit; output routed per-thread (a leaked timed-out
+    thread can NOT silence the app); output capped head+tail. NOT a security
+    sandbox — same trust level as exec()."""
+    import io, traceback
+    ns = getattr(session, "_py_ns", None)
+    if ns is None:
+        ns = {}
+        session._py_ns = ns
+    if not (code or "").strip():
+        names = sorted(k for k in ns if not k.startswith("_"))
+        return ("fresh call with code. Names in the interpreter: "
+                + (", ".join(names[:40]) if names else "(none yet)")), {}
+    timeout = max(1, min(int(timeout or 60), 300))
+    buf_out, buf_err = io.StringIO(), io.StringIO()
+    _install_py_router()
+
+    def run():
+        _PY_TLS.buf = buf_out
+        _PY_TLS.err = buf_err
+        try:
+            exec(compile(code, "<py>", "exec"), ns)
+        except Exception:
+            traceback.print_exc(file=buf_err)
+        finally:
+            _PY_TLS.buf = None
+            _PY_TLS.err = None
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return (f"error: py timed out after {timeout}s (thread leaked; interpreter state kept)"), {}
+    out = buf_out.getvalue()
+    err = buf_err.getvalue()
+    result = out + (("\n[stderr]\n" + err) if err.strip() else "")
+    if not result.strip():
+        result = "(no output — state kept for the next py() call)"
+    if len(result) > 8000:
+        result = result[:3800] + f"\n\n…[{len(result)-7600:,} chars elided]…\n\n" + result[-3800:]
+    return result, {}
+
+
 def tool_todo(items: list[dict]) -> tuple[str, dict]:
     n = len(items)
     done = sum(1 for i in items if i.get("status") == "done")
@@ -577,18 +675,22 @@ _SAFE_CMDS = {"ls", "cat", "head", "tail", "rg", "grep", "find", "pwd", "wc",
 _SAFE_GIT = {"status", "diff", "log", "show", "branch", "ls-files", "rev-parse",
              "remote", "blame", "shortlog", "describe", "tag", "stash list"}
 _DANGER_TOKENS = (">", "<", "$(", "`", "&>", "&>>")
+# Mutating/destructive flags on otherwise read-only tools
+_MUTATING_GIT_FLAGS = {"-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--force", "-f",
+                       "--edit", "-a", "--all", "--set-upstream", "-u"}
 
 
 def is_safe_readonly(cmd: str) -> bool:
     """True when every pipeline/chain segment is a known read-only command and
-    the command contains no redirection or substitution. Used to auto-approve
-    harmless inspection commands while still gating anything mutating."""
+    the command contains no redirection, substitution, or chaining into
+    mutating actions. Used to auto-approve harmless inspection commands."""
     s = cmd.strip()
     if not s:
         return False
     if any(tok in s for tok in _DANGER_TOKENS):
         return False
-    segments = re.split(r"\|\||&&|\|", s)
+    # Split on every shell sequence/chain operator: pipes, logical, semicolons, newlines
+    segments = re.split(r"\|\||&&|[|;\n]", s)
     for seg in segments:
         seg = seg.strip()
         if not seg:
@@ -600,6 +702,9 @@ def is_safe_readonly(cmd: str) -> bool:
         if cmd0 == "git":
             sub = " ".join(parts[1:3]) if len(parts) > 1 else ""
             if not any(sub.startswith(g) for g in _SAFE_GIT):
+                return False
+            # Disallow destructive flags like branch -D, tag -d, etc.
+            if any(p in _MUTATING_GIT_FLAGS for p in parts[1:]):
                 return False
     return True
 
@@ -657,7 +762,8 @@ def tool_search(fs: FS, pattern: str, path: str = "",
         return f"no matches for '{pattern}' in {search_path}", {}
 
     # Truncate if too many results
-    truncated = len(lines) > max_results
+    total_matches = len(lines)
+    truncated = total_matches > max_results
     if truncated:
         lines = lines[:max_results]
 
@@ -676,5 +782,5 @@ def tool_search(fs: FS, pattern: str, path: str = "",
 
     result = "\n".join(out)
     if truncated:
-        result += f"\n… and {len(lines) - max_results} more results (truncated)"
+        result += f"\n… and {total_matches - max_results} more results (truncated)"
     return result, {}

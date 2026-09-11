@@ -750,15 +750,23 @@ class KernApp(App):
             pass
 
     def _ctx_info(self) -> str:
+        curr_len = len(self.session.events)
+        if curr_len == getattr(self, "_last_ctx_events_len", -1) and getattr(self, "_last_ctx_str", None):
+            return self._last_ctx_str
         b = budget(self.session.events, self.session)
         used = b["approx_tokens"]
         entry = self._catalog.get(self.model, {})
         limit = entry.get("context_length") or (entry.get("limit") or {}).get("context")
         if limit:
-            return f"ctx {used / limit * 100:.0f}% ({used:,}/{limit // 1000}k)"
-        return f"ctx≈{used:,}"
+            res = f"ctx {used / limit * 100:.0f}% ({used:,}/{limit // 1000}k)"
+        else:
+            res = f"ctx≈{used:,}"
+        self._last_ctx_events_len = curr_len
+        self._last_ctx_str = res
+        return res
 
     def _refresh_chrome(self):
+        self._last_ctx_events_len = -1
         self.query_one("#topbar").update(
             f" [#7dcfff]◆[/] [bold]kern[/]  [dim]·[/]  [#9ece6a]{self.model}[/]"
             f"  [dim]·[/]  [dim]{self.session.id}[/]")
@@ -772,7 +780,6 @@ class KernApp(App):
     _SPIN = STREAMING_CURSOR
 
     def _on_tick(self):
-        b = budget(self.session.events, self.session)
         right = self._ctx_info()
         if self._turn_running():
             el = time.monotonic() - self._t0

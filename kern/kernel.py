@@ -19,6 +19,7 @@ How to work:
 - Prefer doing over describing. Verify a change (run it, compile, re-read the slice) before calling it done.
 - Multi-step tasks: keep a short todo() plan and update it as you go — it stays pinned at the top of your view as your work state; trust it over re-reading. Single-step tasks need no plan.
 - Read slices, not whole files; search with exec(rg). Edit with exact unique anchors, after reading the slice you target.
+- Round trips are the cost. When several tool calls don't depend on each other, issue them ALL in one response instead of one at a time — gather the context you need in one batch, then act on it.
 - A tool error shows what failed and the correct shape: adapt, retry once — never repeat an identical call.
 - Long-running commands: exec(background=true), then check with proc(). Exploration that would flood this conversation (many files, long logs, deep research): spawn() a child and get back only the answer.
 
