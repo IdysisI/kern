@@ -45,10 +45,10 @@ DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
 TOOL_ICON = {"read": "◱", "write": "✎", "edit": "✎", "exec": "▶", "spawn": "⑂",
              "fetch": "◈", "todo": "☰", "proc": "⚙"}
 
-# Compact braille spinner: used as the moving cursor at the tail of streamed
-# text, in the waiting placeholder, and in the thinking block title. Stays a
-# single column wide so it never jitters the layout.
-STREAMING_CURSOR = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+# Rotating circle: the moving cursor at the tail of streamed text, the waiting
+# placeholder, the status bar, and pending tool cards. Four quarter-fill frames
+# = one smooth revolution; single column wide so it never jitters the layout.
+STREAMING_CURSOR = "◐◓◑◒"
 
 CSS = """
 /* theme-token based + transparent: the terminal's own background shows through */
@@ -91,7 +91,10 @@ CollapsibleTitle { color: $text-muted; text-style: italic; background: transpare
 .error { border-left: thick $error; padding: 0 1; margin: 0 2 0 1; color: $error; }
 .todo { border: round $border; padding: 0 1; margin: 0 6 0 1; }
 .queued { color: $warning; padding: 0 2; text-style: italic; }
-.waiting { color: $text-muted; padding: 0 2; text-style: italic; }
+/* The waiting placeholder IS the assistant container, alive from the first
+   frame: same left bar as .stream, so pressing enter never looks dead. */
+.waiting { padding: 0 1 0 2; border-left: tall $primary;
+           color: $text-muted; text-style: italic; }
 
 Approve { align: center middle; }
 #dlg { width: 84; height: auto; max-height: 26; background: $surface;
@@ -141,20 +144,27 @@ def _diff_text(diff: str, max_lines: int = 30) -> str:
 class ThinkingBlock(Collapsible):
     def __init__(self):
         self._content_static = Static("", classes="thinking-text", markup=False)
-        super().__init__(self._content_static, title="thinking...", collapsed=False, classes="thinking")
+        super().__init__(self._content_static, title="✦ thinking…", collapsed=False, classes="thinking")
         self._buf: list[str] = []
 
     def append_thinking(self, delta: str):
         self._buf.append(delta)
         chars = sum(len(x) for x in self._buf)
         toks = max(1, chars // 4)
-        self.title = f"thinking ({toks:,} tokens)..."
+        self.title = f"✦ thinking · {toks:,} tokens"
         self._content_static.update("".join(self._buf))
+
+    def set_frame(self, frame: str):
+        """Keep the token count moving while thinking is still in progress."""
+        if not self.collapsed:
+            chars = sum(len(x) for x in self._buf)
+            toks = max(1, chars // 4)
+            self.title = f"✦ thinking · {toks:,} tokens"
 
     def finalize(self):
         chars = sum(len(x) for x in self._buf)
         toks = max(1, chars // 4)
-        self.title = f"thought for {toks:,} tokens"
+        self.title = f"✦ thought for {toks:,} tokens"
         self.collapsed = True
 
 
@@ -184,9 +194,20 @@ class ToolCard(Static):
         self.args = args
         self.result: str | None = None
         self.diff: str | None = None
-        icon = TOOL_ICON.get(name, "▸")
-        self.update(f"[dim]⠿[/] [#e0af68]{icon}[/] [bold]{safe(name)}[/] "
-                    f"[dim]{safe(self._headline(name, args))}[/]")
+        self._frame = STREAMING_CURSOR[0]
+        self._pending_text()
+
+    def _pending_text(self):
+        icon = TOOL_ICON.get(self.tname, "▸")
+        self.update(f"[#e0af68]{self._frame}[/] [#e0af68]{icon}[/] "
+                    f"[bold]{safe(self.tname)}[/] "
+                    f"[dim]{safe(self._headline(self.tname, self.args))}[/]")
+
+    def tick(self, frame: str):
+        """Animate the leading glyph while the tool is still running."""
+        if self.result is None and self.diff is None:
+            self._frame = frame
+            self._pending_text()
 
     def set_result(self, result: str):
         self.result = result
@@ -203,7 +224,7 @@ class ToolCard(Static):
             ok = not self.result.startswith(("error", "denied"))
             mark = "[#9ece6a]✓[/]" if ok else "[#f7768e]✗[/]"
         else:
-            mark = "[#e0af68]⠿[/]"   # diff arrived before the result — still running
+            mark = f"[#e0af68]{self._frame}[/]"   # still running
         icon = TOOL_ICON.get(self.tname, "▸")
         head = (f"{mark} [#e0af68]{icon}[/] [bold]{safe(self.tname)}[/] "
                 f"[dim]{safe(self._headline(self.tname, self.args))}[/]\n")
@@ -464,18 +485,26 @@ class KernApp(App):
     def _short_cwd(self):
         return self.cwd if len(self.cwd) < 46 else "…" + self.cwd[-45:]
 
-    _SPIN = "⠋⠙⠹⠸⠼⠴⦾⣿"
+    _SPIN = STREAMING_CURSOR
 
     def _on_tick(self):
         b = budget(self.session.events, self.session)
         right = self._ctx_info()
         if self._turn_running():
             el = time.monotonic() - self._t0
-            frame = self._SPIN[int(el * 12) % len(self._SPIN)]
+            frame = self._SPIN[int(el * 8) % len(self._SPIN)]
             tok = getattr(self.engine, "tokens_streamed", 0)
             self.query_one("#status").update(
                 f" {frame} {self._verb}  {el:0.1f}s · {tok:,} tok")
             right += f"  ↑{self.engine.usage_in:,} ↓{self.engine.usage_out:,}"
+            # live updates: streamed text, waiting placeholder, running cards
+            self._paint_stream(frame)
+            if self._waiting_widget is not None:
+                self._waiting_widget.update(f"{frame} [dim]{safe(self._verb)}[/]")
+            if self._thinking_widget is not None:
+                self._thinking_widget.set_frame(frame)
+            if self._tool_card is not None:
+                self._tool_card.tick(frame)
         self.query_one("#bar").update(
             f" {self._short_cwd()}   {right}   "
             f"[dim]ctrl-p models · ctrl-r resume · ctrl-n new · ctrl-c stop/quit · /help[/]")
@@ -528,6 +557,8 @@ class KernApp(App):
         return v == "y"
 
     def _on_stream(self, kind: str, text: str):
+        if kind in ("thinking", "text", "tool"):
+            self._dismiss_waiting()
         if kind == "thinking":
             if self._thinking_widget is None:
                 self._thinking_widget = ThinkingBlock()
@@ -540,7 +571,6 @@ class KernApp(App):
             if self._thinking_widget is not None:
                 self._thinking_widget.finalize()
                 self._thinking_widget = None
-            self._waiting_widget = self._dismiss_waiting()
             if self._stream_widget is None:
                 self._stream_widget = Static(classes="stream", markup=False)
                 self.chat.mount(self._stream_widget)
@@ -590,6 +620,38 @@ class KernApp(App):
             self._chat_note("◈ " + text.splitlines()[0])
         elif kind == "handle":
             self._chat_note(f"⚙ background process {text} started")
+
+    def _dismiss_waiting(self):
+        """Remove the 'waiting' placeholder once real output (thinking,
+        text, or a tool call) has arrived."""
+        w = self._waiting_widget
+        if w is not None:
+            self._waiting_widget = None
+            try:
+                w.remove()
+            except Exception:
+                pass
+
+    def _paint_stream(self, frame: str):
+        """Live-paint buffered assistant text with an animated tail cursor.
+        Called from _on_tick; this is what makes answers stream visibly
+        instead of appearing all at once at turn end. The cursor keeps
+        animating between chunks so the answer always looks alive, but the
+        view only auto-scrolls when new text actually arrived (so scrolling
+        up mid-stream isn't fought)."""
+        w = self._stream_widget
+        if w is None:
+            return
+        text = "".join(self._stream_buf)
+        if not text:
+            return
+        grew = self._stream_dirty
+        self._stream_dirty = False
+        # never double-space or orphan the circle on its own line
+        tail = "" if text[-1:].isspace() else " "
+        w.update(f"{text}{tail}{frame}")
+        if grew:
+            self.chat.scroll_end(animate=False)
 
     def _flush_stream(self):
         # finalize thinking block if active
@@ -645,6 +707,11 @@ class KernApp(App):
         self._thinking_widget = None
         self._verb = "thinking…"
         self.query_one("#status").display = True
+        self._dismiss_waiting()
+        self._waiting_widget = Static(
+            f"{STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
+        self.chat.mount(self._waiting_widget)
+        self.chat.scroll_end(animate=False)
         self._t0 = time.monotonic()
         self.turn_worker = self.run_worker(self.engine.chat(text), name="turn",
                                            exclusive=False, exit_on_error=False)
@@ -653,6 +720,7 @@ class KernApp(App):
     def _on_worker_state(self, ev: Worker.StateChanged):
         if ev.worker.name != "turn" or not ev.worker.is_finished:
             return
+        self._dismiss_waiting()
         if ev.worker.is_cancelled:
             self._flush_stream()
             self._chat_note("■ interrupted — session intact")

@@ -1,0 +1,68 @@
+[
+ {
+  "model": "deepseek-v4-flash",
+  "task": "write_and_run",
+  "sid": "20260911-114627-4a9993",
+  "ok": true,
+  "seconds": 13.3,
+  "tok_in": 7577,
+  "tok_out": 152,
+  "error": "",
+  "steps": 2
+ },
+ {
+  "model": "deepseek-v4-flash",
+  "task": "edit_existing",
+  "sid": "20260911-114641-726a92",
+  "ok": true,
+  "seconds": 11.3,
+  "tok_in": 10622,
+  "tok_out": 332,
+  "error": "",
+  "steps": 3
+ },
+ {
+  "model": "deepseek-v4-flash",
+  "task": "debug_test",
+  "sid": "20260911-114652-2ea825",
+  "ok": true,
+  "seconds": 14.9,
+  "tok_in": 13569,
+  "tok_out": 349,
+  "error": "",
+  "steps": 4
+ },
+ {
+  "model": "deepseek-v4-flash",
+  "task": "fetch_and_answer",
+  "sid": "20260911-114707-8d214a",
+  "ok": true,
+  "seconds": 9.2,
+  "tok_in": 5021,
+  "tok_out": 88,
+  "error": "",
+  "steps": 1
+ },
+ {
+  "model": "deepseek-v4-flash",
+  "task": "plan_and_background",
+  "sid": "20260911-114716-1621da",
+  "ok": true,
+  "seconds": 53.0,
+  "tok_in": 31363,
+  "tok_out": 1965,
+  "error": "",
+  "steps": 9
+ },
+ {
+  "model": "deepseek-v4-flash",
+  "task": "giant_output",
+  "sid": "20260911-114809-8ae5ed",
+  "ok": true,
+  "seconds": 42.5,
+  "tok_in": 10435,
+  "tok_out": 1908,
+  "error": "",
+  "steps": 3
+ }
+]

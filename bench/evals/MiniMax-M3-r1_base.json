@@ -1,0 +1,68 @@
+[
+ {
+  "model": "MiniMax-M3",
+  "task": "write_and_run",
+  "sid": "20260911-120413-c9f46c",
+  "ok": false,
+  "seconds": 267.9,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "",
+  "steps": 1
+ },
+ {
+  "model": "MiniMax-M3",
+  "task": "edit_existing",
+  "sid": "20260911-120841-29f2a3",
+  "ok": false,
+  "seconds": 241.1,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "",
+  "steps": 1
+ },
+ {
+  "model": "MiniMax-M3",
+  "task": "debug_test",
+  "sid": "20260911-121242-810d6c",
+  "ok": false,
+  "seconds": 241.5,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "",
+  "steps": 1
+ },
+ {
+  "model": "MiniMax-M3",
+  "task": "fetch_and_answer",
+  "sid": "20260911-121643-65f277",
+  "ok": false,
+  "seconds": 177.4,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "",
+  "steps": 1
+ },
+ {
+  "model": "MiniMax-M3",
+  "task": "plan_and_background",
+  "sid": "20260911-121941-4528de",
+  "ok": false,
+  "seconds": 146.2,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "",
+  "steps": 1
+ },
+ {
+  "model": "MiniMax-M3",
+  "task": "giant_output",
+  "sid": "20260911-122207-1e7f6f",
+  "ok": false,
+  "seconds": 178.9,
+  "tok_in": 0,
+  "tok_out": 0,
+  "error": "",
+  "steps": 1
+ }
+]

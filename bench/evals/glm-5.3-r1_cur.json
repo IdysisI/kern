@@ -1,0 +1,68 @@
+[
+ {
+  "model": "glm-5.3",
+  "task": "write_and_run",
+  "sid": "20260911-115615-f5fc7d",
+  "ok": true,
+  "seconds": 7.3,
+  "tok_in": 6816,
+  "tok_out": 102,
+  "error": "",
+  "steps": 2
+ },
+ {
+  "model": "glm-5.3",
+  "task": "edit_existing",
+  "sid": "20260911-115622-8e794f",
+  "ok": true,
+  "seconds": 11.1,
+  "tok_in": 9385,
+  "tok_out": 126,
+  "error": "",
+  "steps": 3
+ },
+ {
+  "model": "glm-5.3",
+  "task": "debug_test",
+  "sid": "20260911-115633-fa6ee0",
+  "ok": true,
+  "seconds": 48.7,
+  "tok_in": 12553,
+  "tok_out": 235,
+  "error": "",
+  "steps": 4
+ },
+ {
+  "model": "glm-5.3",
+  "task": "fetch_and_answer",
+  "sid": "20260911-115722-80a913",
+  "ok": true,
+  "seconds": 147.6,
+  "tok_in": 4497,
+  "tok_out": 52,
+  "error": "",
+  "steps": 1
+ },
+ {
+  "model": "glm-5.3",
+  "task": "plan_and_background",
+  "sid": "20260911-115950-9b96a8",
+  "ok": true,
+  "seconds": 140.2,
+  "tok_in": 21963,
+  "tok_out": 905,
+  "error": "",
+  "steps": 10
+ },
+ {
+  "model": "glm-5.3",
+  "task": "giant_output",
+  "sid": "20260911-120210-663d26",
+  "ok": true,
+  "seconds": 107.8,
+  "tok_in": 11970,
+  "tok_out": 635,
+  "error": "",
+  "steps": 4
+ }
+]
