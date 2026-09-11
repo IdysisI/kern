@@ -45,11 +45,11 @@ DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
 TOOL_ICON = {"read": "◱", "write": "✎", "edit": "✎", "exec": "▶", "spawn": "⑂",
              "fetch": "◈", "todo": "☰", "proc": "⚙"}
 
-# Rotating ring: the moving cursor at the tail of streamed text, the waiting
-# placeholder, the status bar, and pending tool cards. A full circle of dots
-# with one gap that walks around it — 8 frames, 45° per step, one smooth
-# revolution per second at 8fps. Single column wide, never jitters the layout.
-STREAMING_CURSOR = "⣾⣽⣻⢿⡿⣟⣯⣷"
+# Breathing dot: the moving cursor at the tail of streamed text, the waiting
+# placeholder, the status bar, and pending tool cards. One glyph that swells
+# and recedes instead of a wheel that spins — 12 frames at the 0.12s tick, so
+# one calm breath every 1.44s. Single column wide, never jitters the layout.
+STREAMING_CURSOR = "··∙∙••••∙∙··"
 
 CSS = """
 /* theme-token based + transparent: the terminal's own background shows through */
@@ -636,8 +636,8 @@ class KernApp(App):
         right = self._ctx_info()
         if self._turn_running():
             el = time.monotonic() - self._t0
-            # One frame per tick: the ring rotates exactly 45° every 0.12s —
-            # never aliases, never skips, so the revolution reads as smooth.
+            # One frame per tick: the dot swells and recedes a step every
+            # 0.12s, never jumping, so the breath reads as one slow pulse.
             self._spin_i = (getattr(self, "_spin_i", -1) + 1) % len(self._SPIN)
             frame = self._SPIN[self._spin_i]
             tok = getattr(self.engine, "tokens_streamed", 0)

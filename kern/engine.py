@@ -70,6 +70,8 @@ class Engine:
         self.usage_out = 0
         self.tokens_streamed = 0
         self.todo: list[dict] = []
+        self._reread_noted: dict[str, bool] = {}
+        self._noted_stale_install = False
         self.forced_fenced = bool(__import__("os").environ.get("KERN_FORCE_FENCED"))
 
     # ---- capability index + mounts ----------------------------------------
@@ -138,7 +140,33 @@ class Engine:
             return f"fetch {args.get('url', '')}"
         return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
 
+    def _reread_note(self, name: str, args: dict) -> None:
+        """Anti-circling: if this read/search targets something the model has
+        already read >=3 times in the recent window, append a soft nudge.
+        Deterministic, non-blocking — just makes the loop visible to the model."""
+        if name not in ("read", "search"):
+            return
+        key = str(args.get("path") or args.get("pattern") or "")[:80]
+        if not key:
+            return
+        repeats = 0
+        for ev in self.session.events[-40:]:
+            if ev.get("kind") != "assistant":
+                continue
+            for tc in ev.get("tool_calls") or []:
+                if tc.get("name") == name:
+                    k2 = str((tc.get("arguments") or {}).get("path")
+                             or (tc.get("arguments") or {}).get("pattern") or "")[:80]
+                    if k2 == key:
+                        repeats += 1
+        if repeats >= 3 and not getattr(self, "_reread_noted", {}).get(key):
+            getattr(self, "_reread_noted", {})[key] = True
+            self.stream_cb("note", f"kern: you have now targeted '{key}' {repeats} times in "
+                                   f"the recent window — earlier results are in your view. "
+                                   f"Re-reading rarely adds information; act on what you have.")
+
     def _prior_execution(self, name: str, args: dict) -> str | None:
+
         """Replay visibility: if an IDENTICAL (name, canonical args) call was
         already executed in this session, return its result snippet. We do NOT
         block the re-run (a repeat may be legitimate) — we make it visible so
@@ -218,7 +246,42 @@ class Engine:
         self._autocheckpoint()
         return await self._loop()
 
+    def _installed_copy_note(self, path: str) -> None:
+        """One deterministic note per session: if the project being edited is
+        ALSO installed as a binary elsewhere (uv tool / pip), remind that the
+        running copy is stale until reinstall. Catches the classic 'it didn't
+        change' loop where the agent edits source the user never executes."""
+        if getattr(self, "_noted_stale_install", False):
+            return
+        try:
+            import shutil, tomllib
+            top = Path(self.fs.cwd)
+            pp = top / "pyproject.toml"
+            if not pp.is_file():
+                return
+            pkg = (tomllib.loads(pp.read_text()).get("project") or {}).get("name", "")
+            if not pkg:
+                return
+            bin_name = pkg.replace("-", "_").replace("_agent", "").replace("_", "")[:20]
+            exe = shutil.which(pkg.replace("-agent", "").replace("-", "")) or shutil.which(bin_name)
+            if not exe:
+                return
+            exe = str(Path(exe).resolve())
+            if exe.startswith(str(top)):
+                return                       # running copy lives in the repo: fine
+            self._noted_stale_install = True
+            self.session.emit("note", text=(
+                f"kern: source edited ({Path(path).name}). NOTE: an installed copy of "
+                f"'{pkg}' exists at {exe} — the user may be RUNNING that stale copy. "
+                f"Reinstall before testing changes: `uv tool install --force .` from {top} "
+                f"(or verify which binary the user actually launches)."))
+            self.stream_cb("note", f"⚠ edited source of an installed package — "
+                                   f"stale binary at {exe} until reinstall")
+        except Exception:
+            pass
+
     def _autocheckpoint(self) -> None:
+
         """Snapshot dirty files of the cwd git repo (if any) so /undo can
         restore both the journal AND the working tree. Silent on failure."""
         try:
@@ -436,6 +499,8 @@ class Engine:
                     self.stream_cb("result", str(call["kern_error"]))
                     continue
                 prior = self._prior_execution(name, args)
+                if not call.get("kern_error"):
+                    self._reread_note(name, args)
                 needs_ok = name in ("write", "edit", "exec") and not args.get("background")
                 if name == "exec" and syscalls.is_safe_readonly(str(args.get("cmd", ""))):
                     needs_ok = False   # read-only inspection flows without a modal
@@ -467,6 +532,8 @@ class Engine:
                             f"executed earlier this session — prior result: "
                             f"{prior[:120]!r}. You have just re-run it; side effects "
                             f"may have been repeated.]\n{text}")
+                if name in ("write", "edit") and not str(text).startswith("error"):
+                    self._installed_copy_note(str(args.get("path", "")))
                 self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
                                    diff=meta.get("diff") or None)
                 self.stream_cb("result", str(text))
