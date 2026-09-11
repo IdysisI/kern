@@ -1,7 +1,9 @@
-"""T14 — anti-circling: (A) note 'copie installée périmée' au premier edit
-réussi d'un projet installé ailleurs; (B) note douce après 3 lectures de la
-même cible dans la fenêtre récente. Déterministe."""
-import asyncio, json, os, sys, tempfile, pathlib, subprocess
+"""T14v2 — anti-circling GÉNÉRAL: 'code édité ≠ code en cours d'exécution'.
+Branche 1: self-edit (fichier dans le package que CE processus exécute) -> note RESTART explicite.
+Branche 2: copie installée hors repo -> note conditionnelle (demande le mode de lancement).
+Branche 3: générique -> note restart/reload pour N'IMPORTE QUEL fichier de n'importe quel repo.
++ note de relecture répétée (inchangée)."""
+import asyncio, json, os, sys, tempfile, pathlib
 sys.path.insert(0, "/home/marty/kern")
 from kern.client import load_health, save_health
 h = load_health(); h["fake-model"] = {"ok": True, "tools": True, "protocol": "openai"}
@@ -10,79 +12,71 @@ from kern.journal import create_session
 from kern.engine import Engine
 from kern.client import StreamEvent
 
-notes_seen = []
-
+notes = []
 def cb(kind, text):
-    if kind == "note":
-        notes_seen.append(text)
+    if kind == "note": notes.append(text)
 
-class FakeClient:
+class FC:
     def __init__(self): self.n = 0
     async def probe(self, model): return None
     async def stream_chat(self, model, messages, system=None, tools=None, max_tokens=None):
         self.n += 1
         if self.n == 1:
             yield StreamEvent("tool_call", tool_call={"id": "e1", "name": "write",
-                                                     "arguments": {"path": "kern/tui.py", "content": "x"}})
-            yield StreamEvent("done")
-        elif 2 <= self.n <= 4:
-            yield StreamEvent("tool_call", tool_call={"id": f"r{self.n}", "name": "read",
-                                                      "arguments": {"path": "kern/tui.py"}})
+                                                     "arguments": {"path": "src/app.py", "content": "x"}})
             yield StreamEvent("done")
         else:
-            yield StreamEvent("text", text="done")
-            yield StreamEvent("done")
+            yield StreamEvent("text", text="done"); yield StreamEvent("done")
 
-# (A) projeter un repo factice AVEC pyproject + un "binaire installé" hors repo
-tmp = pathlib.Path(tempfile.mkdtemp())
-(tmp / "pyproject.toml").write_text('[project]\nname = "kern-agent"\nversion = "0.2"\n')
-(tmp / "kern").mkdir()
-(tmp / "kern" / "tui.py").write_text("old\n")
-import pathlib as _pl
-outside = _pl.Path(tempfile.mkdtemp(prefix="kern-fakebin-"))   # HORS du repo
-fakebin = outside / "kern"
-fakebin.write_text("#!/bin/sh\n"); fakebin.chmod(0o755)
-os.environ["PATH"] = f"{outside}:" + os.environ["PATH"]        # prepend fake bin dir
+def run(tmp, extra_env=None):
+    sess = create_session(cwd=str(tmp))
+    eng = Engine(FC(), "fake-model", sess, str(tmp), approve=lambda d, p=None: True, stream_cb=cb)
+    asyncio.run(eng.chat("write it"))
+    jn = [e.get("text","") for e in sess.events if e["kind"] == "note"]
+    return notes, jn
 
-sess = create_session(cwd=str(tmp))
-eng = Engine(FakeClient(), "fake-model", sess, str(tmp), approve=lambda d, p=None: True, stream_cb=cb)
-asyncio.run(eng.chat("write the file"))
+# Branche 3: repo lambda SANS pyproject -> note générique
+tmp3 = pathlib.Path(tempfile.mkdtemp())
+(tmp3 / "src").mkdir()
+os.environ.pop("KERN_SELF_DIR", None)
+os.environ.pop("KERN_FAKEBIN", None)
+notes.clear()
+_, jn3 = run(tmp3)
+assert any("hot-reload" in n for n in jn3), f"FAIL branche 3: {jn3[:2]}"
+print("3) note générique (repo lambda):", jn3[0][:70], "...")
 
-stale = [n for n in notes_seen if "stale" in n.lower() or "installed copy" in n.lower()]
-journal_notes = [e.get("text","") for e in sess.events if e["kind"] == "note"]
-all_stale = stale + journal_notes
-assert any("stale" in n.lower() or "installed" in n.lower() for n in all_stale), f"FAIL A: aucune note: {notes_seen[:3]}"
-assert any("uv tool install" in n for n in all_stale), f"note sans commande: {all_stale[:2]}"
-print("A) note binaire périmé émise:", stale[0][:80], "...")
+# Branche 1: self-edit — KERN_SELF_DIR pointe dans le repo
+tmp1 = pathlib.Path(tempfile.mkdtemp())
+(tmp1 / "src").mkdir()
+(tmp1 / "pyproject.toml").write_text('[project]\nname = "someapp"\n')
+os.environ["KERN_SELF_DIR"] = str(tmp1 / "src")
+notes.clear()
+_, jn1 = run(tmp1)
+assert any("RESTART" in n for n in jn1), f"FAIL branche 1: {jn1[:2]}"
+assert any("launched as" in n for n in jn1)
+print("1) note self-edit (RESTART explicite):", [n[:70] for n in jn1 if "RESTART" in n][0], "...")
 
-# un seul rappel par session: second edit -> pas de nouvelle note
-n_before = len(notes_seen)
-class FakeClient2(FakeClient):
-    def __init__(self): super().__init__()
-asyncio.run(eng.chat("edit again"))
-stale2 = [n for n in notes_seen if "stale" in n.lower()]
-assert len(stale2) == 1, f"FAIL A2: doublon de note: {len(stale2)}"
-print("A2) une seule note par session — OK")
+# Branche 2: copie installée hors repo (self_dir ailleurs) -> note conditionnelle
+import shutil
+tmp2 = pathlib.Path(tempfile.mkdtemp())
+(tmp2 / "src").mkdir()
+(tmp2 / "pyproject.toml").write_text('[project]\nname = "someapp"\n')
+outside = pathlib.Path(tempfile.mkdtemp(prefix="fakebin-"))
+(outside / "someapp").write_text("#!/bin/sh\n"); (outside / "someapp").chmod(0o755)
+os.environ["KERN_SELF_DIR"] = "/nonexistent-elsewhere"
+os.environ["PATH"] = f"{outside}:" + os.environ["PATH"]
+notes.clear()
+_, jn2 = run(tmp2)
+assert any("installed copy" in n and "BEFORE assuming" in n for n in jn2), f"FAIL branche 2: {jn2[:2]}"
+print("2) note copie installée (conditionnelle):", [n[:70] for n in jn2 if "installed copy" in n][0], "...")
 
-# (B) 3 relectures de la même cible -> note douce
-class FakeClient3(FakeClient):
-    async def stream_chat(self, model, messages, system=None, tools=None, max_tokens=None):
-        self.n += 1
-        if self.n <= 3:
-            yield StreamEvent("tool_call", tool_call={"id": f"r{self.n}", "name": "read",
-                                                     "arguments": {"path": "kern/tui.py"}})
-            yield StreamEvent("done")
-        else:
-            yield StreamEvent("text", text="ok")
-            yield StreamEvent("done")
-
-notes_seen.clear()
-sess2 = create_session(cwd=str(tmp))
-eng2 = Engine(FakeClient3(), "fake-model", sess2, str(tmp), approve=lambda d, p=None: True, stream_cb=cb)
-for i in range(3):
-    await_obj = eng2.chat(f"turn {i}")
-    asyncio.run(await_obj)
-reread = [n for n in notes_seen if "times in the recent window" in n]
-assert reread, f"FAIL B: pas de note relecture: {notes_seen[:4]}"
-print("B) note de relecture répétée émise:", reread[0][:70], "...")
-print("PASS T14")
+# Une seule note par session
+notes.clear()
+sess = create_session(cwd=str(tmp3))
+eng = Engine(FC(), "fake-model", sess, str(tmp3), approve=lambda d, p=None: True, stream_cb=cb)
+asyncio.run(eng.chat("again"))
+asyncio.run(eng.chat("and again"))
+jn_all = [e.get("text","") for e in sess.events if e["kind"] == "note" and "hot-reload" in e.get("text","")]
+assert len(jn_all) == 1, f"FAIL: doublons ({len(jn_all)})"
+print("4) une seule note par session — OK")
+print("PASS T14v2")
