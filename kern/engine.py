@@ -492,7 +492,7 @@ class Engine:
         return f"error: unknown action '{action}'. Valid actions: status, logs, wait, cancel", {}
 
 
-    async def chat(self, user_text: str, max_steps: int = 30) -> str:
+    async def chat(self, user_text: str, max_steps: int | None = None) -> str:
         self.session.emit("user", text=user_text)
         # Preserve active task objective across generic "Continue" prompts:
         # a user saying "Continue" is telling the agent to keep working on its
@@ -503,16 +503,16 @@ class Engine:
         self._autocheckpoint()
         return await self._run_marked(max_steps=max_steps)
 
-    async def resume(self) -> str:
+    async def resume(self, max_steps: int | None = None) -> str:
         """Continue an OPEN turn (daemon died mid-flight). The user message is
         already journaled; the pager flags any dangling actions as uncertain,
         so the model verifies state instead of blindly replaying side effects."""
         if not self.session.turn_is_open():
             raise RuntimeError("no open turn to resume")
         self._autocheckpoint()
-        return await self._run_marked()
+        return await self._run_marked(max_steps=max_steps)
 
-    async def _run_marked(self, max_steps: int = 30) -> str:
+    async def _run_marked(self, max_steps: int | None = None) -> str:
         """_loop() + journal a turn_end marker so the turn is CLOSED: an
         interrupt/undo/rewind must never look like a crash to auto-resume."""
         self._req0 = getattr(self.client, "requests", 0)
@@ -728,13 +728,15 @@ class Engine:
         self.stream_cb("note", "in-reply summary missing — using dedicated compaction request")
         await self._dedicated_compaction(to_compact, None)
 
-    async def _loop(self, max_steps: int = 100000) -> str:
+    async def _loop(self, max_steps: int | None = None) -> str:
         if not health_of(self.model) and not self.forced_fenced:
             # never guess a model's protocol — measure it once, then remember
             self.stream_cb("note", f"probing {self.model} capabilities…")
             await self.client.probe(self.model)
         final_text = ""
-        for _ in range(max_steps):
+        step = 0
+        while max_steps is None or step < max_steps:
+            step += 1
             await self._maybe_compact()
             view = pager.materialize(self.session.events, self.session)
             tools = self._tools()

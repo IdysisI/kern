@@ -61,15 +61,26 @@ TOOL_ICON = {"read": "◱", "write": "✎", "edit": "✎", "exec": "▶", "spawn
 STREAMING_CURSOR = "··∙∙••••∙∙··"
 
 CSS = """
-/* theme-token based + transparent: the terminal's own background shows through */
+/* ── ground rule ──────────────────────────────────────────────────────
+   The terminal's own background shows through EVERYWHERE in the chat
+   area: no widget below paints a background. Identity comes from thin
+   rails and color, never from filled boxes. */
 Screen { background: transparent; }
-#topbar { dock: top; height: 1; color: $primary; padding: 0 2; text-style: bold; }
+
+/* ── chrome ─────────────────────────────────────────────────────────── */
+#topbar { dock: top; height: 1; padding: 0 2; }
+#tleft  { width: auto; color: $text-muted; }
+#tright { width: 1fr; text-align: right; color: $text-muted; }
+
 #chat { height: 1fr; padding: 0 2; background: transparent;
         scrollbar-color: $border transparent; scrollbar-background: transparent; }
-#status { dock: bottom; height: 1; padding: 0 2; color: $primary; }
+
+/* activity line while a turn runs (hidden when idle) */
+#status { dock: bottom; height: 1; padding: 0 2; color: #e0af68; }
+
 #prompt { border: round $border; color: $text; height: auto; max-height: 9; min-height: 3;
           background: transparent; }
-#prompt:focus { border: round $primary; }
+#prompt:focus { border: round #7aa2f7; }
 /* Cursor: a solid bright block, like a terminal caret.
    Textual's :ansi default is text-style: reverse with ansi_default colors —
    most terminals render "reverse of default" as BLACK, which read as a
@@ -90,32 +101,40 @@ Screen { background: transparent; }
 }
 #bar { dock: bottom; height: 1; color: $text-muted; padding: 0 2; }
 
-.user { border: round $border; padding: 0 1; margin: 1 6 0 0; }
-.assistant { padding: 0 1 0 2; border-left: tall $border; }
-.stream { padding: 0 1 0 2; border-left: tall $primary; }
-.thinking { background: transparent; border: none; padding: 0 1; margin: 0 1; }
+/* ── conversation: rails, not boxes ─────────────────────────────────── */
+/* you: one bright thick rail — the strongest structural mark in the file */
+.user    { border-left: thick #c0caf5; padding: 0 1; margin: 1 0 0 1; }
+/* kern answering (final): no rail, just alignment under your text */
+.assistant { padding: 0 1 0 1; margin-left: 1; }
+/* kern streaming: the rail pulses — blue means "kern is speaking now" */
+.stream  { padding: 0 1 0 1; margin-left: 1; border-left: tall #7aa2f7; }
+
+.thinking { background: transparent; border: none; padding: 0; margin: 0 0 0 1; }
 .thinking .thinking-text { color: $text-muted; text-style: italic; }
 CollapsibleTitle { color: $text-muted; text-style: italic; background: transparent; padding: 0; }
-.tool { border-left: thick $warning; padding: 0 1; margin: 0 2 0 1; }
-.note { color: $text-muted; padding: 0 2; text-style: italic; }
-.error { border-left: thick $error; padding: 0 1; margin: 0 2 0 1; color: $error; }
-.todo { border: round $border; padding: 0 1; margin: 0 6 0 1; }
-.queued { color: $warning; padding: 0 2; text-style: italic; }
+
+/* tool calls: purple hairline rail, one calm headline + dim result */
+.tool    { border-left: tall #bb9af7; padding: 0 1 0 1; margin: 0 0 0 1; }
+.note    { color: $text-muted; padding: 0 1 0 2; }
+.hello   { padding: 0 1 0 2; margin: 1 0; }
+.error   { border-left: tall #f7768e; padding: 0 1 0 1; margin: 0 0 0 1; color: $error; }
+.todo    { border-left: tall #7dcfff; padding: 0 1 0 1; margin: 0 0 0 1; }
+.queued  { color: #e0af68; padding: 0 1 0 2; text-style: italic; }
 /* The waiting placeholder IS the assistant container, alive from the first
-   frame: same left bar as .stream, so pressing enter never looks dead. */
-.waiting { padding: 0 1 0 2; border-left: tall $primary;
+   frame: same rail as .stream, so pressing enter never looks dead. */
+.waiting { padding: 0 1 0 1; margin-left: 1; border-left: tall #7aa2f7;
            color: $text-muted; text-style: italic; }
 
 Approve { align: center middle; }
 #dlg { width: 84; height: auto; max-height: 26; background: $surface;
-       border: round $warning; padding: 1 2; }
+       border: round #e0af68; padding: 1 2; }
 #dlg .q { color: $text; margin-bottom: 1; }
 #dlg .diff { color: $text; }
 #dlg Button { margin: 0 1; }
 
 ModelPicker { align: center middle; }
 SessionPicker { align: center middle; }
-#mp { width: 72; height: 24; background: $surface; border: round $primary; padding: 0 1; }
+#mp { width: 74; height: 24; background: $surface; border: round #7aa2f7; padding: 0 1; }
 #mp ListView { height: 1fr; }
 #mp ListItem { padding: 0 1; }
 #mp ListItem.-highlight { background: $boost; }
@@ -180,7 +199,7 @@ class ThinkingBlock(Collapsible):
 
 class UserMsg(Static):
     def __init__(self, text):
-        super().__init__(safe(text), classes="user", markup=True)
+        super().__init__(f"[#c0caf5 b]you[/]  {safe(text)}", classes="user", markup=True)
 
 
 class ToolCard(Static):
@@ -205,16 +224,24 @@ class ToolCard(Static):
         self.result: str | None = None
         self.diff: str | None = None
         self._frame = STREAMING_CURSOR[0]
+        self._t0 = time.monotonic()
         self._pending_text()
 
-    def _pending_text(self):
+    def _head(self, mark: str) -> str:
+        """One-line card header: status mark, icon, tool, headline, elapsed."""
         icon = TOOL_ICON.get(self.tname, "▸")
-        self.update(f"[#e0af68]{self._frame}[/] [#e0af68]{icon}[/] "
-                    f"[bold]{safe(self.tname)}[/] "
-                    f"[dim]{safe(self._headline(self.tname, self.args))}[/]")
+        head = safe(self._headline(self.tname, self.args))
+        el = time.monotonic() - self._t0
+        # dim the elapsed timer once finished; keep the mark colored
+        timing = f"  [dim]{el:.1f}s[/]" if el >= 0.05 else ""
+        return (f"{mark} [#bb9af7]{icon}[/] [b]{safe(self.tname)}[/] "
+                f"[dim]{head}[/]{timing}")
+
+    def _pending_text(self):
+        self.update(self._head(f"[#e0af68]{self._frame}[/]"))
 
     def tick(self, frame: str):
-        """Animate the leading glyph while the tool is still running."""
+        """Animate the leading glyph + elapsed timer while the tool runs."""
         if self.result is None and self.diff is None:
             self._frame = frame
             self._pending_text()
@@ -235,9 +262,7 @@ class ToolCard(Static):
             mark = "[#9ece6a]✓[/]" if ok else "[#f7768e]✗[/]"
         else:
             mark = f"[#e0af68]{self._frame}[/]"   # still running
-        icon = TOOL_ICON.get(self.tname, "▸")
-        head = (f"{mark} [#e0af68]{icon}[/] [bold]{safe(self.tname)}[/] "
-                f"[dim]{safe(self._headline(self.tname, self.args))}[/]\n")
+        head = self._head(mark) + "\n"
         if self.diff:
             self.update(head + _diff_text(self.diff))
         else:
@@ -250,15 +275,18 @@ class TodoCard(Static):
         self.render_items(items)
 
     def render_items(self, items):
-        lines = ["[#7dcfff][bold]plan[/bold][/]"]
+        done = sum(1 for it in items if it.get("status") == "done")
+        lines = [f"[#7dcfff][bold]plan[/bold][/]  [dim]{done}/{len(items)}[/]"]
         for it in items:
             st = it.get("status", "pending")
             mark, style = {"done": ("✓", "#9ece6a"), "active": ("●", "#e0af68"),
                            "pending": ("○", "dim")}.get(st, ("○", "dim"))
             if st == "done":
-                lines.append(f"  [#9ece6a]{mark}[/] [dim]{safe(it.get('text', ''))}[/]")
+                lines.append(f"  [#9ece6a]{mark}[/] [dim strike]{safe(it.get('text', ''))}[/]")
+            elif st == "active":
+                lines.append(f"  [#e0af68]{mark}[/] [b]{safe(it.get('text', ''))}[/]")
             else:
-                lines.append(f"  [{style}]{mark}[/] {safe(it.get('text', ''))}")
+                lines.append(f"  [dim]{mark}[/] [dim]{safe(it.get('text', ''))}[/]")
         self.update("\n".join(lines))
 
 
@@ -430,7 +458,7 @@ class PromptArea(TextArea):
         self.border_title = "›"
         self.past: list[str] = []
         self._hi: int | None = None
-        self.placeholder = "ask, plan, build…   (enter sends · ctrl+j newline · /help)"
+        self.placeholder = "ask, plan, build…"
         self.compact = True
 
     def on_key(self, event):
@@ -526,7 +554,9 @@ class KernApp(App):
     # ---- layout ------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Static(id="topbar")
+        with Horizontal(id="topbar"):
+            yield Static(id="tleft")
+            yield Static(id="tright")
         yield VerticalScroll(id="chat")
         yield Static("thinking…", id="status")
         yield PromptArea()
@@ -814,7 +844,7 @@ class KernApp(App):
         self.query_one("#status").display = True
         self._dismiss_waiting()
         self._waiting_widget = Static(
-            f"{STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
+            f"[#7aa2f7 b]kern[/]  {STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
         self.chat.mount(self._waiting_widget)
         self.chat.scroll_end(animate=False)
 
@@ -877,12 +907,10 @@ class KernApp(App):
 
     def _refresh_chrome(self):
         self._last_ctx_events_len = -1
-        self.query_one("#topbar").update(
-            f" [#7dcfff]◆[/] [bold]kern[/]  [dim]·[/]  [#9ece6a]{self.model}[/]"
-            f"  [dim]·[/]  [dim]{self.session.id}[/]")
-        self.query_one("#bar").update(
-            f" {self._short_cwd()}   [dim]ctx≈0[/]   "
-            f"[dim]ctrl-p models · ctrl-r resume · ctrl-n new · ctrl-c stop/quit · /help[/]")
+        self.query_one("#tleft").update(
+            f" [bold]kern[/] [dim]·[/] [#9ece6a]{safe(self.model)}[/]")
+        self.query_one("#tright").update(
+            f"[dim]{self._short_cwd()}[/] [dim]·[/] [dim]{self.session.id}[/] ")
 
     def _short_cwd(self):
         return self.cwd if len(self.cwd) < 46 else "…" + self.cwd[-45:]
@@ -907,7 +935,7 @@ class KernApp(App):
             frame = self._SPIN[self._spin_i]
             tok = getattr(getattr(self, "engine", None), "tokens_streamed", getattr(self, "_tokens_streamed", 0))
             self.query_one("#status").update(
-                f" {frame} {self._verb}  {el:0.1f}s · {tok:,} tok")
+                f" {frame} {self._verb}  [dim]{el:0.1f}s · {tok:,} tok[/]")
             u_in = getattr(getattr(self, "engine", None), "usage_in", getattr(self, "_usage_in", 0))
             u_out = getattr(getattr(self, "engine", None), "usage_out", getattr(self, "_usage_out", 0))
             reqs = getattr(getattr(self, "engine", None), "requests", getattr(self, "_requests", 0))
@@ -921,16 +949,18 @@ class KernApp(App):
             if self._tool_card is not None:
                 self._tool_card.tick(frame)
         self.query_one("#bar").update(
-            f" {self._short_cwd()}   {right}   "
-            f"[dim]ctrl-p models · ctrl-r resume · ctrl-n new · ctrl-c stop/quit · /help[/]")
+            f" [dim]{right}[/]   "
+            f"[dim]enter send · ctrl-p models · ctrl-r resume · ctrl-n new · ctrl-c stop/quit · /help[/]")
 
     _verb = "thinking…"
 
     def _welcome(self):
-        self._chat_note(
-            "kern v0.2 — one model, no baggage.\n"
-            "ctrl-p model picker · ctrl-r resume session · /new fresh · "
-            "tools mount themselves: try [mount: toy]")
+        self.chat.mount(Static(
+            "[b]kern[/] [dim]v" + safe(KERN_VERSION) + "[/] — one model, no baggage.\n"
+            "[dim]ctrl-p models · ctrl-r resume · /new fresh · /help[/]\n"
+            "[dim]tools mount themselves: try[/] [mount: toy]",
+            classes="hello", markup=True))
+        self.chat.scroll_end(animate=False)
 
     # ---- chat helpers -------------------------------------------------------
 
@@ -1117,7 +1147,7 @@ class KernApp(App):
                 if self._queued_chip is None:
                     self._queued_chip = Static(classes="queued", markup=True)
                     self.chat.mount(self._queued_chip)
-                self._queued_chip.update(f"⏳ queued: {safe(text)}")
+                self._queued_chip.update(f"[dim]⏳[/] queued: {safe(text)}")
                 self.chat.scroll_end(animate=False)
             else:
                 self._remote_send_chat(text)
@@ -1127,7 +1157,7 @@ class KernApp(App):
             if self._queued_chip is None:
                 self._queued_chip = Static(classes="queued", markup=True)
                 self.chat.mount(self._queued_chip)
-            self._queued_chip.update(f"⏳ queued: {safe(text)}")
+            self._queued_chip.update(f"[dim]⏳[/] queued: {safe(text)}")
             self.chat.scroll_end(animate=False)
             return
         self.chat.mount(UserMsg(text))
@@ -1146,7 +1176,7 @@ class KernApp(App):
         self.query_one("#status").display = True
         self._dismiss_waiting()
         self._waiting_widget = Static(
-            f"{STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
+            f"[#7aa2f7 b]kern[/]  {STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
         self.chat.mount(self._waiting_widget)
         self.chat.scroll_end(animate=False)
         self._t0 = time.monotonic()
