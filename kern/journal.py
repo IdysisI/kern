@@ -281,24 +281,94 @@ def list_sessions() -> list[str]:
     return sorted(p.name for p in SESSIONS.iterdir() if p.is_dir())
 
 
-def session_previews(limit: int = 50) -> list[dict]:
-    """id, cwd, started, first user message — for the resume picker, sorted by last updated."""
-    out = []
-    for sid in list_sessions():
-        s = Session(sid)
-        if not s.events:
+BENCH_PHRASES = (
+    "fix the spinner", "do the heavy thing", "do work", "tâche longue", "tâche initiale",
+    "do the thing", "do two things", "corrige le port", "turn one", "turn two", "turn 1", "turn 2",
+    "slow turn in the child", "analyze this", "test turn", "mixed turn", "run bad json",
+    "calcule", "slow task for sub1", "first", "second", "hello world", "what is the answer",
+    "start background slow worker", "run bad commands", "write the file then finish", "grep the theme code",
+    "make a plan with todo(), then write a file calc.py", "make a 3-step plan with todo()",
+    "use the fetch tool on https://example.com", "test_calc.py fails", "buggy.py should print the sum",
+    "create a file answer.py that prints", "bigdata.txt is large"
+)
+
+
+def is_test_session(cwd: str, preview: str) -> bool:
+    if cwd.startswith("/tmp") or cwd.startswith("/var/tmp"):
+        return True
+    t = preview.strip().lower()
+    return any(bp in t for bp in BENCH_PHRASES)
+
+
+def session_previews(limit: int = 60, current_cwd: str | None = None, include_tests: bool = False) -> list[dict]:
+    """Fast session scanner: discovers on-disk sessions, filters out empty sessions
+    and test fixtures, and returns real conversations sorted by last activity."""
+    if not SESSIONS.exists():
+        return []
+    candidates = []
+    for p in SESSIONS.iterdir():
+        if not p.is_dir():
             continue
-        meta = s.meta()
-        first_user = next((e.get("text", "") for e in s.events if e["kind"] == "user"), "")
-        n_user = sum(1 for e in s.events if e["kind"] == "user")
-        last_ts = s.events[-1].get("ts", s.log.stat().st_mtime if s.log.exists() else 0)
-        out.append({
-            "id": sid,
-            "cwd": meta.get("cwd", "?"),
-            "turns": n_user,
-            "preview": first_user[:80],
-            "ts": last_ts
-        })
-    # Sort by most recently active session first!
-    out.sort(key=lambda r: r["ts"], reverse=True)
+        log = p / "events.jsonl"
+        try:
+            st = log.stat()
+            if st.st_size >= 110:   # skip empty 0-turn sessions (<110 bytes)
+                candidates.append((p.name, log, st.st_mtime))
+        except FileNotFoundError:
+            pass
+
+    # Sort candidates by modification time descending
+    candidates.sort(key=lambda x: x[2], reverse=True)
+
+    out = []
+    test_out = []
+    for sid, log, mtime in candidates:
+        try:
+            with open(log, "r", encoding="utf-8", errors="replace") as f:
+                head = f.read(3072)
+            lines = [l for l in head.splitlines() if l.strip()]
+            if len(lines) < 2:
+                continue
+            cwd = ""
+            first_user = ""
+            user_count = 0
+            for l in lines:
+                try:
+                    obj = json.loads(l)
+                    k = obj.get("kind")
+                    if k in ("meta", "session") and not cwd:
+                        cwd = obj.get("cwd", "")
+                    elif k == "user":
+                        user_count += 1
+                        if not first_user:
+                            first_user = obj.get("text", "")
+                except Exception:
+                    pass
+            if not first_user:
+                continue
+
+            entry = {
+                "id": sid,
+                "cwd": cwd or "?",
+                "turns": max(1, user_count),
+                "preview": first_user[:100],
+                "ts": mtime,
+            }
+            if is_test_session(cwd, first_user):
+                test_out.append(entry)
+            else:
+                out.append(entry)
+                if len(out) >= limit:
+                    break
+        except Exception:
+            pass
+
+    if include_tests and len(out) < limit:
+        out.extend(test_out[:(limit - len(out))])
+
+    if current_cwd:
+        out.sort(key=lambda r: (r.get("cwd") == current_cwd, r.get("ts", 0)), reverse=True)
+    else:
+        out.sort(key=lambda r: r.get("ts", 0), reverse=True)
+
     return out[:limit]

@@ -346,7 +346,7 @@ class ModelPicker(ModalScreen[str | None]):
             self.dismiss(self.rows[idx][0])
 
 
-def _order_sessions(rows: list[dict], limit: int = 40) -> list[dict]:
+def _order_sessions(rows: list[dict], limit: int = 60) -> list[dict]:
     """Picker order: last USED first (most recent activity -> oldest).
     Sessions with unknown last-use sink to the bottom; among themselves
     they run newest-CREATED -> oldest (session ids are YYYYmmdd-HHMMSS,
@@ -672,7 +672,7 @@ class KernApp(App):
                         exclusive=True)
 
         try:
-            res = await self._remote_rpc("sessions", timeout=4.0)
+            res = await self._remote_rpc("sessions", cwd=self.cwd, timeout=4.0)
             listing = res.get("sessions", {})
         except Exception:
             listing = {}
@@ -722,7 +722,7 @@ class KernApp(App):
 
     async def _show_sessions_picker(self):
         try:
-            res = await self._remote_rpc("sessions", timeout=4.0)
+            res = await self._remote_rpc("sessions", cwd=self.cwd, timeout=4.0)
             listing = res.get("sessions", {})
         except Exception as e:
             self._chat_error(f"could not list sessions: {e}")
@@ -1252,7 +1252,7 @@ class KernApp(App):
             self.run_worker(self._resume_picker(), name="resume", exclusive=False)
 
     async def _resume_picker(self):
-        rows = session_previews()
+        rows = session_previews(limit=60, current_cwd=self.cwd)
         if not rows:
             self._chat_note("no past sessions")
             return

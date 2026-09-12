@@ -21,7 +21,7 @@ import websockets
 
 from .client import Client, load_health
 from .engine import Engine
-from .journal import Session, create_session, list_sessions
+from .journal import Session, create_session, list_sessions, session_previews
 
 HOST = os.environ.get("KERN_SERVE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KERN_SERVE_PORT", "8766"))
@@ -194,35 +194,37 @@ class Registry:
         self.workers[sess.id] = w
         return w
 
-    def listing(self, limit: int = 40) -> dict[str, dict]:
-        """Fast session listing: active sessions first, then the most recent
-        sessions on disk capped at `limit`. Avoids parsing 1000+ files and
-        prevents Textual RecursionError on large session archives."""
+    def listing(self, limit: int = 60, current_cwd: str | None = None) -> dict[str, dict]:
+        """Fast session listing: active/daemon workers first, then the user's real past
+        conversations sorted by last used time, filtering out empty boots and test runs."""
         out = {}
-        # 1. All active workers first
+        # 1. All workers on this daemon (active or recently used)
         for sid, w in self.workers.items():
-            if w.running:
-                out[sid] = {"active": True, "preview": _preview(w.session),
-                            "cwd": w.cwd, "model": w.model, "last_ts": _last_ts(w.session)}
+            out[sid] = {
+                "active": w.running,
+                "preview": _preview(w.session),
+                "cwd": w.cwd,
+                "model": w.model,
+                "last_ts": _last_ts(w.session),
+            }
 
-        # 2. Fast sort of on-disk sessions by SID (which embeds creation time YYYYmmdd-HHMMSS)
-        disk_sids = sorted(list_sessions(), reverse=True)
-        for sid in disk_sids:
-            if len(out) >= limit:
-                break
+        # 2. Get real past conversations via fast session scanner
+        previews = session_previews(limit=limit, current_cwd=current_cwd, include_tests=False)
+        for r in previews:
+            sid = r["id"]
             if sid in out:
                 continue
             w = self.workers.get(sid)
             if w:
-                out[sid] = {"active": w.running, "preview": _preview(w.session),
-                            "cwd": w.cwd, "model": w.model, "last_ts": _last_ts(w.session)}
+                out[sid] = {"active": w.running, "preview": r["preview"] or _preview(w.session),
+                            "cwd": w.cwd, "model": w.model, "last_ts": max(r["ts"], _last_ts(w.session))}
             else:
-                s = Session(sid)
-                out[sid] = {"active": False, "preview": _preview(s),
-                            "cwd": s.meta().get("cwd", "?"), "model": "?",
-                            "last_ts": _last_ts(s)}
+                out[sid] = {"active": False, "preview": r["preview"],
+                            "cwd": r["cwd"], "model": "?", "last_ts": r["ts"]}
+
         return dict(sorted(out.items(),
-                           key=lambda kv: (kv[1]["active"], kv[1]["last_ts"], kv[0]), reverse=True))
+                           key=lambda kv: (kv[1]["active"], kv[1].get("cwd") == current_cwd if current_cwd else False, kv[1]["last_ts"], kv[0]),
+                           reverse=True))
 
 
 def _last_ts(s: Session) -> float:
@@ -277,7 +279,8 @@ async def handler(ws):
                 # huge journal) doing it inline starved the loop, handshakes
                 # timed out, and TUIs fell back to local mode (or worse,
                 # killed a healthy daemon). Never block the loop on disk.
-                listing = await asyncio.to_thread(REG.listing)
+                current_cwd = msg.get("cwd")
+                listing = await asyncio.to_thread(REG.listing, current_cwd=current_cwd)
                 await ws.send(reply({"sessions": listing}))
             elif m == "new":
                 new_worker = REG.new(msg.get("cwd", os.getcwd()), msg.get("model"))
