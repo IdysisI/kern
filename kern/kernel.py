@@ -52,5 +52,14 @@ def system_prompt(cwd: str, model: str, date: str, git: str, cap_lines: list[str
     parts = [KERNEL]
     if cap_lines:
         parts.append(CAP_BLOCK.format(n=len(cap_lines), lines="\n".join(sorted(cap_lines))))
-    parts.append(SESSION_BLOCK.format(cwd=cwd, date=date, model=model, git=git))
+    session_part = SESSION_BLOCK.format(cwd=cwd, date=date, model=model, git=git)
+    # MemGate admission map: ~25 tokens showing available memory scope (empty if none)
+    try:
+        from .memory import MemoryTree
+        hint = MemoryTree(cwd).scope_hint()
+        if hint:
+            session_part += "\n" + hint
+    except Exception:
+        pass
+    parts.append(session_part)
     return "\n".join(parts)

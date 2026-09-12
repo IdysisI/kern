@@ -81,7 +81,8 @@ SCHEMAS = [
         "name": "memory",
         "description": "Query/annotate this project's persistent memory. QUERY-ONLY design: nothing is ever auto-injected — call it ONLY when the current task plausibly benefits from a past session on this same project. Actions: outline (index), search(pattern), read(path), remember(text, topic) for durable facts, write(path, content) for project.md/atoms/scenarios, forget(pattern) to tombstone stale facts.",
         "parameters": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["outline", "search", "read", "remember", "write", "forget"]},
+            "action": {"type": "string", "enum": ["outline", "search", "read", "remember", "write", "forget", "reconcile"],
+                       "description": "reconcile: return active ground truth for a topic without superseded or deleted facts"},
             "pattern": {"type": "string"},
             "path": {"type": "string", "description": "e.g. project.md, atoms/topic.md, scenarios/<name>.md"},
             "text": {"type": "string"},
@@ -555,6 +556,8 @@ def tool_memory(session, cwd: str, action: str, pattern: str = "",
             if not path or text is None:
                 return "error: write needs path and text", {}
             return tree.write(path, text), {}
+        if action == "reconcile":
+            return tree.reconcile(topic=topic or "decisions"), {}
         if action == "forget":
             if not pattern:
                 return "error: forget needs pattern", {}
