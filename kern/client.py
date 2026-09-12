@@ -446,7 +446,16 @@ def _ir_to_openai(messages: list[dict]) -> list[dict]:
                                         "function": {"name": tc["name"],
                                                      "arguments": json.dumps(tc["arguments"])}} for tc in m["tool_calls"]]})
         elif m["role"] == "tool":
-            out.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["text"]})
+            media = m.get("media")
+            if media and media.get("type") == "image":
+                # Native multimodal image payload for OpenAI/VSLLM vision models
+                content = [
+                    {"type": "text", "text": m["text"]},
+                    {"type": "image_url", "image_url": {"url": f"data:{media['mime']};base64,{media['data']}"}}
+                ]
+                out.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": content})
+            else:
+                out.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["text"]})
         else:
             out.append({"role": m["role"], "content": m.get("text", "")})
     return out
@@ -463,7 +472,17 @@ def _ir_to_anthropic(messages: list[dict]) -> list[dict]:
                         "input": tc["arguments"]} for tc in m["tool_calls"]]
             out.append({"role": "assistant", "content": blocks})
         elif m["role"] == "tool":
-            blk = {"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": m["text"]}
+            media = m.get("media")
+            if media and media.get("type") == "image":
+                # Native multimodal image payload for Anthropic vision models
+                blk_content = [
+                    {"type": "text", "text": m["text"]},
+                    {"type": "image", "source": {"type": "base64", "media_type": media["mime"], "data": media["data"]}}
+                ]
+                blk = {"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": blk_content}
+            else:
+                blk = {"type": "tool_result", "tool_use_id": m["tool_call_id"], "content": m["text"]}
+
             if out and out[-1]["role"] == "user" and isinstance(out[-1]["content"], list):
                 out[-1]["content"].append(blk)
             else:

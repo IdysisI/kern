@@ -240,8 +240,10 @@ def materialize(events: list[dict], session) -> list[dict]:
                         session.offload(f"t{ev['n']}", text)
                     out_text += (f"\n[full output: {full} — use read(path) "
                                  f"with offset/limit to inspect any part]")
-                msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
-                             "text": out_text})
+                m_item = {"role": "tool", "tool_call_id": ev.get("call_id", ""), "text": out_text}
+                if ev.get("media"):
+                    m_item["media"] = ev["media"]
+                msgs.append(m_item)
             elif i not in keep_inline and n - i > STALE_AGE and len(text) > STALE_MIN \
                     and not ev.get("paged"):
                 path = session.offload(f"t{ev['n']}", text)

@@ -130,10 +130,52 @@ class FS:
         self.cwd = Path(cwd).resolve()
 
     def resolve(self, path: str) -> Path:
+        p, _ = self.resolve_resilient(path)
+        return p
+
+    def resolve_resilient(self, path: str) -> tuple[Path, str | None]:
+        """Resolve a path with fuzzy auto-correction:
+        1. If exact path exists, return it immediately.
+        2. If path is a relative basename (e.g. 'tui.py' or 'tests/test_x.py')
+           and doesn't exist at cwd, search the project for a unique match.
+        3. If exactly ONE match exists (e.g. 'kern/tui.py'), auto-resolve it
+           and return an informative note. Saves models 1 whole wasted round-trip!"""
         p = Path(path).expanduser()
         if not p.is_absolute():
             p = self.cwd / p
-        return p.resolve()
+        resolved = p.resolve()
+        if resolved.exists():
+            return resolved, None
+
+        # Attempt unique fuzzy resolution within self.cwd
+        target_name = Path(path).name
+        if target_name and not path.startswith(".."):
+            matches = []
+            try:
+                for candidate in self.cwd.rglob(target_name):
+                    # ignore hidden, virtualenv, and cache folders
+                    parts = candidate.parts
+                    if any(part.startswith(".") or part in ("__pycache__", "venv", ".venv", "node_modules") for part in parts):
+                        continue
+                    if candidate.is_file():
+                        matches.append(candidate)
+                        if len(matches) > 3:
+                            break
+            except Exception:
+                pass
+            if len(matches) == 1:
+                match = matches[0]
+                rel = match.relative_to(self.cwd)
+                return match, f"[auto-resolved '{path}' -> '{rel}']"
+
+        return resolved, None
+
+
+def _is_binary_bytes(chunk: bytes) -> bool:
+    """True if chunk contains null bytes or high ratio of non-text control chars."""
+    if b"\x00" in chunk:
+        return True
+    return False
 
 
 def _numbered(p: Path, offset: int, limit: int) -> str:
@@ -154,25 +196,77 @@ def _unified_diff(path: Path, old: str, new: str) -> str:
 
 def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
               full: bool = False) -> tuple[str, dict]:
-    """Read a file. By default returns a numbered slice. If full=True and the
-    file is under 2000 lines, returns the entire content. Otherwise returns
-    the numbered slice (offset/limit)."""
-    p = fs.resolve(path)
+    """Read a file or inspect multimodal media (images/audio/binary).
+    Supports auto-path resolution, numbered text slices, and native multimodal
+    payload attachment for vision/audio models on VSLLM."""
+    p, note = fs.resolve_resilient(path)
+    res_prefix = (note + "\n") if note else ""
+
     if p.is_dir():
         entries = sorted(os.listdir(p))[:200]
-        return f"{p}/ (directory)\n" + "\n".join(entries), {}
+        return f"{res_prefix}{p}/ (directory)\n" + "\n".join(entries), {}
     if not p.exists():
-        near = difflib.get_close_matches(str(p), [str(x) for x in p.parent.glob("*")], n=3)
+        near = difflib.get_close_matches(str(p), [str(x) for x in p.parent.glob("*")], n=3) if p.parent.exists() else []
         return (f"error: no such file: {p}"
                 + (f"\ndid you mean: {', '.join(near)}" if near else "")), {}
+
+    size = p.stat().st_size
+    suffix = p.suffix.lower()
+
+    # Multimodal Media: Images
+    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+    if suffix in IMAGE_EXTS:
+        import base64, mimetypes
+        mime = mimetypes.guess_type(str(p))[0] or f"image/{suffix.lstrip('.')}"
+        if size <= 10 * 1024 * 1024:  # up to 10MB
+            try:
+                b64_data = base64.b64encode(p.read_bytes()).decode("ascii")
+                meta = {"media": {"type": "image", "mime": mime, "data": b64_data, "path": str(p)}}
+                return f"{res_prefix}[image: {p.name} ({mime}, {size:,} bytes) — visual content attached for multimodal models]", meta
+            except Exception as e:
+                pass
+        return f"{res_prefix}[image file: {p.name} ({mime}, {size:,} bytes) — too large for in-line attachment]", {}
+
+    # Multimodal Media: Audio
+    AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac"}
+    if suffix in AUDIO_EXTS:
+        import base64, mimetypes
+        mime = mimetypes.guess_type(str(p))[0] or f"audio/{suffix.lstrip('.')}"
+        if size <= 15 * 1024 * 1024:  # up to 15MB
+            try:
+                b64_data = base64.b64encode(p.read_bytes()).decode("ascii")
+                meta = {"media": {"type": "audio", "mime": mime, "data": b64_data, "path": str(p)}}
+                return f"{res_prefix}[audio: {p.name} ({mime}, {size:,} bytes) — audio content attached for multimodal models]", meta
+            except Exception as e:
+                pass
+        return f"{res_prefix}[audio file: {p.name} ({mime}, {size:,} bytes) — raw audio read skipped]", {}
+
+    # Pure binary files (.so, .bin, .pyc, .exe, zip/tar, or null-byte detection)
+    BINARY_EXTS = {".so", ".dylib", ".dll", ".bin", ".exe", ".pyc", ".tar", ".gz", ".zip", ".7z", ".pdf"}
+    is_binary = suffix in BINARY_EXTS
+    if not is_binary and size > 0:
+        try:
+            with open(p, "rb") as bf:
+                chunk = bf.read(1024)
+                if _is_binary_bytes(chunk):
+                    is_binary = True
+        except Exception:
+            pass
+
+    if is_binary:
+        import mimetypes
+        mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+        return (f"{res_prefix}[binary file: {p.name} ({mime}, {size:,} bytes) — "
+                f"raw binary read skipped to prevent context window corruption]"), {}
+
+    # Standard Text File
     if full:
         text = p.read_text(errors="replace")
         if len(text.splitlines()) <= 2000:
-            return text, {}
-        return (f"error: file too large for full read ({len(text.splitlines())} lines). "
+            return f"{res_prefix}{text}", {}
+        return (f"{res_prefix}error: file too large for full read ({len(text.splitlines())} lines). "
                 f"Use offset/limit instead."), {}
-    return _numbered(p, offset, limit), {}
-
+    return f"{res_prefix}{_numbered(p, offset, limit)}", {}
 
 def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
     p = fs.resolve(path)
@@ -654,6 +748,30 @@ def tool_py(session, code: str, timeout: int = 60) -> tuple[str, dict]:
     if len(result) > 8000:
         result = result[:3800] + f"\n\n…[{len(result)-7600:,} chars elided]…\n\n" + result[-3800:]
     return result, {}
+
+
+
+def cleanup_procs() -> int:
+    """Terminate any lingering background processes. Returns count killed."""
+    killed = 0
+    for hid, h in list(PROCS.items()):
+        proc = h.get("proc")
+        if proc and proc.poll() is None:
+            try:
+                import signal
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                killed += 1
+            except Exception:
+                try:
+                    proc.kill()
+                    killed += 1
+                except Exception:
+                    pass
+    PROCS.clear()
+    return killed
+
+import atexit
+atexit.register(cleanup_procs)
 
 
 def tool_todo(items: list[dict]) -> tuple[str, dict]:

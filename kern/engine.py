@@ -103,6 +103,7 @@ class Engine:
         self.requests = 0                 # paid API requests this engine made
         self._stream_fails = 0            # consecutive transport failures
         self._fetch_cache: dict = {}      # url+max_chars -> wrapped body (session scope)
+        self._consecutive_errors: list[str] = []
         self.subagents: dict[str, dict] = {}
         self._approve_lock = asyncio.Lock()
         self._replay_subagents()
@@ -896,8 +897,20 @@ class Engine:
                             f"executed earlier this session — prior result: "
                             f"{prior[:120]!r}. You have just re-run it; side effects "
                             f"may have been repeated.]\n{text}")
+                # Error loop sensor: prevent agents from stubbornly brute-forcing failing calls
+                is_err = "error:" in str(text) or ("exit=" in str(text) and "exit=0" not in str(text))
+                if is_err:
+                    self._consecutive_errors.append(str(text).splitlines()[0][:60])
+                    if len(self._consecutive_errors) >= 3:
+                        text = (str(text) + "\n\n[harness hint: 3 consecutive actions failed with similar errors. "
+                                           "Stop brute-forcing: inspect the premises with read(), check file contents, "
+                                           "or test a fundamentally different approach before repeating.]")
+                else:
+                    self._consecutive_errors.clear()
+
                 self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
-                                   diff=meta.get("diff") or None)
+                                   diff=meta.get("diff") or None,
+                                   media=meta.get("media") or None)
                 self.stream_cb("result", str(text))
                 if meta.get("diff"):
                     self.stream_cb("diff", meta["diff"])
