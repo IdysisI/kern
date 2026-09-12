@@ -49,9 +49,14 @@ class CapabilityIndex:
                     self.caps[sk.name] = Capability(sk.name, "skill", _skill_oneliner(md), str(md))
         if MCP_CONFIG.exists():
             try:
-                for name in json.loads(MCP_CONFIG.read_text()):
-                    self.caps.setdefault(name, Capability(name, "mcp", "MCP server", name))
-            except json.JSONDecodeError:
+                data = json.loads(MCP_CONFIG.read_text())
+                if isinstance(data, dict):
+                    for name, entry in data.items():
+                        desc = "MCP server"
+                        if isinstance(entry, dict):
+                            desc = entry.get("description") or "MCP server"
+                        self.caps.setdefault(name, Capability(name, "mcp", desc, name))
+            except Exception:
                 pass
 
     def lines(self) -> list[str]:
@@ -87,7 +92,8 @@ class MCPClient:
         self.proc = await asyncio.create_subprocess_exec(
             *self.command,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL)
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=16 * 1024 * 1024)
         await self._rpc("initialize", {
             "protocolVersion": "2024-11-05", "capabilities": {},
             "clientInfo": {"name": "kern", "version": "0.1.0"}})
