@@ -48,23 +48,38 @@ assert meta_img["media"]["data"] == base64.b64encode(dummy_png).decode("ascii")
 print("1b) Image file attached with base64 payload in meta")
 
 # C) Wire payload conversion
+# Seed health for verified vision vs text-only model
+kc.save_health({
+    "test-vision-model": {"ok": True, "vision": True},
+    "test-text-only-model": {"ok": True, "vision": False}
+})
+
 ir_msgs = [
     {"role": "user", "text": "inspect this"},
     {"role": "tool", "tool_call_id": "c1", "text": msg_img, "media": meta_img["media"]}
 ]
-openai_wire = kc._ir_to_openai(ir_msgs)
+# For verified vision model: attaches native image_url / image block
+openai_wire = kc._ir_to_openai(ir_msgs, model="test-vision-model")
 assert any(
     isinstance(m.get("content"), list) and any(item.get("type") == "image_url" for item in m["content"])
     for m in openai_wire
 )
-print("1c) OpenAI wire format converts image to image_url block")
+print("1c) Verified vision model: converts image to native image_url block")
 
-anthropic_wire = kc._ir_to_anthropic(ir_msgs)
+anthropic_wire = kc._ir_to_anthropic(ir_msgs, model="test-vision-model")
 assert any(
     isinstance(m.get("content"), list) and any(item.get("type") == "tool_result" and isinstance(item.get("content"), list) and any(b.get("type") == "image" for b in item["content"]) for item in m["content"])
     for m in anthropic_wire
 )
-print("1d) Anthropic wire format converts image to source base64 block")
+print("1d) Anthropic wire format: converts image to source base64 block")
+
+# For text-only or blind model: safely omits data URL block to prevent HTTP 400 or hallucinations
+text_only_wire = kc._ir_to_openai(ir_msgs, model="test-text-only-model")
+assert all(
+    not (isinstance(m.get("content"), list) and any(item.get("type") == "image_url" for item in m["content"]))
+    for m in text_only_wire
+)
+print("1e) Text-only model: omits image payload safely, preventing 400 error or hallucination")
 
 # --- 2. Path Resilience ---
 repo_dir = pathlib.Path(tempfile.mkdtemp())

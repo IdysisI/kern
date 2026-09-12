@@ -59,6 +59,13 @@ def save_health(h: dict) -> None:
         json.dump(h, f, indent=1)
     os.replace(tmp, HEALTH_PATH)
 
+def supports_vision(model: str) -> bool:
+    if not model:
+        return True   # default if model not specified (backwards compatibility / unit tests)
+    h = health_of(model)
+    return bool(h.get("vision"))
+
+
 def health_of(model: str) -> dict:
     h = load_health().get(model, {})
     ts = h.get("ts")
@@ -230,7 +237,7 @@ class Client:
                                    f"Re-issue the tool call with valid JSON arguments.")})
 
     async def _stream_openai(self, model, messages, system, tools, max_tokens):
-        msgs = ([{"role": "system", "content": system}] if system else []) + _ir_to_openai(messages)
+        msgs = ([{"role": "system", "content": system}] if system else []) + _ir_to_openai(messages, model=model)
         body: dict[str, Any] = {
             "model": model, "messages": msgs, "stream": True,
             "max_tokens": max_tokens, "stream_options": {"include_usage": True},
@@ -306,7 +313,7 @@ class Client:
     async def _stream_anthropic(self, model, messages, system, tools, max_tokens):
         body: dict[str, Any] = {
             "model": model, "max_tokens": max_tokens, "stream": True,
-            "messages": _ir_to_anthropic(messages),
+            "messages": _ir_to_anthropic(messages, model=model),
         }
         if system:
             body["system"] = [{"type": "text", "text": system,
@@ -429,6 +436,30 @@ class Client:
                     result["py_repl"] = True
                 except SyntaxError:
                     result["py_repl"] = False
+        # CAPABILITY TEST — Vision: empirically test if model genuinely perceives images.
+        # Avoids sending multimodal payload to text-only models (which trigger HTTP 400)
+        # or blind models that return HTTP 200 while hallucinating.
+        # We test with a 32x32 pure solid red PNG and verify if the model identifies 'red'.
+        result["vision"] = False
+        if result["ok"]:
+            red_32_b64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAGklEQVR42mP8z8BQDwAE/wD/AP8A/wAHEAL+Hn2jAAAAAElFTkSuQmCC"
+            vision_msg = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is the single dominant color of this solid color image? Reply with ONLY the color name in one word."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{red_32_b64}"}}
+                ]
+            }
+            try:
+                ans_text = ""
+                async for ev in self.stream_chat(model, [vision_msg], max_tokens=128):
+                    if ev.kind == "text":
+                        ans_text += ev.text
+                if "red" in ans_text.lower():
+                    result["vision"] = True
+            except Exception:
+                result["vision"] = False
+
         h = load_health()
         h[model] = result
         save_health(h)
@@ -437,7 +468,7 @@ class Client:
 
 # ---- IR <-> wire conversions ------------------------------------------------
 
-def _ir_to_openai(messages: list[dict]) -> list[dict]:
+def _ir_to_openai(messages: list[dict], model: str = "") -> list[dict]:
     out = []
     for m in messages:
         if m["role"] == "assistant" and m.get("tool_calls"):
@@ -447,8 +478,8 @@ def _ir_to_openai(messages: list[dict]) -> list[dict]:
                                                      "arguments": json.dumps(tc["arguments"])}} for tc in m["tool_calls"]]})
         elif m["role"] == "tool":
             media = m.get("media")
-            if media and media.get("type") == "image":
-                # Native multimodal image payload for OpenAI/VSLLM vision models
+            if media and media.get("type") == "image" and supports_vision(model):
+                # Native multimodal image payload for verified vision models
                 content = [
                     {"type": "text", "text": m["text"]},
                     {"type": "image_url", "image_url": {"url": f"data:{media['mime']};base64,{media['data']}"}}
@@ -461,7 +492,7 @@ def _ir_to_openai(messages: list[dict]) -> list[dict]:
     return out
 
 
-def _ir_to_anthropic(messages: list[dict]) -> list[dict]:
+def _ir_to_anthropic(messages: list[dict], model: str = "") -> list[dict]:
     out = []
     for m in messages:
         if m["role"] == "assistant" and m.get("tool_calls"):
@@ -473,8 +504,8 @@ def _ir_to_anthropic(messages: list[dict]) -> list[dict]:
             out.append({"role": "assistant", "content": blocks})
         elif m["role"] == "tool":
             media = m.get("media")
-            if media and media.get("type") == "image":
-                # Native multimodal image payload for Anthropic vision models
+            if media and media.get("type") == "image" and supports_vision(model):
+                # Native multimodal image payload for verified vision models
                 blk_content = [
                     {"type": "text", "text": m["text"]},
                     {"type": "image", "source": {"type": "base64", "media_type": media["mime"], "data": media["data"]}}
