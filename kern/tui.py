@@ -567,7 +567,7 @@ class KernApp(App):
         last = None
         for i in range(tries):
             try:
-                ws = await _ws.connect(KERN_DAEMON_URI, open_timeout=1.5)
+                ws = await _ws.connect(KERN_DAEMON_URI, open_timeout=2.0, ping_interval=None, max_size=32 * 1024 * 1024)
                 # Check daemon version to ensure it is not running stale code
                 # A busy daemon (e.g. replaying a huge journal) can starve
                 # its event loop and miss a short probe. Patient probe; and
@@ -1233,44 +1233,46 @@ class KernApp(App):
                 self._load_session(pick)
 
     def _render_journal(self):
-        """Replay the current session's journal back into widgets.
-        Returns an AwaitComplete-friendly coroutine-friendly method: for
-        huge journals we yield to the event loop every 50 events so a
-        2000-event replay cannot starve RPCs/status ticks (the exact cause
-        of 'daemon unavailable' right after resuming a long session)."""
+        """Replay the journal back into widgets cleanly and instantly.
+        If a compaction checkpoint exists, historical turns [0..cutoff_n)
+        are represented by the compaction header note; active uncompacted
+        turns are rendered in full. If no compaction exists, recent turns
+        are rendered directly. Eliminates Textual RecursionError and lag."""
         for w in list(self.chat.children):
             w.remove()
         self._todo_card = None
         self._tool_card = None
+
+        compact_ev = None
+        cutoff_n = 0
+        for ev in reversed(self.session.events):
+            if ev.get("kind") == "compact":
+                compact_ev = ev
+                cutoff_n = ev.get("upto_n", ev.get("covers", 0))
+                break
+
         calls_by_id: dict[str, tuple[str, dict, ToolCard]] = {}
-        self._render_journal_events(calls_by_id)
 
-    def _render_journal_events(self, calls_by_id, _batch=50):
-        self._render_journal_continue(calls_by_id, 0, _batch)
+        if compact_ev is not None and cutoff_n > 0:
+            self.chat.mount(Static(
+                f"◈ session compacted ({cutoff_n} past events summarized) — full history in events.jsonl",
+                classes="note"
+            ))
+            active_events = [e for e in self.session.events if e.get("n", 0) >= cutoff_n]
+        elif len(self.session.events) > 150:
+            earlier_count = len(self.session.events) - 100
+            self.chat.mount(Static(
+                f"◈ earlier history ({earlier_count} events) — full log in events.jsonl",
+                classes="note"
+            ))
+            active_events = self.session.events[-100:]
+        else:
+            active_events = self.session.events
 
-    def _render_journal_continue(self, calls_by_id, start, _batch=50):
-        """Chunked replay: after each batch we schedule the next chunk as a
-        separate task with a sleep(0) yield, so mounting 2000 widgets can't
-        starve the TUI loop (RPC timeouts -> 'daemon unavailable' right
-        after resuming a long session)."""
-        async def _run():
-            try:
-                for i, ev in enumerate(self.session.events[start:], start):
-                    if i and i % _batch == 0:
-                        self._render_journal_continue(calls_by_id, i, _batch)
-                        return
-                    self._render_one(ev, calls_by_id)
-                    if i and i % _batch == _batch // 2:
-                        await asyncio.sleep(0)
-                self._refresh_chrome()
-                self.chat.scroll_end(animate=False)
-                if start > 0:
-                    self._chat_note(f"◈ replay done ({len(self.session.events)} events)")
-            except Exception:
-                # teardown race: app/screen gone mid-replay — nothing to do.
-                pass
-        asyncio.ensure_future(_run())
-        self._chat_note(f"◈ replay done ({len(self.session.events)} events)")
+        for ev in active_events:
+            self._render_one(ev, calls_by_id)
+
+        self._refresh_chrome()
         self.chat.scroll_end(animate=False)
 
     def _render_one(self, ev, calls_by_id):

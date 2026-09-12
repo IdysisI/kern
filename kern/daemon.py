@@ -369,7 +369,11 @@ async def handler(ws):
 
 def main():
     async def _run():
-        async with websockets.serve(handler, HOST, PORT):
+        async with websockets.serve(
+            handler, HOST, PORT,
+            ping_interval=None,
+            max_size=32 * 1024 * 1024
+        ):
             print(f"kern daemon on ws://{HOST}:{PORT} — sessions survive their terminals")
             await asyncio.Future()
     asyncio.run(_run())
