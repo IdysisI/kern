@@ -562,6 +562,16 @@ class KernApp(App):
         yield PromptArea()
         yield Static(id="bar")
 
+    async def _push_modal(self, screen: Screen) -> Any:
+        """Push a modal screen and await its dismissal without requiring a Textual Worker.
+        Textual's push_screen_wait() raises NoActiveWorker when called from event
+        handlers or message pumps; this helper uses a future-backed callback that
+        works safely across all async contexts."""
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self.push_screen(screen, callback=lambda res: fut.set_result(res) if not fut.done() else None)
+        return await fut
+
     def on_mount(self):
         self.query_one("#status").display = False
         self._refresh_chrome()
@@ -727,7 +737,7 @@ class KernApp(App):
             return
         rows = ([{"id": "__new__", "turns": "0", "preview": "start a fresh session"}]
                 + _order_sessions(sess_rows))
-        pick = await self.push_screen_wait(SessionPicker(rows))
+        pick = await self._push_modal(SessionPicker(rows))
         if pick == "__new__":
             await self._slash("/new")
         elif pick:
@@ -874,7 +884,7 @@ class KernApp(App):
             except Exception:
                 pass
             return
-        v = await self.push_screen_wait(Approve(desc, diff))
+        v = await self._push_modal(Approve(desc, diff))
         if v == "a":
             self._always = True
         try:
@@ -995,7 +1005,7 @@ class KernApp(App):
     async def _approve(self, desc: str, diff: str | None = None) -> bool:
         if self._always:
             return True
-        v = await self.push_screen_wait(Approve(desc, diff))
+        v = await self._push_modal(Approve(desc, diff))
         if v == "a":
             self._always = True
             return True
@@ -1255,7 +1265,7 @@ class KernApp(App):
                                               {"preview": r.get("preview", ""),
                                                "last_ts": r.get("ts", 0.0)})}
                     for r in rows]
-        pick = await self.push_screen_wait(SessionPicker(_order_sessions(sess_rows)))
+        pick = await self._push_modal(SessionPicker(_order_sessions(sess_rows)))
         if pick:
             if self.remote is not None:
                 await self._attach_remote(pick)
@@ -1552,7 +1562,7 @@ class KernApp(App):
                 status = "[dim]·[/]"
             rows.append((name, status))
         rows.sort(key=lambda r: (r[0] != self.model, r[0]))
-        pick = await self.push_screen_wait(ModelPicker(rows, self.model))
+        pick = await self._push_modal(ModelPicker(rows, self.model))
         if pick:
             self.model = pick
             self._explicit_model = True
