@@ -134,6 +134,60 @@ class MCPClient:
                 self.proc.kill()
 
 
+def sanitize_schema(schema: dict | Any, root: dict | None = None) -> dict:
+    """Normalize MCP/JSON-Schema dictionaries into standard, wire-compliant OpenAPI schemas.
+    Resolves internal $ref pointers, flattens tuple items into single-object array items
+    (fixing Gemini's 'Proto field is not repeating, cannot start list' HTTP 400 error),
+    strips invalid meta keywords ($schema, $id, definitions), and ensures object properties."""
+    if root is None:
+        root = schema if isinstance(schema, dict) else {}
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}}
+
+    if "$ref" in schema:
+        ref = schema["$ref"]
+        if isinstance(ref, str) and ref.startswith("#/"):
+            parts = ref.lstrip("#/").split("/")
+            curr = root
+            found = True
+            for p in parts:
+                if isinstance(curr, dict) and p in curr:
+                    curr = curr[p]
+                elif isinstance(curr, list) and p.isdigit() and int(p) < len(curr):
+                    curr = curr[int(p)]
+                else:
+                    found = False
+                    break
+            if found and isinstance(curr, dict) and curr is not schema:
+                return sanitize_schema(dict(curr), root)
+            else:
+                return {"type": "object", "properties": {}}
+
+    out = {}
+    for k, v in schema.items():
+        if k in ("$schema", "$id", "definitions", "$defs", "execution"):
+            continue
+        if k == "items":
+            if isinstance(v, list):
+                out[k] = sanitize_schema(v[0], root) if v else {"type": "string"}
+            elif isinstance(v, dict):
+                out[k] = sanitize_schema(v, root)
+            else:
+                out[k] = {"type": "string"}
+        elif k == "properties" and isinstance(v, dict):
+            out[k] = {pk: sanitize_schema(pv, root) for pk, pv in v.items()}
+        elif k in ("anyOf", "oneOf", "allOf") and isinstance(v, list):
+            out[k] = [sanitize_schema(item, root) for item in v]
+        elif isinstance(v, dict):
+            out[k] = sanitize_schema(v, root)
+        else:
+            out[k] = v
+
+    if out.get("type") == "object" and "properties" not in out:
+        out["properties"] = {}
+    return out
+
+
 class MountTable:
     """What is currently mounted in this session."""
 
@@ -146,10 +200,12 @@ class MountTable:
         out = []
         for srv, client in self.mcps.items():
             for t in client.tools:
+                raw_params = t.get("inputSchema") or {"type": "object", "properties": {}}
+                clean_params = sanitize_schema(raw_params)
                 out.append({"type": "function", "function": {
                     "name": f"{srv}__{t['name']}",
                     "description": f"[{srv} mcp] " + (t.get("description") or "")[:200],
-                    "parameters": t.get("inputSchema", {"type": "object", "properties": {}})}})
+                    "parameters": clean_params}})
         return out
 
     async def call_mcp(self, fq_name: str, arguments: dict) -> str:
