@@ -1,6 +1,6 @@
 """T19 — Verification of core audit fixes:
  1. is_safe_readonly security hardening (semicolon, newline, destructive git flags)
- 2. tool_search truncation reporting accurate remaining count
+ 2. fetch cache: repeated fetch of the same URL+max_chars is served from cache
  3. Handshake native_tools=False auto-switches engine to fenced mode
  4. Fenced mode invalid JSON yields structured feedback (kern_error), not silent drop
  5. Slate objective fallback to last user message when explicit objective is absent
@@ -29,16 +29,36 @@ assert ks.is_safe_readonly("ls -la"), "ls -la should be safe"
 assert ks.is_safe_readonly("git status && git log -n 3"), "git status && git log should be safe"
 print("1) is_safe_readonly security hardened")
 
-# 2. tool_search truncation reporting accurate remaining count
-fs = ks.FS(tmp_home)
-test_dir = os.path.join(tmp_home, "search_test")
-os.makedirs(test_dir, exist_ok=True)
-for i in range(10):
-    with open(os.path.join(test_dir, f"file_{i}.txt"), "w") as f:
-        f.write("target_word_for_search\n")
-res_text, _ = ks.tool_search(fs, "target_word_for_search", path=test_dir, max_results=3)
-assert "… and 7 more results (truncated)" in res_text, f"Unexpected truncation text: {res_text}"
-print("2) tool_search remaining count accurate")
+# 2. fetch cache: repeated fetch of the same URL+max_chars is served from cache
+class _FakeResp:
+    status_code = 200
+    headers = {"content-type": "text/plain"}
+    text = "cached body content"
+
+class _FetchClient:
+    calls = 0
+    def get(self, *a, **k):
+        _FetchClient.calls += 1
+        return _FakeResp()
+
+import kern.syscalls as _ks2
+_orig_get = _ks2.httpx.get if hasattr(_ks2, "httpx") else None
+import httpx as _httpx_mod
+_ks_httpx_get = _httpx_mod.get
+_httpx_mod.get = _FetchClient().get
+try:
+    cache = {}
+    r1, _ = _ks2.tool_fetch("https://example.com/doc", cache=cache)
+    r2, _ = _ks2.tool_fetch("https://example.com/doc", cache=cache)
+    assert r1 == r2, "cached body must equal fresh body"
+    assert _FetchClient.calls == 1, f"HTTP must be called exactly once, got {_FetchClient.calls}"
+    # different max_chars -> different key -> refetch
+    _FetchClient.calls = 0
+    _ks2.tool_fetch("https://example.com/doc", max_chars=500, cache=cache)
+    assert _FetchClient.calls == 1, "different max_chars must not hit cache"
+finally:
+    _httpx_mod.get = _ks_httpx_get
+print("2) fetch cache: one HTTP call per url+max_chars per session")
 
 # 3. Handshake native_tools=False auto-switches engine to fenced mode
 save_health({"dumb-model": {"ok": True, "native_tools": False}})
@@ -51,11 +71,15 @@ print("3) Handshake native_tools=False auto-switches engine to fenced mode")
 
 # 4. Fenced mode invalid JSON yields structured feedback (kern_error), not silent drop
 class FakeFencedBadJsonClient:
+    def __init__(self): self.n = 0
     async def probe(self, model): return None
     async def list_models(self): return []
     async def stream_chat(self, model, messages, system=None, tools=None, max_tokens=None):
-        # Emits invalid JSON inside fenced block
-        yield StreamEvent("text", text='```tool\n{"name": "exec", "arguments": {"cmd": broken_json\n```')
+        self.n += 1
+        if self.n == 1:
+            yield StreamEvent("text", text='```tool\n{"name": "exec", "arguments": {"cmd": broken_json\n```')
+        else:
+            yield StreamEvent("text", text="done")
         yield StreamEvent("done")
 
 s_fenced = create_session(cwd=tmp_home)
@@ -88,11 +112,16 @@ def custom_approve(desc, preview=None):
     return True
 
 class FakeSubagentClient:
+    def __init__(self): self.n = 0
     async def probe(self, model): return None
     async def list_models(self): return []
     async def stream_chat(self, model, messages, system=None, tools=None, max_tokens=None):
-        yield StreamEvent("tool_call", tool_call={"id": "c1", "name": "write",
-                                                 "arguments": {"path": "sub.txt", "content": "hi"}})
+        self.n += 1
+        if self.n == 1:
+            yield StreamEvent("tool_call", tool_call={"id": "c1", "name": "write",
+                                                     "arguments": {"path": "sub.txt", "content": "hi"}})
+        else:
+            yield StreamEvent("text", text="done")
         yield StreamEvent("done")
 
 s_parent = create_session(cwd=tmp_home)

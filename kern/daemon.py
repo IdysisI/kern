@@ -42,7 +42,7 @@ class Worker:
         self.pending_approval: tuple[int, str, str | None] | None = None
         self._approvals: dict[int, asyncio.Future] = {}
         self._approval_seq = 0
-        self.usage = {"in": 0, "out": 0}
+        self.usage = {"in": 0, "out": 0, "requests": 0}
 
     # ---- outbound -----------------------------------------------------------
 
@@ -116,7 +116,8 @@ class Worker:
         async def run():
             try:
                 reply = await eng_cb(eng)
-                self.usage = {"in": eng.usage_in, "out": eng.usage_out}
+                self.usage = {"in": eng.usage_in, "out": eng.usage_out,
+                              "requests": eng.requests}
                 await self.broadcast(event="turn_end", reply=reply, usage=self.usage)
             except asyncio.CancelledError:
                 await self.broadcast(event="turn_end", reply="", interrupted=True)
@@ -193,22 +194,56 @@ class Registry:
         self.workers[sess.id] = w
         return w
 
-    def listing(self) -> dict[str, dict]:
+    def listing(self, limit: int = 40) -> dict[str, dict]:
+        """Fast session listing: active sessions first, then the most recent
+        sessions on disk capped at `limit`. Avoids parsing 1000+ files and
+        prevents Textual RecursionError on large session archives."""
         out = {}
-        for sid in list_sessions():
+        # 1. All active workers first
+        for sid, w in self.workers.items():
+            if w.running:
+                out[sid] = {"active": True, "preview": _preview(w.session),
+                            "cwd": w.cwd, "model": w.model, "last_ts": _last_ts(w.session)}
+
+        # 2. Fast sort of on-disk sessions by SID (which embeds creation time YYYYmmdd-HHMMSS)
+        disk_sids = sorted(list_sessions(), reverse=True)
+        for sid in disk_sids:
+            if len(out) >= limit:
+                break
+            if sid in out:
+                continue
             w = self.workers.get(sid)
             if w:
-                out[sid] = {"active": w.running, "preview": _preview(w.session), "cwd": w.cwd, "model": w.model}
+                out[sid] = {"active": w.running, "preview": _preview(w.session),
+                            "cwd": w.cwd, "model": w.model, "last_ts": _last_ts(w.session)}
             else:
                 s = Session(sid)
-                out[sid] = {"active": False, "preview": _preview(s), "cwd": s.meta().get("cwd", "?"), "model": "?"}
-        return out
+                out[sid] = {"active": False, "preview": _preview(s),
+                            "cwd": s.meta().get("cwd", "?"), "model": "?",
+                            "last_ts": _last_ts(s)}
+        return dict(sorted(out.items(),
+                           key=lambda kv: (kv[1]["active"], kv[1]["last_ts"], kv[0]), reverse=True))
+
+
+def _last_ts(s: Session) -> float:
+    """Last time this session was actually used: the ts of its final event,
+    falling back to the journal file's mtime, falling back to 0 (unknown)."""
+    try:
+        if s.events:
+            ts = s.events[-1].get("ts")
+            if isinstance(ts, (int, float)) and ts > 0:
+                return float(ts)
+        if s.log.exists():
+            import os as _os
+            return s.log.stat().st_mtime
+    except Exception:
+        pass
+    return 0.0
 
 
 def _preview(s: Session) -> str:
     first_user = next((e.get("text", "") for e in s.events if e["kind"] == "user"), "")
-    ts = s.events[-1].get("ts", 0) if s.events else 0
-    return f"{first_user[:60]}|{ts}"
+    return first_user[:60]
 
 
 REG = Registry()
@@ -237,7 +272,13 @@ async def handler(ws):
                 await ws.send(reply({"shutdown": True}))
                 asyncio.get_event_loop().call_later(0.1, lambda: os._exit(0))
             elif m == "sessions":
-                await ws.send(reply({"sessions": REG.listing()}))
+                # parse journals OFF the event loop: listing() reads every
+                # events.jsonl on disk; on a busy daemon (mid-replay of a
+                # huge journal) doing it inline starved the loop, handshakes
+                # timed out, and TUIs fell back to local mode (or worse,
+                # killed a healthy daemon). Never block the loop on disk.
+                listing = await asyncio.to_thread(REG.listing)
+                await ws.send(reply({"sessions": listing}))
             elif m == "new":
                 new_worker = REG.new(msg.get("cwd", os.getcwd()), msg.get("model"))
                 if worker is not None and worker is not new_worker:
@@ -247,7 +288,11 @@ async def handler(ws):
                 await ws.send(reply({"attached": worker.session.id, "model": worker.model}))
             elif m == "attach":
                 requested_model = msg.get("model")
-                new_worker = REG.ensure(msg["session"], requested_model)
+                # Session(sid) parses the whole journal — off the loop (a
+                # huge replay here starved handshakes; see "sessions").
+                # ensure() itself only hits disk on the FIRST attach of a
+                # session; afterwards it's a dict lookup.
+                new_worker = await asyncio.to_thread(REG.ensure, msg["session"], requested_model)
                 if worker is not None and worker is not new_worker:
                     worker.clients.discard(ws)
                 worker = new_worker

@@ -13,7 +13,7 @@ client -> server:
   {"method": "rewind", "id": 0} / {"method": "fork", "at": 12}
 
 server -> client:
-  {"event": "text" | "tool" | "result" | "diff" | "todo" | "note" | "handle", ...}
+  {"event": "text" | "tool" | "result" | "diff" | "todo" | "note" | "handle" | "summary", ...}
   {"event": "approve_request", "id": 3, "desc": "...", "diff": "...or null"}
   {"event": "turn_end", "reply": "...", "usage": {...}}
   {"event": "error", "error": "..."}
@@ -84,7 +84,8 @@ class Conn:
                 try:
                     reply = await eng.chat(msg["text"])
                     await self.send(event="turn_end", reply=reply,
-                                    usage={"in": eng.usage_in, "out": eng.usage_out})
+                                    usage={"in": eng.usage_in, "out": eng.usage_out,
+                                            "requests": eng.requests})
                 except asyncio.CancelledError:
                     await self.send(event="turn_end", reply="", interrupted=True)
                 except Exception as e:

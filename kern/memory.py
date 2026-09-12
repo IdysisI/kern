@@ -154,6 +154,11 @@ class MemoryTree:
             f"{summary}\n\n(full raw history: ~/.kern/sessions/{sid}/events.jsonl)\n")
         scen = sorted((self.root / "scenarios").glob("*.md"),
                       key=lambda p: p.stat().st_mtime, reverse=True)
+        # ARCHIVE, don't delete: a rotated scenario may hold facts that a later
+        # `remember` corrects — supersession must have something to supersede,
+        # and the archive stays queryable via memory(search) at zero cost.
         for old in scen[30:]:
-            old.unlink()
+            archive = self.root / "scenarios-archive"
+            archive.mkdir(exist_ok=True)
+            old.rename(archive / old.name)
         return f"absorbed into memory:scenarios/{name}"

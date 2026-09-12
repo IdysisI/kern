@@ -28,6 +28,10 @@ KERN_HOME = os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern"))
 STALL_FIRST = float(os.environ.get("KERN_STALL_FIRST", "360"))
 STALL_NEXT = float(os.environ.get("KERN_STALL_NEXT", "90"))
 HEALTH_PATH = os.path.join(KERN_HOME, "health.json")
+# health TTL: a probe result older than this is treated as stale and the model
+# is re-probed (proxies change behavior under us; stale "native_tools" makes
+# every turn silently dumb — each of those turns is a paid request wasted).
+HEALTH_TTL = float(os.environ.get("KERN_HEALTH_TTL", str(7 * 24 * 3600)))
 
 # ---------------------------------------------------------------- events ---
 
@@ -56,7 +60,22 @@ def save_health(h: dict) -> None:
     os.replace(tmp, HEALTH_PATH)
 
 def health_of(model: str) -> dict:
-    return load_health().get(model, {})
+    h = load_health().get(model, {})
+    ts = h.get("ts")
+    if ts and (time.time() - ts) > HEALTH_TTL:
+        return {}   # stale: force a re-probe
+    return h
+
+
+def invalidate_health(model: str, reason: str = "") -> None:
+    """Drop a model's cached capability profile — e.g. after consecutive
+    stream errors on a model whose health claimed 'ok'. The next turn
+    re-probes instead of blindly trusting a stale profile."""
+    h = load_health()
+    if model in h:
+        h.pop(model)
+        save_health(h)
+    return None
 
 # ---------------------------------------------------------------- client ---
 
@@ -104,6 +123,7 @@ class Client:
     def __init__(self, base_url: str = BASE_URL, timeout: float = 600.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.requests = 0          # EVERY paid API call, ever, on this client
 
     async def list_models(self) -> list[dict]:
         async with httpx.AsyncClient(timeout=15) as c:
@@ -122,6 +142,7 @@ class Client:
         max_tokens: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
         actual_max = max_tokens or default_max_output_tokens(model)
+        self.requests += 1
         if protocol_for(model) == "anthropic":
             gen = self._stream_anthropic(model, messages, system, tools, actual_max)
         else:

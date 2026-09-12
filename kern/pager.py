@@ -125,10 +125,18 @@ def materialize(events: list[dict], session) -> list[dict]:
             cutoff_n = ev.get("upto_n", ev.get("covers", 0))
             break
 
-    # Tier 1c: find the indices of the most recent tool_results to keep inline
+    # Tier 1c: find the indices of the most recent tool_results to keep inline.
+    # SOFT THRESHOLD: while the session is small (well under the compaction
+    # trigger), keep every result inline — eliding a 2k result costs the model
+    # a re-read round-trip (a paid request) to recover it. Eviction only kicks
+    # in once the view is meaningfully large.
     tool_result_idx = [i for i, ev in enumerate(events)
                        if ev["kind"] == "tool_result" and (compact_ev is None or ev.get("n", i) >= cutoff_n)]
-    keep_inline = set(tool_result_idx[-KEEP_RECENT_TOOL_RESULTS:])
+    approx_now = sum(len(json.dumps(ev, default=str)) for ev in events) // 4
+    if approx_now < COMPACT_AT // 2:
+        keep_inline = set(tool_result_idx)          # small session: keep everything
+    else:
+        keep_inline = set(tool_result_idx[-KEEP_RECENT_TOOL_RESULTS:])
 
     # ---- THE SLATE: the model's own work state, always at the top ----------
     slate = _slate(events)
@@ -210,7 +218,8 @@ def materialize(events: list[dict], session) -> list[dict]:
                                  f"with offset/limit to inspect any part]")
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
                              "text": out_text})
-            elif n - i > STALE_AGE and len(text) > STALE_MIN and not ev.get("paged"):
+            elif i not in keep_inline and n - i > STALE_AGE and len(text) > STALE_MIN \
+                    and not ev.get("paged"):
                 path = session.offload(f"t{ev['n']}", text)
                 ev["paged"] = True
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),

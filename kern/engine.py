@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 from . import kernel, pager, syscalls
-from .client import Client, health_of
+from .client import Client, health_of, invalidate_health
 from .journal import Session, create_session
 from . import linker
 from .linker import CapabilityIndex, MCPClient, MountTable
@@ -61,7 +61,12 @@ _CONTINUATION_WORDS = {
 }
 
 
-def _is_continuation_prompt(text: str) -> bool:
+def _is_continuation_prompt(text: str, has_active_objective: bool = True) -> bool:
+    """A continuation only exists if there IS an active objective to continue.
+    On a fresh session (or after the journal has no objective), a terse input
+    like 'fix' or 'ok' is a NEW instruction, not a 'keep going'."""
+    if not has_active_objective:
+        return False
     t = text.strip().lower().rstrip("!., ")
     return t in _CONTINUATION_WORDS or (len(t) <= 3 and t.isalpha())
 
@@ -83,6 +88,9 @@ class Engine:
         self.last_usage: dict = {}
         self.usage_in = 0
         self.usage_out = 0
+        self.requests = 0                 # paid API requests this engine made
+        self._stream_fails = 0            # consecutive transport failures
+        self._fetch_cache: dict = {}      # url+max_chars -> wrapped body (session scope)
         self.tokens_streamed = 0
         self.todo: list[dict] = []
         self.forced_fenced = bool(__import__("os").environ.get("KERN_FORCE_FENCED"))
@@ -250,9 +258,7 @@ class Engine:
         if name == "proc":
             return syscalls.tool_proc(**args)
         if name == "fetch":
-            return syscalls.tool_fetch(**args)
-        if name == "search":
-            return syscalls.tool_search(self.fs, **args)
+            return syscalls.tool_fetch(**args, cache=self._fetch_cache)
         if name == "memory":
             return syscalls.tool_memory(self.session, self.cwd, **args)
         if name == "py":
@@ -274,6 +280,8 @@ class Engine:
                        subagent_depth=self.depth + 1)
         prompt = task + (f"\n\nContext from parent: {context}" if context else "")
         report = await child.chat(prompt)
+        if child.requests > 1:
+            report += f"\n[child cost: {child.requests} requests]"
         return report[:4000]
 
     # ---- the loop ------------------------------------------------------------
@@ -283,7 +291,8 @@ class Engine:
         # Preserve active task objective across generic "Continue" prompts:
         # a user saying "Continue" is telling the agent to keep working on its
         # current goal, NOT changing the goal to the word "Continue".
-        if not _is_continuation_prompt(user_text):
+        has_obj = any(ev.get("kind") == "objective" for ev in self.session.events)
+        if not _is_continuation_prompt(user_text, has_active_objective=has_obj):
             self.session.emit("objective", text=user_text[:400])
         self._autocheckpoint()
         return await self._run_marked()
@@ -300,9 +309,11 @@ class Engine:
     async def _run_marked(self) -> str:
         """_loop() + journal a turn_end marker so the turn is CLOSED: an
         interrupt/undo/rewind must never look like a crash to auto-resume."""
+        self._req0 = getattr(self.client, "requests", 0)
         reason = "done"
         try:
-            return await self._loop()
+            reply = await self._loop()
+            return reply
         except asyncio.CancelledError:
             reason = "interrupted"
             raise
@@ -310,6 +321,8 @@ class Engine:
             reason = "error"
             raise
         finally:
+            # per-turn request accounting (the client counts every paid call)
+            self.requests = getattr(self.client, "requests", 0) - self._req0
             try:
                 self.session.emit("turn_end", reason=reason)
             except Exception:
@@ -387,6 +400,9 @@ class Engine:
             self.stream_cb("note", f"memory absorb failed: {me}")
         self.stream_cb("note", f"compacted: {dropped} events -> summary "
                                f"({len(summary)} chars), user msgs + state kept verbatim")
+        # Surface the actual summary so the user can audit what the model chose
+        # to remember — compaction is otherwise silent and unauditable.
+        self.stream_cb("summary", summary)
         self._compact_fails = 0
         # DEEPENING PASSES: if the budget is STILL over the threshold (the
         # protected window itself was the bulk), shrink the window and compact
@@ -486,7 +502,12 @@ class Engine:
         if not to_compact:
             return
         m = None
-        for ev in self.session.events:
+        # Scope the search to THIS turn's assistant events: the model may
+        # quote an older summary inside its reply, and matching that would
+        # compact the session onto stale text.
+        last_user = max((i for i, ev in enumerate(self.session.events)
+                         if ev["kind"] == "user"), default=-1)
+        for ev in self.session.events[last_user + 1:]:
             if ev["kind"] == "assistant":
                 mm = re.search(r"<summary>(.*?)</summary>", ev.get("text", ""), re.DOTALL)
                 if mm:
@@ -501,7 +522,7 @@ class Engine:
         self.stream_cb("note", "in-reply summary missing — using dedicated compaction request")
         await self._dedicated_compaction(to_compact, None)
 
-    async def _loop(self, max_steps: int = 30) -> str:
+    async def _loop(self, max_steps: int = 100000) -> str:
         if not health_of(self.model) and not self.forced_fenced:
             # never guess a model's protocol — measure it once, then remember
             self.stream_cb("note", f"probing {self.model} capabilities…")
@@ -520,27 +541,51 @@ class Engine:
             calls: list[dict] = []
             error = ""
             truncated = False
-            async for ev in self.client.stream_chat(self.model, view, system=system, tools=tools):
-                if ev.kind == "thinking":
-                    self.stream_cb("thinking", ev.text)
-                elif ev.kind == "finish" and ev.text == "length":
-                    truncated = True
-                    self.stream_cb("note", "⚠ Le modèle a atteint sa limite de tokens de sortie (max_tokens).")
-                elif ev.kind == "text":
-                    text_parts.append(ev.text)
-                    self.tokens_streamed += max(1, len(ev.text) // 4)
-                    self.stream_cb("text", ev.text)
-                elif ev.kind == "tool_call":
-                    calls.append(ev.tool_call)
-                elif ev.kind == "usage":
-                    self.last_usage = ev.usage
-                    self.usage_in += ev.usage.get("prompt_tokens", ev.usage.get("input_tokens", 0))
-                    self.usage_out += ev.usage.get("completion_tokens", ev.usage.get("output_tokens", 0))
-                elif ev.kind == "error":
-                    error = ev.error
-                    # never silent: a stream error in a MIXED turn (text and/or
-                    # valid calls present) must still be journaled and shown.
-                    self.stream_cb("note", f"⚠ {error}")
+            # TRANSPORT RETRY: a proxy that drops the connection before ANY
+            # content arrives burns a paid request for nothing. Retry once
+            # after a short backoff — safe, because nothing was executed and
+            # nothing was journaled from this attempt.
+            for attempt in range(2):
+                text_parts = []
+                calls = []
+                error = ""
+                truncated = False
+                async for ev in self.client.stream_chat(self.model, view, system=system, tools=tools):
+                    if ev.kind == "thinking":
+                        self.stream_cb("thinking", ev.text)
+                    elif ev.kind == "finish" and ev.text == "length":
+                        truncated = True
+                        self.stream_cb("note", "⚠ Le modèle a atteint sa limite de tokens de sortie (max_tokens).")
+                    elif ev.kind == "text":
+                        text_parts.append(ev.text)
+                        self.tokens_streamed += max(1, len(ev.text) // 4)
+                        self.stream_cb("text", ev.text)
+                    elif ev.kind == "tool_call":
+                        calls.append(ev.tool_call)
+                    elif ev.kind == "usage":
+                        self.last_usage = ev.usage
+                        self.usage_in += ev.usage.get("prompt_tokens", ev.usage.get("input_tokens", 0))
+                        self.usage_out += ev.usage.get("completion_tokens", ev.usage.get("output_tokens", 0))
+                    elif ev.kind == "error":
+                        error = ev.error
+                        # never silent: a stream error in a MIXED turn (text and/or
+                        # valid calls present) must still be journaled and shown.
+                        self.stream_cb("note", f"⚠ {error}")
+                retryable = ("stage=transport" in error) and not text_parts and not calls
+                if not retryable or attempt:
+                    break
+                self.stream_cb("note", f"transport died before any content — retrying once ({error[:120]})")
+                await asyncio.sleep(2.0)
+            if "stage=transport" in error:
+                self._stream_fails += 1
+                if self._stream_fails >= 3:
+                    # health said this model works, but it keeps failing:
+                    # drop the stale profile so the next turn re-probes.
+                    invalidate_health(self.model)
+                    self.stream_cb("note", f"3 consecutive transport failures — will re-probe {self.model}")
+                    self._stream_fails = 0
+            else:
+                self._stream_fails = 0
 
             raw_text = "".join(text_parts)
             if error:
@@ -549,26 +594,31 @@ class Engine:
                 self.session.emit("tool_result", call_id="", text=f"engine error: {error}")
                 return f"[error from model endpoint: {error}]"
 
-            # Fallback parsing: if model emitted ```tool {...}``` or XML <invoke name="...">
-            for m in FENCED_RE.finditer(raw_text):
-                try:
-                    call = json.loads(m.group(1))
-                    calls.append({"id": f"fenced-{len(calls)}",
-                                  "name": call.get("name", ""),
-                                  "arguments": call.get("arguments", {})})
-                except json.JSONDecodeError as err:
-                    bad_snippet = m.group(1)[:200]
-                    calls.append({
-                        "id": f"fenced-{len(calls)}",
-                        "name": "invalid_tool_json",
-                        "arguments": {},
-                        "kern_error": (f"error: invalid JSON in ```tool block ({err}). "
-                                       f"Block was:\n{bad_snippet}\n"
-                                       f"Correct shape:\n```tool\n"
-                                       f'{{"name": "...", "arguments": {{...}}}}\n```')
-                    })
-            for call in _parse_xml_invoke(raw_text):
-                calls.append(call)
+            # Fallback parsing — ONLY when the native channel produced no
+            # calls. In native-tools mode the model may echo fenced/XML
+            # examples in prose ("here's how you'd call this…"); executing
+            # those would be a phantom tool call. Native calls, when present,
+            # are authoritative.
+            if not calls:
+                for m in FENCED_RE.finditer(raw_text):
+                    try:
+                        call = json.loads(m.group(1))
+                        calls.append({"id": f"fenced-{len(calls)}",
+                                      "name": call.get("name", ""),
+                                      "arguments": call.get("arguments", {})})
+                    except json.JSONDecodeError as err:
+                        bad_snippet = m.group(1)[:200]
+                        calls.append({
+                            "id": f"fenced-{len(calls)}",
+                            "name": "invalid_tool_json",
+                            "arguments": {},
+                            "kern_error": (f"error: invalid JSON in ```tool block ({err}). "
+                                           f"Block was:\n{bad_snippet}\n"
+                                           f"Correct shape:\n```tool\n"
+                                           f'{{"name": "...", "arguments": {{...}}}}\n```')
+                        })
+                for call in _parse_xml_invoke(raw_text):
+                    calls.append(call)
 
             display = FENCED_RE.sub("", raw_text)
             display = re.sub(r"\]<\]minimax\[?>?\[?", "", display)
@@ -655,4 +705,4 @@ class Engine:
 
         if getattr(self, "_compact_pending", False):
             await self._finish_pending_compaction()
-        return final_text + "\n[step limit reached — 30 tool iterations this turn; send another message to continue]"
+        return final_text

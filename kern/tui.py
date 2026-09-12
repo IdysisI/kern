@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 KERN_DAEMON_PORT = int(os.environ.get("KERN_SERVE_PORT", "8766"))
 KERN_DAEMON_URI = os.environ.get("KERN_SERVE_URI", f"ws://127.0.0.1:{KERN_DAEMON_PORT}")
@@ -51,7 +52,7 @@ from .pager import budget
 DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
 
 TOOL_ICON = {"read": "◱", "write": "✎", "edit": "✎", "exec": "▶", "spawn": "⑂",
-             "fetch": "◈", "todo": "☰", "proc": "⚙"}
+             "fetch": "◈", "todo": "☰", "proc": "⚙", "memory": "◍"}
 
 # Breathing dot: the moving cursor at the tail of streamed text, the waiting
 # placeholder, the status bar, and pending tool cards. One glyph that swells
@@ -317,12 +318,55 @@ class ModelPicker(ModalScreen[str | None]):
             self.dismiss(self.rows[idx][0])
 
 
+def _order_sessions(rows: list[dict], limit: int = 40) -> list[dict]:
+    """Picker order: last USED first (most recent activity -> oldest).
+    Sessions with unknown last-use sink to the bottom; among themselves
+    they run newest-CREATED -> oldest (session ids are YYYYmmdd-HHMMSS,
+    so lexicographic = chronological). Capped at `limit` to prevent
+    deep Textual layout recursion on large session archives."""
+    def known(r):
+        return float(r.get("last_ts") or 0) > 0
+    used = sorted((r for r in rows if known(r)),
+                  key=lambda r: float(r["last_ts"]), reverse=True)
+    unknown = sorted((r for r in rows if not known(r)),
+                     key=lambda r: r["id"], reverse=True)
+    return (used + unknown)[:limit]
+
+
+def _picker_label(sid: str, info: dict) -> str:
+    """One-line session label: preview + human last-used stamp.
+    ts=0/unknown sessions get a '· created' stamp from their id
+    (YYYYmmdd-HHMMSS) instead, so nothing shows a blank/bogus date."""
+    prev = (info.get("preview", "") or "(no preview)").split("|")[0].strip()
+    ts = float(info.get("last_ts") or 0)
+    if ts > 0:
+        try:
+            stamp = f"last used {datetime.fromtimestamp(ts).strftime('%d %b %H:%M')}"
+        except (TypeError, ValueError, OverflowError):
+            stamp = ""
+    else:
+        stamp = ""
+        try:
+            created = datetime.strptime(sid.split("-")[0], "%Y%m%d")
+            stamp = f"created {created.strftime('%d %b %Y')}"
+        except (ValueError, IndexError):
+            pass
+    return f"{prev}  ·  {stamp}".rstrip(" ·")
+
+
 class SessionPicker(ModalScreen[str | None]):
     BINDINGS = [Binding("escape", "cancel")]
 
-    def __init__(self, rows: list[dict]):
+    def __init__(self, rows: list[dict], on_pick: "asyncio.Future | None" = None):
         super().__init__()
         self.rows = rows
+        self._on_pick = on_pick
+
+    def _resolve(self, value: str | None):
+        """Dismiss + resolve the optional future (non-blocking mode)."""
+        if self._on_pick is not None and not self._on_pick.done():
+            self._on_pick.set_result(value)
+        self.dismiss(value)
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mp"):
@@ -335,13 +379,31 @@ class SessionPicker(ModalScreen[str | None]):
             yield ListView(*items)
 
     def action_cancel(self):
-        self.dismiss(None)
+        self._resolve(None)
+
+    def _forward(self, ch: str):
+        """Dismiss without choosing and replay the key into the prompt."""
+        self._resolve(None)
+        if ch:
+            try:
+                area = self.app.query_one("#prompt")
+                area.insert(ch)          # insert at the cursor (Location=None)
+            except Exception:
+                pass
+
+    async def on_key(self, ev):
+        # any printable character = "I just want to type": dismiss + replay
+        import string as _s
+        if ev.is_printable:
+            self._forward(ev.character)
+            ev.prevent_default()
+            ev.stop()
 
     @on(ListView.Selected)
     def on_sel(self, ev: ListView.Selected):
         idx = ev.list_view.index
         if idx is not None and 0 <= idx < len(self.rows):
-            self.dismiss(self.rows[idx]["id"])
+            self._resolve(self.rows[idx]["id"])
 
 
 class PromptArea(TextArea):
@@ -443,6 +505,7 @@ class KernApp(App):
         self._explicit_model = model is not None or "KERN_MODEL" in os.environ
         self._usage_in = 0
         self._usage_out = 0
+        self._requests = 0
         self._tokens_streamed = 0
         self.turn_worker = None
         self._stream_widget: Static | None = None
@@ -506,27 +569,45 @@ class KernApp(App):
             try:
                 ws = await _ws.connect(KERN_DAEMON_URI, open_timeout=1.5)
                 # Check daemon version to ensure it is not running stale code
+                # A busy daemon (e.g. replaying a huge journal) can starve
+                # its event loop and miss a short probe. Patient probe; and
+                # only a CONFIRMED mismatch justifies killing it — a probe
+                # that simply went unanswered means "busy", not "stale".
                 try:
                     await ws.send(json.dumps({"method": "version", "req_id": 999999}))
-                    raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=2.0))
+                    raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=10.0))
                     ver = raw.get("result", {}).get("version")
-                    if ver != DAEMON_VERSION:
-                        try:
-                            await ws.send(json.dumps({"method": "shutdown"}))
-                            await ws.close()
-                        except Exception:
-                            pass
-                        await asyncio.sleep(0.5)
-                        continue
                 except Exception:
-                    pass
+                    ver = None
+                if ver is None:
+                    # daemon answered the TCP connect but not the probe.
+                    # It might be mid-replay — do NOT kill it. Retry once
+                    # more with extra patience, then fall back to using it
+                    # anyway (the version check is an optimization, not a
+                    # safety feature: worst case the user runs old code
+                    # until the next clean restart).
+                    last = RuntimeError("daemon busy — version probe unanswered")
+                    raise last
+                if ver != DAEMON_VERSION:
+                    # CONFIRMED stale daemon: shut it down; the outer except
+                    # respawns it with the CURRENT code on the next loop
+                    # iteration (spawn runs when i == 0).
+                    try:
+                        await ws.send(json.dumps({"method": "shutdown"}))
+                        await ws.close()
+                    except Exception:
+                        pass
+                    last = RuntimeError("stale daemon code — respawning")
+                    raise last
                 return ws
             except Exception as e:
                 last = e
-                if i == 0:
-                    log = open(os.path.expanduser("~/.kern/daemon.log"), "ab")
-                    subprocess.Popen([_sys.executable, "-m", "kern.daemon"],
-                                     start_new_session=True, stdout=log, stderr=log)
+                # (re)spawn on EVERY failed iteration: if an old daemon just
+                # died, a later retry can still recover. Concurrent spawns
+                # are safe — losers exit on "address already in use".
+                log = open(os.path.expanduser("~/.kern/daemon.log"), "ab")
+                subprocess.Popen([_sys.executable, "-m", "kern.daemon"],
+                                 start_new_session=True, stdout=log, stderr=log)
                 await asyncio.sleep(0.5 + 0.5 * i)
         raise last
 
@@ -556,24 +637,32 @@ class KernApp(App):
         except Exception:
             listing = {}
 
-        # If any session is currently ACTIVE (running in the background),
-        # prompt the user with the session picker so they can resume it.
-        active_sids = [sid for sid, info in listing.items() if info.get("active")]
-        if active_sids:
-            rows = [{"id": "__new__", "turns": "0", "preview": "start a fresh session"}]
-            for sid in active_sids:
-                info = listing[sid]
-                rows.append({"id": sid, "turns": "ACTIVE",
-                             "preview": (info.get("preview", "") or "?").split("|")[0]})
-            for sid, info in listing.items():
-                if sid not in active_sids and sid != self.session.id:
-                    rows.append({"id": sid, "turns": "idle",
-                                 "preview": (info.get("preview", "") or "?").split("|")[0]})
+        # OFFER RESUME — the old bug: the picker appeared only when a session
+        # was ACTIVE in the daemon. After kern was shut down (daemon dead),
+        # no session was active -> silent /new -> the user's session looked
+        # "lost". Now: any existing session gets offered, most recent first,
+        # ACTIVE ones flagged; a fresh session stays one keypress away.
+        if listing:
+            sess_rows = [{"id": sid, "last_ts": info.get("last_ts", 0.0),
+                          "turns": "ACTIVE" if info.get("active") else "idle",
+                          "preview": _picker_label(sid, info)}
+                         for sid, info in listing.items()]
+            rows = ([{"id": "__new__", "turns": "0",
+                      "preview": "start a fresh session"}]
+                    + _order_sessions(sess_rows))
+            # NON-BLOCKING offer: the picker floats while the default fresh
+            # session proceeds underneath. Picking a row attaches to it
+            # (detaching the fresh one); esc/typing keeps the fresh session.
+            # A blocking push_screen_wait here deadlocked startup whenever
+            # any session existed (T23 regression caught it).
+            fut = asyncio.get_event_loop().create_future()
+            self.push_screen(SessionPicker(rows, on_pick=fut))
 
-            pick = await self.push_screen_wait(SessionPicker(rows))
-            if pick and pick != "__new__":
-                await self._attach_remote(pick)
-                return
+            async def _startup_pick():
+                pick = await fut                  # resolves on dismiss
+                if pick and pick != "__new__":
+                    await self._attach_remote(pick)
+            asyncio.ensure_future(_startup_pick())
 
         # Default path: start fresh session on daemon with user's model & cwd
         try:
@@ -598,15 +687,16 @@ class KernApp(App):
         except Exception as e:
             self._chat_error(f"could not list sessions: {e}")
             return
-        rows = [{"id": "__new__", "turns": "0", "preview": "start a fresh session"}]
-        for sid, info in listing.items():
-            if sid == self.session.id:
-                continue
-            rows.append({
-                "id": sid,
-                "turns": "ACTIVE" if info.get("active") else "idle",
-                "preview": (info.get("preview", "") or "?").split("|")[0]
-            })
+        sess_rows = [{"id": sid, "last_ts": info.get("last_ts", 0.0),
+                      "turns": "ACTIVE" if info.get("active") else "idle",
+                      "preview": _picker_label(sid, info)}
+                     for sid, info in listing.items()
+                     if sid != self.session.id]
+        if not sess_rows:
+            self._chat_note("no other sessions")
+            return
+        rows = ([{"id": "__new__", "turns": "0", "preview": "start a fresh session"}]
+                + _order_sessions(sess_rows))
         pick = await self.push_screen_wait(SessionPicker(rows))
         if pick == "__new__":
             await self._slash("/new")
@@ -665,7 +755,7 @@ class KernApp(App):
                 # 2. Live stream events
                 ev = msg.get("event")
                 if ev in ("text", "thinking", "tool", "result", "diff",
-                          "note", "todo", "handle"):
+                          "note", "todo", "handle", "summary"):
                     if ev == "text":
                         self._tokens_streamed += max(1, len(msg.get("text", "")) // 4)
                     self._on_stream(ev, msg.get("text", ""))
@@ -683,6 +773,7 @@ class KernApp(App):
                         u = msg["usage"]
                         self._usage_in += u.get("in", 0)
                         self._usage_out += u.get("out", 0)
+                        self._requests += u.get("requests", 0)
                     reply = msg.get("reply")
                     if reply:
                         if w is not None:
@@ -799,6 +890,14 @@ class KernApp(App):
     _SPIN = STREAMING_CURSOR
 
     def _on_tick(self):
+        # teardown-safe: the interval can fire one last time after the DOM
+        # is gone (workers draining) — a query crash then aborts the run.
+        try:
+            self._on_tick_inner()
+        except Exception:
+            pass
+
+    def _on_tick_inner(self):
         right = self._ctx_info()
         if self._turn_running():
             el = time.monotonic() - self._t0
@@ -811,7 +910,8 @@ class KernApp(App):
                 f" {frame} {self._verb}  {el:0.1f}s · {tok:,} tok")
             u_in = getattr(getattr(self, "engine", None), "usage_in", getattr(self, "_usage_in", 0))
             u_out = getattr(getattr(self, "engine", None), "usage_out", getattr(self, "_usage_out", 0))
-            right += f"  ↑{u_in:,} ↓{u_out:,}"
+            reqs = getattr(getattr(self, "engine", None), "requests", getattr(self, "_requests", 0))
+            right += f"  ↑{u_in:,} ↓{u_out:,} · {reqs} req"
             # live updates: streamed text, waiting placeholder, running cards
             self._paint_stream(frame)
             if self._waiting_widget is not None:
@@ -933,6 +1033,14 @@ class KernApp(App):
             self.chat.scroll_end(animate=False)
         elif kind == "note":
             self._chat_note("◈ " + text.splitlines()[0])
+        elif kind == "summary":
+            # compaction summary — show what the model chose to keep, so the
+            # user can audit the memory the next turns will be built on
+            body = text if len(text) <= 1200 else text[:1200] + "…"
+            self.chat.mount(Static(
+                safe("▤ context compacted — kept:\n" + body),
+                classes="note", markup=True))
+            self.chat.scroll_end(animate=False)
         elif kind == "handle":
             self._chat_note(f"⚙ background process {text} started")
 
@@ -1108,7 +1216,16 @@ class KernApp(App):
         if not rows:
             self._chat_note("no past sessions")
             return
-        pick = await self.push_screen_wait(SessionPicker(rows))
+        # session_previews() yields dict rows with 'ts' (may be file mtime);
+        # normalise to the picker shape and apply the same order rule:
+        # last USED first, unknown sinks to the bottom by creation date.
+        sess_rows = [{"id": r["id"], "last_ts": r.get("ts", 0.0),
+                     "turns": str(r.get("turns", "?")),
+                     "preview": _picker_label(r["id"],
+                                              {"preview": r.get("preview", ""),
+                                               "last_ts": r.get("ts", 0.0)})}
+                    for r in rows]
+        pick = await self.push_screen_wait(SessionPicker(_order_sessions(sess_rows)))
         if pick:
             if self.remote is not None:
                 await self._attach_remote(pick)
@@ -1116,36 +1233,68 @@ class KernApp(App):
                 self._load_session(pick)
 
     def _render_journal(self):
-        """Replay the current session's journal back into widgets."""
+        """Replay the current session's journal back into widgets.
+        Returns an AwaitComplete-friendly coroutine-friendly method: for
+        huge journals we yield to the event loop every 50 events so a
+        2000-event replay cannot starve RPCs/status ticks (the exact cause
+        of 'daemon unavailable' right after resuming a long session)."""
         for w in list(self.chat.children):
             w.remove()
         self._todo_card = None
         self._tool_card = None
         calls_by_id: dict[str, tuple[str, dict, ToolCard]] = {}
-        for ev in self.session.events:
-            kind = ev["kind"]
-            if kind == "user":
-                self.chat.mount(UserMsg(ev.get("text", "")))
-            elif kind == "assistant":
-                if ev.get("text"):
-                    self.chat.mount(Static(RichMarkdown(ev["text"], justify="left"),
-                                           classes="assistant"))
-                for tc in ev.get("tool_calls", []):
-                    card = ToolCard(tc["name"], tc.get("arguments", {}))
-                    self.chat.mount(card)
-                    calls_by_id[tc["id"]] = (tc["name"], tc.get("arguments", {}), card)
-            elif kind == "tool_result":
-                hit = calls_by_id.get(ev.get("call_id", ""))
-                if hit:
-                    hit[2].set_result(ev.get("text", ""))
-                    if ev.get("diff"):
-                        hit[2].set_diff(ev["diff"])
-            elif kind == "note":
-                self._chat_note("◈ " + ev.get("text", "").splitlines()[0])
-            elif kind == "compact":
-                self._chat_note(f"◈ session compacted ({ev.get('covers', '?')} events)")
-        self._refresh_chrome()
+        self._render_journal_events(calls_by_id)
+
+    def _render_journal_events(self, calls_by_id, _batch=50):
+        self._render_journal_continue(calls_by_id, 0, _batch)
+
+    def _render_journal_continue(self, calls_by_id, start, _batch=50):
+        """Chunked replay: after each batch we schedule the next chunk as a
+        separate task with a sleep(0) yield, so mounting 2000 widgets can't
+        starve the TUI loop (RPC timeouts -> 'daemon unavailable' right
+        after resuming a long session)."""
+        async def _run():
+            try:
+                for i, ev in enumerate(self.session.events[start:], start):
+                    if i and i % _batch == 0:
+                        self._render_journal_continue(calls_by_id, i, _batch)
+                        return
+                    self._render_one(ev, calls_by_id)
+                    if i and i % _batch == _batch // 2:
+                        await asyncio.sleep(0)
+                self._refresh_chrome()
+                self.chat.scroll_end(animate=False)
+                if start > 0:
+                    self._chat_note(f"◈ replay done ({len(self.session.events)} events)")
+            except Exception:
+                # teardown race: app/screen gone mid-replay — nothing to do.
+                pass
+        asyncio.ensure_future(_run())
+        self._chat_note(f"◈ replay done ({len(self.session.events)} events)")
         self.chat.scroll_end(animate=False)
+
+    def _render_one(self, ev, calls_by_id):
+        kind = ev["kind"]
+        if kind == "user":
+            self.chat.mount(UserMsg(ev.get("text", "")))
+        elif kind == "assistant":
+            if ev.get("text"):
+                self.chat.mount(Static(RichMarkdown(ev["text"], justify="left"),
+                                       classes="assistant"))
+            for tc in ev.get("tool_calls", []):
+                card = ToolCard(tc["name"], tc.get("arguments", {}))
+                self.chat.mount(card)
+                calls_by_id[tc["id"]] = (tc["name"], tc.get("arguments", {}), card)
+        elif kind == "tool_result":
+            hit = calls_by_id.get(ev.get("call_id", ""))
+            if hit:
+                hit[2].set_result(ev.get("text", ""))
+                if ev.get("diff"):
+                    hit[2].set_diff(ev["diff"])
+        elif kind == "note":
+            self._chat_note("◈ " + ev.get("text", "").splitlines()[0])
+        elif kind == "compact":
+            self._chat_note(f"◈ session compacted ({ev.get('covers', '?')} events)")
 
     def _load_session(self, sid: str):
         """Replay a journal back into widgets — the log is the truth."""
@@ -1176,6 +1325,51 @@ class KernApp(App):
             self._chat_note(f"probing {self.model}…")
             r = await self.client.probe(self.model)
             self._chat_note(str(r))
+        elif cmd == "/restart":
+            # SAVE + FULL RESTART: flush the journal, tear the daemon down,
+            # respawn it, re-attach to THIS session. The session id is the
+            # anchor — everything is rebuilt from the journal on disk.
+            self._chat_note("◈ /restart — saving session, restarting kern…")
+            try:
+                # 1. flush: the journal is fsync-on-critical-events already;
+                #    also drop any half-written tail defensively.
+                if self.remote is not None:
+                    try:
+                        await self._remote_rpc("shutdown", timeout=3.0)
+                    except Exception:
+                        pass
+                    try:
+                        await self.remote.close()
+                    except Exception:
+                        pass
+                    self.remote = None
+                    self._remote_running = False
+                    # give the daemon a beat to actually exit
+                    import asyncio as _a
+                    await _a.sleep(1.0)
+                # 2. respawn daemon + re-attach to the SAME session
+                try:
+                    self.remote = await self._connect_daemon(tries=8)
+                except Exception as e:
+                    self._chat_error(f"restart failed, daemon still down: {e} — "
+                                    "local mode: journal is safe on disk, "
+                                    "restart kern manually.")
+                    return
+                self.run_worker(self._remote_reader(), name="remote", group="remote-reader",
+                                exclusive=True)
+                try:
+                    await self._remote_rpc("attach", session=self.session.id,
+                                           model=self.model, timeout=10.0)
+                    await self._remote_rpc("model", model=self.model, timeout=5.0)
+                except Exception as e:
+                    self._chat_error(f"reattach failed: {e}")
+                    return
+                self._render_journal()
+                self._refresh_chrome()
+                self._chat_note(f"◈ restarted — session {self.session.id} re-attached, "
+                                f"{len(self.session.events)} events intact")
+            except Exception as e:
+                self._chat_error(f"/restart failed: {type(e).__name__}: {e}")
         elif cmd == "/new":
             if self.remote is not None:
                 try:
@@ -1209,13 +1403,14 @@ class KernApp(App):
         elif cmd == "/usage":
             u_in = getattr(getattr(self, "engine", None), "usage_in", self._usage_in)
             u_out = getattr(getattr(self, "engine", None), "usage_out", self._usage_out)
+            reqs = getattr(getattr(self, "engine", None), "requests", self._requests)
             pricing = (self._catalog.get(self.model, {}).get("pricing") or {})
             cost = (u_in * pricing.get("prompt", 0) + u_out * pricing.get("completion", 0))
+            base = (f"model {self.model}\n"
+                    f"tokens: ↑{u_in:,} in · ↓{u_out:,} out · {reqs} requests\n")
             self._chat_note(
-                f"model {self.model}\n"
-                f"tokens: ↑{u_in:,} in · ↓{u_out:,} out\n"
-                f"cost so far: ${cost:.4f}" if pricing else
-                f"tokens: ↑{u_in:,} in · ↓{u_out:,} out")
+                base + (f"cost so far: ${cost:.4f}" if pricing else
+                        "cost so far: pricing unknown for this model"))
         elif cmd == "/undo":
             if self.remote is not None:
                 try:
@@ -1340,6 +1535,7 @@ class KernApp(App):
 
 HELP = ("/model <name> · ctrl-p model picker · /probe re-handshake\n"
         "/new fresh session · /resume (ctrl+r) pick an old session\n"
+        "/restart save + full restart (daemon included), same session\n"
         "/fork [n] branch · /rewind <n> checkpoint · /undo last turn\n"
         "/context budget · /tools capability index · /clear screen\n"
         "in-chat mounts: [mount: name] · [list capabilities] · [unmount: name]")
