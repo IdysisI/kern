@@ -122,6 +122,10 @@ class MCPClient:
     async def stop(self):
         if self.proc and self.proc.returncode is None:
             self.proc.terminate()
+            try:
+                await asyncio.wait_for(self.proc.wait(), 5)
+            except asyncio.TimeoutError:
+                self.proc.kill()
 
 
 class MountTable:

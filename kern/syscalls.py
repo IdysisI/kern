@@ -172,7 +172,7 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
 
 def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
     p = fs.resolve(path)
-    session.checkpoint([str(p)])
+    session.checkpoint([str(p)], cwd=str(fs.cwd))
     p.parent.mkdir(parents=True, exist_ok=True)
     res = _locked_update(p, lambda _src: content)
     old, _new = res if res else ("", content)
@@ -275,9 +275,10 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
             new_lines = flines[:start_line - 1] + new_str.splitlines() + flines[end_line:]
             return "\n".join(new_lines)
 
-        session.checkpoint([str(p)])
+        _cid = session.checkpoint([str(p)], cwd=str(fs.cwd))
         res = _locked_update(p, _apply)
         if res is None:
+            session.drop_checkpoint(_cid)
             if refused and refused[0] == "precondition":
                 flines = src.splitlines()
                 return (f"error: precondition failed — lines {start_line}-{end_line} of {p} "
@@ -308,9 +309,10 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
             return None            # refused; details built by the caller below
         return src.replace(old_str, new_str, 1)
 
-    session.checkpoint([str(p)])
+    _cid = session.checkpoint([str(p)], cwd=str(fs.cwd))
     res = _locked_update(p, _apply)
     if res is None:
+        session.drop_checkpoint(_cid)
         count = src.count(old_str)
         if count == 0:
             hint = _fuzzy_hint(src, old_str)
@@ -341,12 +343,16 @@ def _sandbox_wrap(fs: FS, cmd: str) -> list[str]:
     """bubblewrap: project dir + /tmp + ~/.cache writable, rest read-only,
     network allowed, dies with the parent. Escalation-free by design."""
     cache = Path.home() / ".cache"
-    return ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
+    argv = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
             "--bind", str(fs.cwd), str(fs.cwd),
             "--bind", "/tmp", "/tmp",
-            "--bind", str(cache), str(cache),
-            "--share-net", "--die-with-parent", "--chdir", str(fs.cwd),
-            "--", "bash", "-c", cmd]
+            "--bind", str(cache), str(cache)]
+    # KERN_HOME must be writable inside the sandbox (journal writes, scratch
+    # offloads, capability mounts) — default home included.
+    argv += ["--bind", str(KERN_HOME), str(KERN_HOME)]
+    argv += ["--share-net", "--die-with-parent", "--chdir", str(fs.cwd),
+             "--", "bash", "-c", cmd]
+    return argv
 
 
 _BWRAP = os.environ.get("KERN_SANDBOX", "1") != "0" and shutil.which("bwrap")
@@ -354,16 +360,23 @@ _BWRAP = os.environ.get("KERN_SANDBOX", "1") != "0" and shutil.which("bwrap")
 
 def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False) -> tuple[str, dict]:
     env = dict(os.environ, PAGER="cat", PIP_PROGRESS_BAR="off", TQDM_DISABLE="1")
-    argv = ["bash", "-c", cmd]
-    if _BWRAP and not background:
+    if _BWRAP:
+        # Background jobs get the SAME sandbox as foreground ones — the only
+        # difference is who drains stdout. bwrap --die-with-parent makes the
+        # sandbox non-optional: no unsandboxed code path exists.
+        if background:
+            argv = _sandbox_wrap(fs, cmd)
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    cwd=fs.cwd, env=env, text=True, start_new_session=True)
+            hid = f"h{len(PROCS) + 1}"
+            PROCS[hid] = {"proc": proc, "cmd": cmd, "started": time.time(), "buf": "", "pending": b""}
+            return (f"started {hid} (pid {proc.pid}): {cmd}\n"
+                    f"Use proc(handle=\"{hid}\", action=\"logs\") to inspect. "
+                    f"Note: output drains on each logs call; if you never call it, "
+                    f"a chatty process pauses once its pipe fills (~64 KiB)."), {"handle": hid}
         argv = _sandbox_wrap(fs, cmd)
-    if background:
-        logf = subprocess.PIPE
-        proc = subprocess.Popen(["bash", "-c", cmd], stdout=logf, stderr=subprocess.STDOUT,
-                                cwd=fs.cwd, env=env, text=True, start_new_session=True)
-        hid = f"h{len(PROCS) + 1}"
-        PROCS[hid] = {"proc": proc, "cmd": cmd, "started": time.time(), "buf": "", "pending": b""}
-        return f"started {hid} (pid {proc.pid}): {cmd}\nUse proc(handle=\"{hid}\", action=\"logs\") to inspect.", {"handle": hid}
+    else:
+        argv = ["bash", "-c", cmd]
     try:
         r = subprocess.run(argv, capture_output=True, text=True,
                            cwd=fs.cwd, timeout=timeout, env=env)
@@ -677,7 +690,23 @@ _SAFE_GIT = {"status", "diff", "log", "show", "branch", "ls-files", "rev-parse",
 _DANGER_TOKENS = (">", "<", "$(", "`", "&>", "&>>")
 # Mutating/destructive flags on otherwise read-only tools
 _MUTATING_GIT_FLAGS = {"-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--force", "-f",
-                       "--edit", "-a", "--all", "--set-upstream", "-u"}
+                       "--edit", "-a", "--all", "--set-upstream", "-u",
+                       "--output", "-o", "--no-index"}
+# Mutating flags on other allow-listed tools (find -delete/-fprint, sort -o,
+# tee anything, cp/mv — none of these should ever auto-approve)
+_MUTATING_FLAGS = {"-delete", "-fprint", "-fprint0", "-fprintf", "-fls", "-ok", "-okdir",
+                   "-exec", "-execdir", "-o", "--output", "--output-file", "-i",
+                   "--in-place", "-s", "--symbolic-link"}
+# git subcommands that are write-by-default; pure-listing forms (branch, tag,
+# remote) are only auto-approved with a listing/inspection flag or no argument
+_MUTATING_GIT_SUBS = {"add", "commit", "push", "pull", "merge", "rebase", "reset",
+                      "checkout", "switch", "clean", "rm", "mv", "stash", "apply",
+                      "am", "cherry-pick", "revert", "restore", "gc", "prune",
+                      "init", "clone", "fetch", "tag", "branch", "remote", "config"}
+_GIT_LISTING_OK = {"branch": {"--list", "--show-current", "--all", "-a", "-v", "-vv", "--format"},
+                   "tag": {"--list", "-l", "-n"},
+                   "remote": {"-v", "--verbose", "show"},
+                   "stash": {"list"}}
 
 
 def is_safe_readonly(cmd: str) -> bool:
@@ -699,12 +728,30 @@ def is_safe_readonly(cmd: str) -> bool:
         cmd0 = parts[0].rsplit("/", 1)[-1]
         if cmd0 not in _SAFE_CMDS:
             return False
+        if any(p in _MUTATING_FLAGS for p in parts[1:]):
+            return False
         if cmd0 == "git":
-            sub = " ".join(parts[1:3]) if len(parts) > 1 else ""
+            if len(parts) == 1:
+                return False
+            sub = parts[1]
+            if sub in _MUTATING_GIT_SUBS:
+                # listing forms only: bare "git branch", "git tag --list",
+                # "git stash list", "git remote -v"
+                ok = _GIT_LISTING_OK.get(sub, set())
+                rest = parts[2:]
+                if any(a.startswith("-") for a in rest) and \
+                   not all(a in ok for a in rest if a.startswith("-")):
+                    return False
+                if any(not a.startswith("-") and a not in ok for a in rest):
+                    return False      # a name argument creates/moves something
+                continue
             if not any(sub.startswith(g) for g in _SAFE_GIT):
                 return False
-            # Disallow destructive flags like branch -D, tag -d, etc.
-            if any(p in _MUTATING_GIT_FLAGS for p in parts[1:]):
+            # Disallow destructive flags like branch -D, tag -d. Compare the
+            # flag NAME too so "--output=/path" is caught like "--output".
+            if any(p in _MUTATING_GIT_FLAGS or
+                   p.split("=", 1)[0] in _MUTATING_GIT_FLAGS
+                   for p in parts[1:]):
                 return False
     return True
 

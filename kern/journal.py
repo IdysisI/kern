@@ -14,8 +14,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import time
 from pathlib import Path
+
+from .syscalls import redact as _redact
 
 KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))
 SESSIONS = KERN_HOME / "sessions"
@@ -29,21 +32,53 @@ class Session:
         self.scratch = self.dir / "scratch"
         self.ckpt = self.dir / "ckpt"
         self.events: list[dict] = []
+        self._warn: list[str] = []
         if self.log.exists():
             with open(self.log) as f:
-                self.events = [json.loads(l) for l in f if l.strip()]
+                for i, l in enumerate(f):
+                    if not l.strip():
+                        continue
+                    # Torn-tail tolerance: a crash mid-write leaves one partial
+                    # final line. Skip it (it is already lost) instead of making
+                    # the whole session unopenable. Full lines must still parse.
+                    try:
+                        self.events.append(json.loads(l))
+                    except json.JSONDecodeError:
+                        if i < sum(1 for _ in open(self.log)) - 1:
+                            raise   # malformed line mid-file = real corruption
+                        self._warn.append(
+                            f"torn final line (n={i}) skipped — journal was "
+                            f"interrupted mid-write; that event is lost")
 
     # ---- writing -----------------------------------------------------------
 
     def emit(self, kind: str, **fields) -> dict:
         ev = {"n": len(self.events), "ts": time.time(), "kind": kind, **fields}
+        # Disk-redaction: secrets must never sit in the journal, whatever the
+        # path in (user text, assistant text, tool result). Local-only pass.
+        for k in ("text", "preview"):
+            if k in ev and isinstance(ev[k], str):
+                ev[k] = _redact(ev[k])
         self.events.append(ev)
         self.dir.mkdir(parents=True, exist_ok=True)
         with open(self.log, "a") as f:
             f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            if kind in ("turn_end", "user", "action", "tool_result"):
+                # user input + every model/tool step must survive a crash;
+                # buffering them means losing a turn's provenance wholesale.
+                f.flush()
+                os.fsync(f.fileno())
         return ev
 
     # ---- checkpoints: full undo = files + journal --------------------------
+
+    def drop_checkpoint(self, cid: int) -> None:
+        """Remove a checkpoint made for an edit that never happened (failed
+        precondition / no-match). Keeps ckpt/ from filling with useless dirs."""
+        try:
+            shutil.rmtree(self.ckpt / f"c{cid}")
+        except Exception:
+            pass
 
     def checkpoint(self, files: list[str], cwd: str | None = None) -> int:
         """Snapshot the given files + the untracked-files list of the repo,
@@ -80,6 +115,19 @@ class Session:
         (dest / "manifest.json").write_text(json.dumps({
             "files": saved, "missing": missing, "untracked": untracked,
             "cwd": cwd, "event_n": len(self.events)}))
+        # Durability: a checkpoint that advertises undo but whose copies are
+        # still in page cache would silently break restore after a crash.
+        try:
+            for fp in saved:
+                with open(dest / str(Path(fp)).lstrip("/").replace("/", "__"), "rb") as f:
+                    os.fsync(f.fileno())
+            fd = os.open(dest, os.O_RDONLY)
+            try:
+                os.fsync(fd)     # entries: copies + manifest
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
         return cid
 
     def restore(self, cid: int) -> list[str]:
@@ -141,39 +189,21 @@ class Session:
         return max(ids) if ids else None
 
     def compact_into(self, upto_n: int, summary: str, facts: str = "") -> int:
-        """Replace events [0..upto_n) that are NOT user messages with a single
-        `compact` event carrying the summary. User messages are kept verbatim
-        (golden rule). Returns the number of events dropped.
-
-        The pre-compact tail is saved to compacted-<ts>.jsonl first, so the
-        operation is reversible by hand."""
-        old, recent = self.events[:upto_n], self.events[upto_n:]
-        # dangling actions + work-state (todo/objective) are STATE, not
-        # history: they survive compaction like user messages. The Slate
-        # must never scroll away — that is its whole purpose.
-        answered = {ev.get("call_id") for ev in old if ev["kind"] == "tool_result"}
-        KEEP_KINDS = {"user", "todo", "objective"}
-        droppable = [ev for ev in old
-                     if ev["kind"] not in KEEP_KINDS
-                     and not (ev["kind"] == "action" and ev.get("call_id") not in answered)]
-        dropped = droppable
-        kept = [ev for ev in old if ev not in droppable]
-        if not dropped:
+        """Record a compaction checkpoint covering events [0..upto_n).
+        Appends a `compact` event to the journal with summary and facts.
+        Full history is preserved in events.jsonl so the user can review past
+        assistant messages and tool calls in the TUI.
+        The pager projects the compacted view to the model."""
+        old = [ev for ev in self.events if ev.get("n", 0) < upto_n]
+        if not old:
             return 0
-        # archive the dropped tail before rewriting
+        # Snapshot the compacted slice into an archive file for provenance
         with open(self.dir / f"compacted-{int(time.time())}.jsonl", "a") as f:
-            for ev in dropped:
+            for ev in old:
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        compact_ev = {"n": 0, "ts": time.time(), "kind": "compact",
-                      "text": summary, "facts": facts, "covers": len(dropped)}
-        self.events = [compact_ev] + kept + recent
-        # renumber and rewrite the log
-        for i, ev in enumerate(self.events):
-            ev["n"] = i
-        with open(self.log, "w") as f:
-            for ev in self.events:
-                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        return len(dropped)
+        compact_ev = self.emit("compact", upto_n=upto_n, text=summary,
+                               facts=facts, covers=len(old))
+        return len(old)
 
     def undo_to_last_user(self, keep_last_user: bool = True) -> int:
         """Drop everything after the most recent user message (the agent's

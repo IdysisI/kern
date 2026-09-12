@@ -15,7 +15,8 @@ import time
 
 KERN_DAEMON_PORT = int(os.environ.get("KERN_SERVE_PORT", "8766"))
 KERN_DAEMON_URI = os.environ.get("KERN_SERVE_URI", f"ws://127.0.0.1:{KERN_DAEMON_PORT}")
-DAEMON_VERSION = "0.2.2" 
+from . import __version__ as KERN_VERSION
+DAEMON_VERSION = KERN_VERSION
 
 from rich.markdown import Markdown as RichMarkdown
 from rich.table import Table as RichTable
@@ -542,8 +543,12 @@ class KernApp(App):
             self._welcome()
             return
 
-        # Start the reader worker FIRST so RPC responses are handled immediately
-        self.run_worker(self._remote_reader(), name="remote", exclusive=True)
+        # Start the reader worker FIRST so RPC responses are handled immediately.
+        # group="remote-reader": exclusive=True cancels every worker in the
+        # SAME group — a lone default-group exclusive worker would cancel
+        # _daemon_entry itself mid-RPC (attach silently never completes).
+        self.run_worker(self._remote_reader(), name="remote", group="remote-reader",
+                        exclusive=True)
 
         try:
             res = await self._remote_rpc("sessions", timeout=4.0)
@@ -669,15 +674,29 @@ class KernApp(App):
                     self._remote_turn_started()
                 elif ev == "turn_end":
                     self._remote_running = False
+                    # The live stream widget becomes the final assistant
+                    # bubble: keep a handle across the flush.
+                    w = self._stream_widget
                     self._flush_stream()
                     self._dismiss_waiting()
                     if msg.get("usage"):
                         u = msg["usage"]
                         self._usage_in += u.get("in", 0)
                         self._usage_out += u.get("out", 0)
-                    if msg.get("reply"):
-                        self.chat.mount(Static(RichMarkdown(msg["reply"], justify="left"),
-                                               classes="assistant"))
+                    reply = msg.get("reply")
+                    if reply:
+                        if w is not None:
+                            # turn_end.reply is the AUTHORITATIVE full text:
+                            # replacing in place both dedupes the normal case
+                            # (buf == reply) and heals the mid-turn-attach
+                            # case where only the tail streamed live.
+                            w.update(RichMarkdown(reply, justify="left"))
+                            w.set_classes("assistant")
+                            w.display = True
+                        else:
+                            # nothing streamed live (pure attach/view case)
+                            self.chat.mount(Static(RichMarkdown(reply, justify="left"),
+                                                   classes="assistant"))
                     if self._queue:
                         nxt = self._queue.pop(0)
                         self.chat.mount(UserMsg(nxt))

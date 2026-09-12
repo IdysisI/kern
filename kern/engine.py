@@ -23,6 +23,7 @@ from pathlib import Path
 from . import kernel, pager, syscalls
 from .client import Client, health_of
 from .journal import Session, create_session
+from . import linker
 from .linker import CapabilityIndex, MCPClient, MountTable
 
 
@@ -54,6 +55,17 @@ def _human_desc(name: str, args: dict) -> str:
 MOUNT_RE = re.compile(r"^\[(mount|unmount|list capabilities)(?::\s*([^\]]+))?\]", re.M)
 
 
+_CONTINUATION_WORDS = {
+    "continue", "cotntinue", "cont", "c", "go", "go on", "keep going",
+    "proceed", "next", "next step", "ok", "yes", "oui", "continuer", "vas-y", "y", "k"
+}
+
+
+def _is_continuation_prompt(text: str) -> bool:
+    t = text.strip().lower().rstrip("!., ")
+    return t in _CONTINUATION_WORDS or (len(t) <= 3 and t.isalpha())
+
+
 class Engine:
     def __init__(self, client: Client, model: str, session: Session,
                  cwd: str, approve=None, stream_cb=None, subagent_depth: int = 0):
@@ -66,6 +78,7 @@ class Engine:
         self.stream_cb = stream_cb or (lambda kind, text: None)
         self.index = CapabilityIndex()
         self.mounts = MountTable()
+        self._replay_mounts()
         self.depth = subagent_depth
         self.last_usage: dict = {}
         self.usage_in = 0
@@ -108,6 +121,31 @@ class Engine:
             tools = [t for t in tools if t.get("function", {}).get("name") != "py"]
         return tools
 
+    def _replay_mounts(self) -> None:
+        """The journal is the single truth — including capabilities. Frontends
+        build a fresh Engine per turn, so mounts must be re-derived from the
+        `mount` events or mounted skills/MCPs silently vanish between turns.
+        MCP clients are re-started lazily on first call (call_mcp raises a
+        clear 'not mounted' error if the server is gone)."""
+        for ev in self.session.events:
+            if ev.get("kind") != "mount":
+                continue
+            name, action = ev.get("name"), ev.get("action")
+            if action == "unmount":
+                self.mounts.skills.pop(name, None)
+                self.mounts.mcps.pop(name, None)
+            elif ev.get("cap_kind") == "skill":
+                self.mounts.skills[name] = ev.get("ref", "")
+            elif ev.get("cap_kind") == "mcp":
+                try:
+                    cfg = json.loads(linker.MCP_CONFIG.read_text()).get(name)
+                except Exception:
+                    cfg = None
+                if cfg:
+                    client = MCPClient(cfg["command"])
+                    client.tools = ev.get("tools") or []   # schemas survive
+                    self.mounts.mcps[name] = client
+
     async def _handle_mount_directives(self, text: str) -> list[str]:
         notes = []
         for action, target in MOUNT_RE.findall(text or ""):
@@ -127,17 +165,22 @@ class Engine:
                 client = self.mounts.mcps.pop(name, None)
                 if client:
                     await client.stop()
+                self.session.emit("mount", action="unmount", name=name)
                 notes.append(f"unmounted '{name}'")
             elif cap.kind == "skill":
                 self.mounts.skills[name] = cap.ref
+                self.session.emit("mount", action="mount", cap_kind="skill",
+                                  name=name, ref=cap.ref)
                 body = Path(cap.ref).read_text(errors="replace")[:6000]
                 notes.append(f"mounted skill '{name}'. Instructions follow:\n{body}")
             else:
-                cfg = json.loads((Path.home() / ".kern" / "mcp.json").read_text())[name]
+                cfg = json.loads(linker.MCP_CONFIG.read_text())[name]
                 client = MCPClient(cfg["command"])
                 try:
                     await client.start()
                     self.mounts.mcps[name] = client
+                    self.session.emit("mount", action="mount", cap_kind="mcp",
+                                      name=name, tools=client.tools)
                     names = ", ".join(t["name"] for t in client.tools)
                     notes.append(f"mounted MCP '{name}'. Tools: {names}")
                 except Exception as e:
@@ -237,7 +280,11 @@ class Engine:
 
     async def chat(self, user_text: str) -> str:
         self.session.emit("user", text=user_text)
-        self.session.emit("objective", text=user_text[:400])
+        # Preserve active task objective across generic "Continue" prompts:
+        # a user saying "Continue" is telling the agent to keep working on its
+        # current goal, NOT changing the goal to the word "Continue".
+        if not _is_continuation_prompt(user_text):
+            self.session.emit("objective", text=user_text[:400])
         self._autocheckpoint()
         return await self._run_marked()
 
@@ -311,6 +358,10 @@ class Engine:
                 status = ("error" if t.startswith("error")
                           else "denied" if t.startswith("denied")
                           else "ok")
+                # exec results lead with "exit=N" — surface it in the fact line
+                if ev.get("name") == "exec" and t.startswith("exit="):
+                    rc = t.split()[0]
+                    status = status if rc == "exit=0" else f"{status} but {rc}"
                 detail = t[:120].replace("\n", " ")
                 facts.append(f"{ev.get('name', '?')}{' ' + path if path else ''} -> {status}"
                              + (f" | {detail}" if status != "ok" else "")

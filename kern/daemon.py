@@ -25,7 +25,8 @@ from .journal import Session, create_session, list_sessions
 
 HOST = os.environ.get("KERN_SERVE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KERN_SERVE_PORT", "8766"))
-DAEMON_VERSION = "0.2.2"
+from . import __version__ as KERN_VERSION
+DAEMON_VERSION = KERN_VERSION
 
 
 class Worker:

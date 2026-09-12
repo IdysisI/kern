@@ -105,45 +105,79 @@ def _slate(events: list[dict]) -> str:
 
 
 def materialize(events: list[dict], session) -> list[dict]:
-    """journal events -> IR messages (role/text/tool_calls/tool_call_id)."""
+    """journal events -> IR messages (role/text/tool_calls/tool_call_id).
+
+    True OS-style virtual memory projection:
+      * Raw history stays append-only in events.jsonl forever (human can review
+        every word the agent said in the TUI).
+      * When a compaction event exists, older fulfilled turns [0..cutoff_n) are
+        absorbed into <session-summary> and <execution-facts>. They are NOT
+        re-emitted as raw orphaned user turns (which causes the model to perceive
+        past tasks as unfulfilled and re-execute them).
+      * Active turns [cutoff_n..end) are materialized in full dialogue pairs
+        (user + assistant + tools intact).
+    """
+    compact_ev = None
+    cutoff_n = 0
+    for ev in reversed(events):
+        if ev["kind"] == "compact":
+            compact_ev = ev
+            cutoff_n = ev.get("upto_n", ev.get("covers", 0))
+            break
+
     # Tier 1c: find the indices of the most recent tool_results to keep inline
-    tool_result_idx = [i for i, ev in enumerate(events) if ev["kind"] == "tool_result"]
+    tool_result_idx = [i for i, ev in enumerate(events)
+                       if ev["kind"] == "tool_result" and (compact_ev is None or ev.get("n", i) >= cutoff_n)]
     keep_inline = set(tool_result_idx[-KEEP_RECENT_TOOL_RESULTS:])
 
     # ---- THE SLATE: the model's own work state, always at the top ----------
-    # Feedforward, computational, zero requests: objective + live todo list.
-    # The model maintains them (todo() tool / user messages); the harness
-    # guarantees they never scroll out of the view. This is the anchor that
-    # prevents re-derivation and circling (see session 20260911-131749).
     slate = _slate(events)
     msgs: list[dict] = []
     n = len(events)
     if slate:
         msgs.append({"role": "user", "text": slate})
+
+    # If compacted, emit the session summary and execution facts representing past turns
+    if compact_ev is not None:
+        facts = compact_ev.get("facts") or ""
+        block = (f"<execution-facts covers=\"{compact_ev.get('covers', '?')}\">\n"
+                 f"{facts}\n</execution-facts>\n") if facts else ""
+        msgs.append({"role": "user",
+                     "text": block + f"<session-summary covers=\"{compact_ev.get('covers', '?')}\">\n"
+                             f"{compact_ev.get('text', '')}\n</session-summary>"})
+        # If any action across the whole session was interrupted mid-flight before
+        # receiving its result, ensure the safety flag is preserved in context:
+        for i, ev in enumerate(events):
+            if ev.get("n", i) < cutoff_n and ev["kind"] == "action":
+                if not ev.get("reconciled") and not any(
+                        e.get("call_id") == ev.get("call_id") and e["kind"] == "tool_result"
+                        for e in events[i + 1:]):
+                    msgs.append({"role": "user",
+                                 "text": f"<system-note>⚠ action '{ev.get('name', '?')}' "
+                                         f"(call {ev.get('call_id')}) was dispatched but no "
+                                         f"result was recorded — the run was interrupted. "
+                                         f"Before retrying, VERIFY the actual state with "
+                                         f"read/exec; the effect may have partially or "
+                                         f"fully happened.</system-note>"})
+
     seen_result_hashes: dict[str, int] = {}   # dedup pass: identical tool outputs
     for i, ev in enumerate(events):
+        ev_n = ev.get("n", i)
+        if compact_ev is not None and ev_n < cutoff_n:
+            continue
         kind = ev["kind"]
-        if kind == "user":
+        if kind == "compact":
+            continue
+        elif kind == "user":
             msgs.append({"role": "user", "text": ev["text"]})
-        elif kind == "compact":
-            facts = ev.get("facts") or ""
-            block = (f"<execution-facts covers=\"{ev.get('covers', '?')}\">\n"
-                     f"{facts}\n</execution-facts>\n") if facts else ""
-            msgs.append({"role": "user",
-                         "text": block + f"<session-summary covers=\"{ev.get('covers', '?')}\">\n"
-                                 f"{ev.get('text', '')}\n</session-summary>"})
         elif kind == "assistant":
             m = {"role": "assistant", "text": ev.get("text", "")}
             if ev.get("tool_calls"):
-                # internal bookkeeping keys (kern_error, ...) never leave the journal
                 m["tool_calls"] = [{k: v for k, v in tc.items() if not k.startswith("_")
                                     and k != "kern_error"}
                                    for tc in _clear_tool_args(ev["tool_calls"])]
             msgs.append(m)
         elif kind == "action":
-            # intent receipt (written BEFORE a side-effectful tool runs).
-            # If no tool_result follows for this call_id, the run died
-            # mid-action: the effect may or may not have happened.
             if not ev.get("reconciled") and not any(
                     e.get("call_id") == ev.get("call_id") and e["kind"] == "tool_result"
                     for e in events[i + 1:]):
@@ -157,7 +191,6 @@ def materialize(events: list[dict], session) -> list[dict]:
             continue
         elif kind == "tool_result":
             text = ev.get("text", "")
-            # dedup pass: identical outputs already in the view cost pure tokens
             rh = _rhash(text)
             if rh and rh in seen_result_hashes:
                 first_n = seen_result_hashes[rh]
@@ -168,8 +201,6 @@ def materialize(events: list[dict], session) -> list[dict]:
             if rh:
                 seen_result_hashes[rh] = ev.get("n", i)
             if i in keep_inline:
-                # recent: keep inline, squashed if huge — but never lose bytes:
-                # the full output goes to scratch/ with a recovery pointer.
                 out_text = _squash(text)
                 if len(text) > BIG:
                     full = session.scratch / f"t{ev['n']}.txt"
@@ -180,22 +211,19 @@ def materialize(events: list[dict], session) -> list[dict]:
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
                              "text": out_text})
             elif n - i > STALE_AGE and len(text) > STALE_MIN and not ev.get("paged"):
-                # old + bulky: offload to scratch, leave a pointer
                 path = session.offload(f"t{ev['n']}", text)
-                ev["paged"] = True   # in-memory only; journal stays full-fidelity
+                ev["paged"] = True
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
                              "text": f"[old tool result cleared: {ev.get('name', '?')} — "
                                      f"{len(text):,} bytes -> {path}. "
                                      f"Use read(path) if you need it again.]"})
             else:
-                # old but small: keep a squashed copy
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
                              "text": _squash(text)})
-        elif kind == "note":        # ephemeral system-ish notes (mounted skills etc.)
+        elif kind == "note":
             msgs.append({"role": "user", "text": f"<system-note>{ev['text']}</system-note>"})
         elif kind == "thinking":
-            # Tier-1: strip thinking from past turns (only current thinking stays in the view)
-            continue  # never journaled anyway; model sees only current turn's thinking
+            continue
     return msgs
 
 
@@ -303,8 +331,7 @@ def compaction_view(events: list[dict], keep_recent_tokens: int = 12000) -> tupl
     if chosen <= 0:
         return [], events
     old = events[:chosen]
-    if not any(ev["kind"] != "user" for ev in old):
+    if not any(ev["kind"] not in ("user", "compact") for ev in old):
         return [], events
-    to_compact = [ev for ev in old if ev["kind"] != "user"]
-    kept_from_old = [ev for ev in old if ev["kind"] == "user"]
-    return to_compact, kept_from_old + events[chosen:]
+    to_compact = [ev for ev in old if ev["kind"] != "compact"]
+    return to_compact, events[chosen:]
