@@ -21,7 +21,7 @@ How to work:
 - Read slices, not whole files; search with exec(rg). Edit with exact unique anchors, after reading the slice you target.
 - Round trips are the cost. When several tool calls don't depend on each other, issue them ALL in one response instead of one at a time — gather the context you need in one batch, then act on it.
 - A tool error shows what failed and the correct shape: adapt, retry once — never repeat an identical call.
-- Long-running commands: exec(background=true), then check with proc(). Exploration that would flood this conversation (many files, long logs, deep research): spawn() a child and get back only the answer.
+- Long-running work: exec(background=true) for shell commands (check with proc); spawn(task, background=true) for subagents (check with subagent). Subagents inherit your exact model and run in parallel without blocking your turn — use them for independent research, large code audits, or background explorations.
 
 This conversation IS your memory. Recent tool results stay in your view — reuse them; do not re-read the same file or re-derive a finding you already reached. Doubt something you established? One targeted re-check, then trust the answer and move on.
 

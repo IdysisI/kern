@@ -105,11 +105,22 @@ SCHEMAS = [
             "required": ["items"]}}},
     {"type": "function", "function": {
         "name": "spawn",
-        "description": "Fork an isolated child agent (same model) to explore or research, returning only its final report. Keeps this conversation lean.",
+        "description": "Spawn an isolated subagent (inherits the exact same model) to explore, research, or write code. Runs asynchronously in the background by default so you can continue working without blocking. Returns a handle (e.g. sub_1).",
         "parameters": {"type": "object", "properties": {
-            "task": {"type": "string"},
-            "context": {"type": "string"}},
+            "task": {"type": "string", "description": "clear instructions and goal for the subagent"},
+            "context": {"type": "string", "description": "file paths, constraints, or background knowledge"},
+            "background": {"type": "boolean", "description": "true (default): run asynchronously and return handle immediately; false: wait for final report"},
+            "max_steps": {"type": "integer", "description": "maximum tool execution iterations for the subagent (default 50, max 120)"}},
             "required": ["task"]}}},
+    {"type": "function", "function": {
+        "name": "subagent",
+        "description": "Monitor, inspect, wait for, or cancel a background subagent (e.g. spawned with background=true).",
+        "parameters": {"type": "object", "properties": {
+            "handle": {"type": "string", "description": "subagent handle, e.g. sub_1, sub_2"},
+            "action": {"type": "string", "enum": ["status", "logs", "wait", "cancel"],
+                       "description": "status: check if running/done; logs: read recent activity; wait: await completion and get final report; cancel: stop subagent"},
+            "timeout": {"type": "integer", "description": "seconds to wait if action is 'wait' (default 120)"}},
+            "required": ["handle", "action"]}}},
 ]
 
 

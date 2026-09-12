@@ -91,6 +91,7 @@ class Engine:
         self.requests = 0                 # paid API requests this engine made
         self._stream_fails = 0            # consecutive transport failures
         self._fetch_cache: dict = {}      # url+max_chars -> wrapped body (session scope)
+        self.subagents: dict[str, dict] = {}
         self.tokens_streamed = 0
         self.todo: list[dict] = []
         self.forced_fenced = bool(__import__("os").environ.get("KERN_FORCE_FENCED"))
@@ -127,6 +128,8 @@ class Engine:
         # see the schema. KERN_FORCE_PY overrides.
         if not (h.get("py_repl") or os.environ.get("KERN_FORCE_PY")):
             tools = [t for t in tools if t.get("function", {}).get("name") != "py"]
+        if getattr(self, 'depth', 0) >= 2:
+            tools = [t for t in tools if t.get("function", {}).get("name") != "spawn"]
         return tools
 
     def _replay_mounts(self) -> None:
@@ -266,27 +269,150 @@ class Engine:
         if name == "todo":
             return syscalls.tool_todo(**args)
         if name == "spawn":
-            report = await self._spawn(args.get("task", ""), args.get("context", ""))
-            return report, {}
+            return await self._tool_spawn(**args)
+        if name == "subagent":
+            return await self._tool_subagent(**args)
         return (f"error: unknown tool '{name}'. "
-                f"Core: read, write, edit, exec, proc, fetch, search, memory, todo, spawn."), {}
+                f"Core: read, write, edit, exec, proc, fetch, memory, todo, spawn, subagent."), {}
 
-    async def _spawn(self, task: str, context: str) -> str:
+    async def _spawn(self, task: str, context: str = "", background: bool = False, max_steps: int = 50) -> str:
+        """Backwards-compatible wrapper around _tool_spawn."""
+        report, _ = await self._tool_spawn(task=task, context=context, background=background, max_steps=max_steps)
+        return report
+
+    async def _tool_spawn(self, task: str, context: str = "", background: bool = True, max_steps: int = 50) -> tuple[str, dict]:
         if self.depth >= 2:
-            return "error: spawn depth limit reached. Answer directly."
+            return "error: max subagent depth reached (level 2). Execute the task directly.", {}
+
+        steps_cap = max(5, min(int(max_steps or 50), 120))
         child_session = create_session(cwd=self.cwd, parent=self.session.id)
-        child = Engine(self.client, self.model, child_session, self.cwd,
-                       approve=self.approve, stream_cb=self.stream_cb,
-                       subagent_depth=self.depth + 1)
-        prompt = task + (f"\n\nContext from parent: {context}" if context else "")
-        report = await child.chat(prompt)
-        if child.requests > 1:
-            report += f"\n[child cost: {child.requests} requests]"
-        return report[:4000]
+        hid = f"sub_{len(self.subagents) + 1}"
+
+        def child_stream(kind: str, text: str):
+            if kind == "note":
+                self.stream_cb("note", f"[{hid}] {text}")
+            elif kind == "tool":
+                self.stream_cb("note", f"[{hid} tool] {text[:80]}")
+
+        child_engine = Engine(
+            self.client, self.model, child_session, self.cwd,
+            approve=self.approve, stream_cb=child_stream,
+            subagent_depth=self.depth + 1
+        )
+
+        prompt = task.strip()
+        if context.strip():
+            prompt += f"\n\n<context-from-parent>\n{context.strip()}\n</context-from-parent>"
+
+        entry = {
+            "handle": hid,
+            "task": task,
+            "model": self.model,
+            "session": child_session,
+            "engine": child_engine,
+            "started": time.time(),
+            "max_steps": steps_cap,
+            "completed": False,
+            "result": None,
+            "error": None,
+            "report_path": None,
+        }
+        self.subagents[hid] = entry
+
+        async def run_subagent():
+            try:
+                reply = await child_engine.chat(prompt, max_steps=steps_cap)
+                entry["completed"] = True
+                entry["result"] = reply
+                report_file = self.session.scratch / f"{hid}_report.md"
+                self.session.scratch.mkdir(parents=True, exist_ok=True)
+                report_file.write_text(
+                    f"# Subagent Report ({hid})\nTask: {task}\nModel: {self.model}\n"
+                    f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n{reply}"
+                )
+                entry["report_path"] = str(report_file)
+                self.stream_cb("note", f"✓ subagent {hid} finished ({child_engine.requests} requests) -> report saved to {report_file}")
+                return reply
+            except asyncio.CancelledError:
+                entry["completed"] = True
+                entry["error"] = "cancelled"
+                self.stream_cb("note", f"■ subagent {hid} cancelled")
+            except Exception as e:
+                entry["completed"] = True
+                entry["error"] = str(e)
+                self.stream_cb("note", f"⚠ subagent {hid} failed: {e}")
+
+        if background:
+            task_obj = asyncio.create_task(run_subagent())
+            entry["async_task"] = task_obj
+            msg = (f"started background subagent {hid} (session: {child_session.id}, model: {self.model}, max_steps: {steps_cap}): {task[:90]}\n"
+                   f"The subagent is running asynchronously in the background — you can continue working.\n"
+                   f"Use subagent(handle=\"{hid}\", action=\"status\"|\"logs\"|\"wait\"|\"cancel\") to check progress or retrieve the report.")
+            return msg, {"handle": hid, "session_id": child_session.id}
+        else:
+            reply = await run_subagent()
+            cost = f" [child cost: {child_engine.requests} requests]" if child_engine.requests > 1 else ""
+            return f"subagent {hid} completed:{cost}\n{str(reply)[:4000]}", {"handle": hid, "session_id": child_session.id}
+
+    async def _tool_subagent(self, handle: str, action: str, timeout: int = 120) -> tuple[str, dict]:
+        entry = self.subagents.get(handle)
+        if not entry:
+            live = list(self.subagents.keys())
+            return f"error: no such subagent '{handle}'. Active handles: {live or '(none)'}", {}
+
+        if action == "status":
+            if entry["completed"]:
+                if entry["error"]:
+                    return f"subagent {handle}: failed with error: {entry['error']}", {}
+                reqs = entry["engine"].requests
+                dt = round(time.time() - entry["started"], 1)
+                return f"subagent {handle}: completed in {dt}s ({reqs} requests). Report: {entry['report_path']}", {}
+            else:
+                dt = round(time.time() - entry["started"], 1)
+                reqs = entry["engine"].requests
+                return f"subagent {handle}: still running ({dt}s elapsed, {reqs} requests so far)", {}
+
+        elif action == "logs":
+            sess = entry["session"]
+            lines = []
+            for ev in sess.events:
+                k = ev.get("kind")
+                if k == "assistant" and ev.get("text"):
+                    lines.append(f"[assistant] {ev['text'][:200]}")
+                elif k == "action":
+                    lines.append(f"[action] {ev.get('name')}")
+                elif k == "tool_result":
+                    lines.append(f"[result] {ev.get('name')}: {str(ev.get('text', ''))[:150]}")
+            body = "\n".join(lines[-20:]) if lines else "(no activity yet)"
+            return f"--- subagent {handle} activity (last {min(20, len(lines))} steps) ---\n{body}", {}
+
+        elif action == "wait":
+            if entry["completed"]:
+                if entry["error"]:
+                    return f"subagent {handle}: failed with error: {entry['error']}", {}
+                return f"subagent {handle} completed report:\n{entry['result']}\n(Full report: {entry['report_path']})", {}
+            task_obj = entry.get("async_task")
+            if not task_obj:
+                return f"subagent {handle}: not running as background task", {}
+            try:
+                reply = await asyncio.wait_for(asyncio.shield(task_obj), timeout=float(timeout or 120))
+                return f"subagent {handle} completed report:\n{entry['result']}\n(Full report: {entry['report_path']})", {}
+            except asyncio.TimeoutError:
+                dt = round(time.time() - entry["started"], 1)
+                return f"subagent {handle}: still running after {timeout}s wait ({dt}s total). Continue working or wait again.", {}
+
+        elif action == "cancel":
+            task_obj = entry.get("async_task")
+            if task_obj and not task_obj.done():
+                task_obj.cancel()
+                return f"subagent {handle} cancellation requested", {}
+            return f"subagent {handle} is not running", {}
+
+        return f"error: unknown action '{action}'. Valid actions: status, logs, wait, cancel", {}
 
     # ---- the loop ------------------------------------------------------------
 
-    async def chat(self, user_text: str) -> str:
+    async def chat(self, user_text: str, max_steps: int = 30) -> str:
         self.session.emit("user", text=user_text)
         # Preserve active task objective across generic "Continue" prompts:
         # a user saying "Continue" is telling the agent to keep working on its
@@ -295,7 +421,7 @@ class Engine:
         if not _is_continuation_prompt(user_text, has_active_objective=has_obj):
             self.session.emit("objective", text=user_text[:400])
         self._autocheckpoint()
-        return await self._run_marked()
+        return await self._run_marked(max_steps=max_steps)
 
     async def resume(self) -> str:
         """Continue an OPEN turn (daemon died mid-flight). The user message is
@@ -306,13 +432,13 @@ class Engine:
         self._autocheckpoint()
         return await self._run_marked()
 
-    async def _run_marked(self) -> str:
+    async def _run_marked(self, max_steps: int = 30) -> str:
         """_loop() + journal a turn_end marker so the turn is CLOSED: an
         interrupt/undo/rewind must never look like a crash to auto-resume."""
         self._req0 = getattr(self.client, "requests", 0)
         reason = "done"
         try:
-            reply = await self._loop()
+            reply = await self._loop(max_steps=max_steps)
             return reply
         except asyncio.CancelledError:
             reason = "interrupted"
