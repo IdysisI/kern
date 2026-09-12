@@ -71,6 +71,18 @@ def _is_continuation_prompt(text: str, has_active_objective: bool = True) -> boo
     return t in _CONTINUATION_WORDS or (len(t) <= 3 and t.isalpha())
 
 
+
+# Global concurrency limiter for background subagents across sessions:
+# prevents blasting local VSLLM with 8+ parallel requests and hitting 429.
+_SUBAGENT_SEMAPHORE: asyncio.Semaphore | None = None
+
+def _get_subagent_semaphore() -> asyncio.Semaphore:
+    global _SUBAGENT_SEMAPHORE
+    if _SUBAGENT_SEMAPHORE is None:
+        concurrency = int(os.environ.get("KERN_SUBAGENT_CONCURRENCY", "3"))
+        _SUBAGENT_SEMAPHORE = asyncio.Semaphore(concurrency)
+    return _SUBAGENT_SEMAPHORE
+
 class Engine:
     def __init__(self, client: Client, model: str, session: Session,
                  cwd: str, approve=None, stream_cb=None, subagent_depth: int = 0):
@@ -92,6 +104,8 @@ class Engine:
         self._stream_fails = 0            # consecutive transport failures
         self._fetch_cache: dict = {}      # url+max_chars -> wrapped body (session scope)
         self.subagents: dict[str, dict] = {}
+        self._approve_lock = asyncio.Lock()
+        self._replay_subagents()
         self.tokens_streamed = 0
         self.todo: list[dict] = []
         self.forced_fenced = bool(__import__("os").environ.get("KERN_FORCE_FENCED"))
@@ -156,6 +170,41 @@ class Engine:
                     client = MCPClient(cfg["command"])
                     client.tools = ev.get("tools") or []   # schemas survive
                     self.mounts.mcps[name] = client
+
+    def _replay_subagents(self) -> None:
+        """Reconstruct the subagents registry from the session journal.
+        The journal is the single truth: after a daemon restart or /resume,
+        handles like sub_1, sub_2 are restored with their status, session,
+        and report artifacts rather than being lost."""
+        for ev in self.session.events:
+            k = ev.get("kind")
+            if k == "subagent_spawn":
+                hid = ev.get("handle")
+                sid = ev.get("session_id")
+                child_session = Session(sid) if sid else None
+                entry = {
+                    "handle": hid,
+                    "task": ev.get("task", ""),
+                    "model": ev.get("model", self.model),
+                    "session": child_session,
+                    "engine": None,
+                    "started": ev.get("started", ev.get("ts", 0)),
+                    "max_steps": ev.get("max_steps", 50),
+                    "completed": False,
+                    "result": None,
+                    "error": None,
+                    "report_path": None,
+                    "async_task": None,
+                }
+                self.subagents[hid] = entry
+            elif k == "subagent_finish":
+                hid = ev.get("handle")
+                if hid in self.subagents:
+                    self.subagents[hid]["completed"] = True
+                    self.subagents[hid]["result"] = ev.get("result")
+                    self.subagents[hid]["error"] = ev.get("error")
+                    self.subagents[hid]["report_path"] = ev.get("report_path")
+
 
     async def _handle_mount_directives(self, text: str) -> list[str]:
         notes = []
@@ -288,15 +337,21 @@ class Engine:
         child_session = create_session(cwd=self.cwd, parent=self.session.id)
         hid = f"sub_{len(self.subagents) + 1}"
 
+        # Stream isolation: child events are announced with clean prefix
         def child_stream(kind: str, text: str):
             if kind == "note":
                 self.stream_cb("note", f"[{hid}] {text}")
             elif kind == "tool":
                 self.stream_cb("note", f"[{hid} tool] {text[:80]}")
 
+        # Approvals serialization: avoid concurrent modal collisions in TUI
+        async def child_approve(desc: str, diff: str | None = None) -> bool:
+            async with self._approve_lock:
+                return await self.approve(desc, diff)
+
         child_engine = Engine(
             self.client, self.model, child_session, self.cwd,
-            approve=self.approve, stream_cb=child_stream,
+            approve=child_approve, stream_cb=child_stream,
             subagent_depth=self.depth + 1
         )
 
@@ -319,28 +374,45 @@ class Engine:
         }
         self.subagents[hid] = entry
 
+        # Journal the subagent spawn: preserves handles across restarts and /resume
+        self.session.emit("subagent_spawn", handle=hid, task=task,
+                          session_id=child_session.id, model=self.model,
+                          max_steps=steps_cap, started=entry["started"])
+
+        sem = _get_subagent_semaphore()
+
         async def run_subagent():
-            try:
-                reply = await child_engine.chat(prompt, max_steps=steps_cap)
-                entry["completed"] = True
-                entry["result"] = reply
-                report_file = self.session.scratch / f"{hid}_report.md"
-                self.session.scratch.mkdir(parents=True, exist_ok=True)
-                report_file.write_text(
-                    f"# Subagent Report ({hid})\nTask: {task}\nModel: {self.model}\n"
-                    f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n{reply}"
-                )
-                entry["report_path"] = str(report_file)
-                self.stream_cb("note", f"✓ subagent {hid} finished ({child_engine.requests} requests) -> report saved to {report_file}")
-                return reply
-            except asyncio.CancelledError:
-                entry["completed"] = True
-                entry["error"] = "cancelled"
-                self.stream_cb("note", f"■ subagent {hid} cancelled")
-            except Exception as e:
-                entry["completed"] = True
-                entry["error"] = str(e)
-                self.stream_cb("note", f"⚠ subagent {hid} failed: {e}")
+            async with sem:
+                try:
+                    reply = await child_engine.chat(prompt, max_steps=steps_cap)
+                    entry["completed"] = True
+                    entry["result"] = reply
+                    report_file = self.session.scratch / f"{hid}_report.md"
+                    self.session.scratch.mkdir(parents=True, exist_ok=True)
+                    report_file.write_text(
+                        f"# Subagent Report ({hid})\nTask: {task}\nModel: {self.model}\n"
+                        f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n{reply}"
+                    )
+                    entry["report_path"] = str(report_file)
+                    self.session.emit("subagent_finish", handle=hid, result=reply,
+                                      report_path=str(report_file), error=None,
+                                      requests=child_engine.requests)
+                    self.stream_cb("note", f"✓ subagent {hid} finished ({child_engine.requests} requests) -> report saved to {report_file}")
+                    return reply
+                except asyncio.CancelledError:
+                    entry["completed"] = True
+                    entry["error"] = "cancelled"
+                    self.session.emit("subagent_finish", handle=hid, result=None,
+                                      report_path=None, error="cancelled",
+                                      requests=child_engine.requests)
+                    self.stream_cb("note", f"■ subagent {hid} cancelled")
+                except Exception as e:
+                    entry["completed"] = True
+                    entry["error"] = str(e)
+                    self.session.emit("subagent_finish", handle=hid, result=None,
+                                      report_path=None, error=str(e),
+                                      requests=child_engine.requests)
+                    self.stream_cb("note", f"⚠ subagent {hid} failed: {e}")
 
         if background:
             task_obj = asyncio.create_task(run_subagent())
@@ -364,16 +436,18 @@ class Engine:
             if entry["completed"]:
                 if entry["error"]:
                     return f"subagent {handle}: failed with error: {entry['error']}", {}
-                reqs = entry["engine"].requests
+                reqs = entry["engine"].requests if entry["engine"] else "?"
                 dt = round(time.time() - entry["started"], 1)
                 return f"subagent {handle}: completed in {dt}s ({reqs} requests). Report: {entry['report_path']}", {}
             else:
                 dt = round(time.time() - entry["started"], 1)
-                reqs = entry["engine"].requests
+                reqs = entry["engine"].requests if entry["engine"] else "?"
                 return f"subagent {handle}: still running ({dt}s elapsed, {reqs} requests so far)", {}
 
         elif action == "logs":
-            sess = entry["session"]
+            sess = entry.get("session")
+            if not sess:
+                return f"subagent {handle}: no session log available", {}
             lines = []
             for ev in sess.events:
                 k = ev.get("kind")
@@ -393,7 +467,13 @@ class Engine:
                 return f"subagent {handle} completed report:\n{entry['result']}\n(Full report: {entry['report_path']})", {}
             task_obj = entry.get("async_task")
             if not task_obj:
-                return f"subagent {handle}: not running as background task", {}
+                # If restored from journal after a daemon restart: check if child session has turn_end
+                sess = entry.get("session")
+                if sess and not sess.turn_is_open():
+                    report_file = self.session.scratch / f"{handle}_report.md"
+                    content = report_file.read_text(errors="replace") if report_file.is_file() else "(report on disk)"
+                    return f"subagent {handle} completed report:\n{content}", {}
+                return f"subagent {handle}: not running as in-memory background task", {}
             try:
                 reply = await asyncio.wait_for(asyncio.shield(task_obj), timeout=float(timeout or 120))
                 return f"subagent {handle} completed report:\n{entry['result']}\n(Full report: {entry['report_path']})", {}
@@ -410,7 +490,6 @@ class Engine:
 
         return f"error: unknown action '{action}'. Valid actions: status, logs, wait, cancel", {}
 
-    # ---- the loop ------------------------------------------------------------
 
     async def chat(self, user_text: str, max_steps: int = 30) -> str:
         self.session.emit("user", text=user_text)

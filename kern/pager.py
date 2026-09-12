@@ -75,34 +75,58 @@ def _clear_tool_args(tool_calls: list[dict]) -> list[dict]:
 
 def _slate(events: list[dict]) -> str:
     """Build the always-visible work-state block from the journal:
-    objective (last user message, verbatim, capped) + current todo."""
+    objective (last user message, verbatim, capped) + current todo + active subagents."""
     objective = ""
     todo = None
+    subagents: dict[str, dict] = {}
+
     for ev in events:
-        if ev["kind"] == "objective":
+        k = ev.get("kind")
+        if k == "objective":
             objective = ev.get("text", "")
-        elif ev["kind"] == "todo":
+        elif k == "todo":
             todo = ev.get("items")
+        elif k == "subagent_spawn":
+            hid = ev.get("handle")
+            if hid:
+                subagents[hid] = {"status": "running", "task": str(ev.get("task", ""))[:50]}
+        elif k == "subagent_finish":
+            hid = ev.get("handle")
+            if hid and hid in subagents:
+                st = "failed" if ev.get("error") else "finished"
+                subagents[hid]["status"] = st
+                subagents[hid]["report"] = ev.get("report_path")
+
     if not objective:
         for ev in reversed(events):
             if ev.get("kind") == "user" and ev.get("text"):
                 objective = ev.get("text", "").strip()[:400]
                 break
+
+    lines = ["<work-state>"]
+    if objective:
+        lines.append(f"objective: {objective}")
     if todo:
-        lines = ["<work-state>"]
-        if objective:
-            lines.append(f"objective: {objective}")
         lines.append("todo:")
         for i, item in enumerate(todo, 1):
             mark = {"done": "x", "active": ">", "pending": " "}.get(item.get("status", "pending"), " ")
             text = str(item.get("text", ""))[:80]
             lines.append(f" {mark} {i}. {text}")
-        lines.append("</work-state>")
-        return "\n".join(lines)
-    if objective:
-        return f"<work-state>\nobjective: {objective}\n(no plan yet — multi-step? set one with todo())\n</work-state>"
-    return ""
+    elif not subagents:
+        lines.append("(no plan yet — multi-step? set one with todo())")
 
+    if subagents:
+        lines.append("subagents:")
+        for hid, info in sorted(subagents.items()):
+            if info["status"] == "finished":
+                lines.append(f"  ✓ {hid}: finished (report ready: {info.get('report')})")
+            elif info["status"] == "failed":
+                lines.append(f"  ✗ {hid}: failed")
+            else:
+                lines.append(f"  … {hid}: running ({info['task']})")
+
+    lines.append("</work-state>")
+    return "\n".join(lines)
 
 def materialize(events: list[dict], session) -> list[dict]:
     """journal events -> IR messages (role/text/tool_calls/tool_call_id).
