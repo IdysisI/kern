@@ -281,15 +281,18 @@ def list_sessions() -> list[str]:
     return sorted(p.name for p in SESSIONS.iterdir() if p.is_dir())
 
 
-BENCH_PHRASES = (
-    "fix the spinner", "do the heavy thing", "do work", "tâche longue", "tâche initiale",
-    "do the thing", "do two things", "corrige le port", "turn one", "turn two", "turn 1", "turn 2",
-    "slow turn in the child", "analyze this", "test turn", "mixed turn", "run bad json",
-    "calcule", "slow task for sub1", "first", "second", "hello world", "what is the answer",
-    "start background slow worker", "run bad commands", "write the file then finish", "grep the theme code",
-    "make a plan with todo(), then write a file calc.py", "make a 3-step plan with todo()",
-    "use the fetch tool on https://example.com", "test_calc.py fails", "buggy.py should print the sum",
-    "create a file answer.py that prints", "bigdata.txt is large"
+EXACT_TEST_PROMPTS = {
+    "first", "second", "hello world", "test turn", "mixed turn",
+    "run bad json", "calcule", "turn 1", "turn 2", "turn one",
+    "turn two", "do work", "do the thing", "do two things",
+    "start background slow worker", "write the file then finish",
+    "slow turn in the child", "what is the answer"
+}
+
+BENCH_SIGNATURES = (
+    "fix the spinner", "do the heavy thing", "tâche longue", "tâche initiale",
+    "corrige le port en 9000", "slow task for sub1", "run bad commands",
+    "grep the theme code", "write a file calc.py with a function fib"
 )
 
 
@@ -297,7 +300,15 @@ def is_test_session(cwd: str, preview: str) -> bool:
     if cwd.startswith("/tmp") or cwd.startswith("/var/tmp"):
         return True
     t = preview.strip().lower()
-    return any(bp in t for bp in BENCH_PHRASES)
+    if t in EXACT_TEST_PROMPTS:
+        return True
+    # Substring signatures only apply to short test fixture prompts (<150 chars)
+    # Real user prompts (which can contain common words like 'first' or 'second') are preserved!
+    if len(t) < 150:
+        for sig in BENCH_SIGNATURES:
+            if sig in t:
+                return True
+    return False
 
 
 def session_previews(limit: int = 60, current_cwd: str | None = None, include_tests: bool = False) -> list[dict]:
@@ -324,26 +335,30 @@ def session_previews(limit: int = 60, current_cwd: str | None = None, include_te
     test_out = []
     for sid, log, mtime in candidates:
         try:
-            with open(log, "r", encoding="utf-8", errors="replace") as f:
-                head = f.read(3072)
-            lines = [l for l in head.splitlines() if l.strip()]
-            if len(lines) < 2:
-                continue
             cwd = ""
             first_user = ""
             user_count = 0
-            for l in lines:
-                try:
-                    obj = json.loads(l)
-                    k = obj.get("kind")
-                    if k in ("meta", "session") and not cwd:
-                        cwd = obj.get("cwd", "")
-                    elif k == "user":
-                        user_count += 1
-                        if not first_user:
-                            first_user = obj.get("text", "")
-                except Exception:
-                    pass
+            with open(log, "r", encoding="utf-8", errors="replace") as f:
+                # Read line-by-line so even very long (10KB+) user prompts are parsed cleanly
+                for _ in range(6):
+                    line = f.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                        k = obj.get("kind")
+                        if k in ("meta", "session") and not cwd:
+                            cwd = obj.get("cwd", "")
+                        elif k == "user":
+                            user_count += 1
+                            if not first_user:
+                                first_user = obj.get("text", "")
+                    except Exception:
+                        pass
+
             if not first_user:
                 continue
 
