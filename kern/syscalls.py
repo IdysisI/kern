@@ -130,30 +130,39 @@ class FS:
         self.cwd = Path(cwd).resolve()
 
     def resolve(self, path: str) -> Path:
-        p, _ = self.resolve_resilient(path)
-        return p
-
-    def resolve_resilient(self, path: str) -> tuple[Path, str | None]:
-        """Resolve a path with fuzzy auto-correction:
-        1. If exact path exists, return it immediately.
-        2. If path is a relative basename (e.g. 'tui.py' or 'tests/test_x.py')
-           and doesn't exist at cwd, search the project for a unique match.
-        3. If exactly ONE match exists (e.g. 'kern/tui.py'), auto-resolve it
-           and return an informative note. Saves models 1 whole wasted round-trip!"""
+        """Strict path resolution: resolves path against cwd without fuzzy matching."""
         p = Path(path).expanduser()
         if not p.is_absolute():
             p = self.cwd / p
-        resolved = p.resolve()
+        return p.resolve()
+
+    def resolve_resilient(self, path: str) -> tuple[Path, str | None]:
+        """Resolve a path with safe relative auto-correction:
+        1. If exact path exists, return it immediately.
+        2. Absolute paths are NEVER fuzzy-resolved (avoids cross-project collisions).
+        3. Never fuzzy-resolve if cwd is root ('/') or the user's root home ('~').
+        4. If path is a relative basename (e.g. 'tui.py') and exactly ONE match
+           exists within project cwd, auto-resolve it."""
+        raw_p = Path(path).expanduser()
+        is_abs = raw_p.is_absolute()
+        resolved = (raw_p if is_abs else (self.cwd / raw_p)).resolve()
         if resolved.exists():
             return resolved, None
 
-        # Attempt unique fuzzy resolution within self.cwd
-        target_name = Path(path).name
+        # Absolute paths must NEVER be fuzzy-redirected to existing files elsewhere
+        if is_abs:
+            return resolved, None
+
+        # Disallow global scans from home root or filesystem root
+        if self.cwd in (Path.home(), Path("/"), Path("/home")):
+            return resolved, None
+
+        # Attempt unique fuzzy resolution within self.cwd for relative basenames
+        target_name = raw_p.name
         if target_name and not path.startswith(".."):
             matches = []
             try:
                 for candidate in self.cwd.rglob(target_name):
-                    # ignore hidden, virtualenv, and cache folders
                     parts = candidate.parts
                     if any(part.startswith(".") or part in ("__pycache__", "venv", ".venv", "node_modules") for part in parts):
                         continue
