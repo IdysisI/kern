@@ -53,24 +53,8 @@ def _rhash(text: str) -> str:
 
 
 def _clear_tool_args(tool_calls: list[dict]) -> list[dict]:
-    """Tier 1b: strip bulky file bodies from assistant write/edit calls.
-
-    The model re-emits the same write/edit content at every step while the
-    journaled arguments keep the full text. Once the tool has run, the bytes
-    live on disk; keeping them in-context is pure cost.
-    """
-    out = []
-    for tc in tool_calls:
-        name = tc.get("name", "")
-        args = tc.get("arguments")
-        if name in ("write", "edit") and isinstance(args, dict):
-            args = dict(args)
-            for f in _ARG_BODY_FIELDS:
-                v = args.get(f)
-                if isinstance(v, str) and len(v) > ARG_CLEAR:
-                    args[f] = f"[cleared by kern: {len(v)} chars — re-read the file]"
-        out.append({**tc, "arguments": args} if isinstance(args, dict) else tc)
-    return out
+    # Preserve exact assistant tool arguments so the model has authentic memory of its code
+    return tool_calls
 
 
 def _slate(events: list[dict]) -> str:
