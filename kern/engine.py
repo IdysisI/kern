@@ -729,6 +729,7 @@ class Engine:
         await self._dedicated_compaction(to_compact, None)
 
     async def _loop(self, max_steps: int | None = None) -> str:
+        self._nudged_empty = False
         if not health_of(self.model) and not self.forced_fenced:
             # never guess a model's protocol — measure it once, then remember
             self.stream_cb("note", f"probing {self.model} capabilities…")
@@ -834,7 +835,7 @@ class Engine:
             display = display.strip()
 
             self.session.emit("assistant", text=display, tool_calls=calls)
-            final_text = display or final_text
+            final_text = display
 
             # mount directives (work in both protocols) — journaled AFTER the
             # assistant event so the next turn never ends on a model message
@@ -844,6 +845,11 @@ class Engine:
                 self.stream_cb("note", note)
 
             if not calls and not notes:
+                if not display and step > 1 and not getattr(self, "_nudged_empty", False):
+                    self._nudged_empty = True
+                    self.session.emit("user", text="[Tool completed. Provide your summary or answer to the user.]")
+                    continue
+                self._nudged_empty = False
                 if truncated and not display:
                     msg = "⚠ Le modèle a atteint sa limite de tokens de sortie (max_tokens) pendant son raisonnement."
                     self.session.emit("note", text=msg)

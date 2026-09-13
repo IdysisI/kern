@@ -102,6 +102,8 @@ class MCPClient:
         self.tools = res.get("tools", [])
 
     async def call(self, name: str, arguments: dict) -> str:
+        if self.proc is None or self.proc.returncode is not None:
+            await self.start()
         res = await self._rpc("tools/call", {"name": name, "arguments": arguments})
         parts = [c.get("text", "") for c in res.get("content", []) if isinstance(c, dict)]
         return "\n".join(parts) or json.dumps(res)[:2000]
