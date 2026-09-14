@@ -1,0 +1,203 @@
+{
+  "date": "2026-09-14",
+  "scope": "Synthetic integration only; proxy model labels, not independently authenticated model identity; no baseline comparison.",
+  "runs": [
+    {
+      "run": "live-haiku-before-contract-fix",
+      "platform": "Windows",
+      "stage": "diagnostic before JSON/address fixes",
+      "model": "claude-haiku-4-5-20251001",
+      "protocol": "anthropic",
+      "requests": 18,
+      "seconds": 78.09,
+      "passed": false,
+      "checks": {
+        "file_exact": true,
+        "episode_valid_json_contract": false,
+        "episode_source_exists": true,
+        "single_write_after_reopen": true,
+        "file_unchanged_after_reopen": true,
+        "recall_after_episode": true,
+        "plan_complete": true,
+        "durable_note": true,
+        "fresh_session_recall": true,
+        "fresh_session_no_mounts": true,
+        "all_turns_done": false
+      },
+      "turn_stops": [
+        "unverified",
+        "done",
+        "done"
+      ],
+      "provider_error": "",
+      "raw_result_sha256": "38ab33347e8b0499f3549e80e15bddd3c575e6ad589544e06fc5f82b0b32090e"
+    },
+    {
+      "run": "live-minimax-before-contract-fix",
+      "platform": "Windows",
+      "stage": "diagnostic before JSON/address fixes",
+      "model": "MiniMax-M2.7",
+      "protocol": "openai",
+      "requests": 19,
+      "seconds": 77.58,
+      "passed": false,
+      "checks": {
+        "file_exact": true,
+        "episode_valid_json_contract": false,
+        "episode_source_exists": true,
+        "single_write_after_reopen": true,
+        "file_unchanged_after_reopen": true,
+        "recall_after_episode": true,
+        "plan_complete": true,
+        "durable_note": true,
+        "fresh_session_recall": true,
+        "fresh_session_no_mounts": true,
+        "all_turns_done": false
+      },
+      "turn_stops": [
+        "unverified",
+        "done",
+        "done"
+      ],
+      "provider_error": "",
+      "raw_result_sha256": "e94fe902646cfa720452d7c1296754a70f6f9f5255b1b4c17f69dce6f0eb23b6"
+    },
+    {
+      "run": "live-sonnet",
+      "platform": "Windows",
+      "stage": "first successful run before final JSON/address fixes",
+      "model": "claude-sonnet-4-6",
+      "protocol": "anthropic",
+      "requests": 16,
+      "seconds": 171.94,
+      "passed": true,
+      "checks": {
+        "file_exact": true,
+        "episode_valid_json_contract": true,
+        "episode_source_exists": true,
+        "single_write_after_reopen": true,
+        "file_unchanged_after_reopen": true,
+        "recall_after_episode": true,
+        "plan_complete": true,
+        "durable_note": true,
+        "fresh_session_recall": true,
+        "fresh_session_no_mounts": true,
+        "all_turns_done": true
+      },
+      "turn_stops": [
+        "done",
+        "done",
+        "done"
+      ],
+      "provider_error": "",
+      "raw_result_sha256": "1915171550d027bdbff068df227fb16ba1bbf8bffb2f76aafa4fd198684555af"
+    },
+    {
+      "run": "live-minimax",
+      "platform": "Windows",
+      "stage": "final",
+      "model": "MiniMax-M2.7",
+      "protocol": "openai",
+      "requests": 18,
+      "seconds": 66.7,
+      "passed": true,
+      "checks": {
+        "file_exact": true,
+        "episode_valid_json_contract": true,
+        "episode_source_exists": true,
+        "single_write_after_reopen": true,
+        "file_unchanged_after_reopen": true,
+        "recall_after_episode": true,
+        "plan_complete": true,
+        "durable_note": true,
+        "fresh_session_recall": true,
+        "fresh_session_no_mounts": true,
+        "all_turns_done": true,
+        "no_failed_tool_receipts": true
+      },
+      "turn_stops": [
+        "done",
+        "done",
+        "done"
+      ],
+      "provider_error": "",
+      "raw_result_sha256": "8649fca7c8eb245d034a08b37f09c83dcb6287161a32b1cc482f41a19ab2278f"
+    },
+    {
+      "run": "live-minimax-linux",
+      "platform": "Ubuntu 24.04 WSL",
+      "stage": "final",
+      "model": "MiniMax-M2.7",
+      "protocol": "openai",
+      "requests": 17,
+      "seconds": 60.14,
+      "passed": true,
+      "checks": {
+        "file_exact": true,
+        "episode_valid_json_contract": true,
+        "episode_source_exists": true,
+        "single_write_after_reopen": true,
+        "file_unchanged_after_reopen": true,
+        "recall_after_episode": true,
+        "plan_complete": true,
+        "durable_note": true,
+        "fresh_session_recall": true,
+        "fresh_session_no_mounts": true,
+        "all_turns_done": true,
+        "no_failed_tool_receipts": true
+      },
+      "turn_stops": [
+        "done",
+        "done",
+        "done"
+      ],
+      "provider_error": "",
+      "raw_result_sha256": "97685e1815e5b227666c096ef5f7b6b478c557487b8218c4f37d2fb50293ed7e"
+    },
+    {
+      "run": "live-haiku",
+      "platform": "Windows",
+      "stage": "final",
+      "model": "claude-haiku-4-5-20251001",
+      "protocol": "anthropic",
+      "requests": 16,
+      "seconds": 272.27,
+      "passed": false,
+      "checks": {
+        "file_exact": true,
+        "episode_valid_json_contract": true,
+        "episode_source_exists": true,
+        "single_write_after_reopen": true,
+        "file_unchanged_after_reopen": true,
+        "recall_after_episode": false,
+        "plan_complete": true,
+        "durable_note": true,
+        "fresh_session_recall": true,
+        "fresh_session_no_mounts": true,
+        "all_turns_done": false,
+        "no_failed_tool_receipts": true
+      },
+      "turn_stops": [
+        "done",
+        "error",
+        "done"
+      ],
+      "provider_error": "[error from model endpoint: stage=transport http status=503: {\"type\": \"error\", \"error\": {\"type\": \"api_error\", \"message\": \"no upstream keys available\"}}]",
+      "raw_result_sha256": "0759a062e4cdfb36d72d9f7bd8a34d469001df9d19fae1d0f46c9342f4604e62"
+    },
+    {
+      "run": "live-sonnet-final",
+      "platform": "Windows",
+      "stage": "final",
+      "model": "claude-sonnet-4-6",
+      "protocol": "anthropic",
+      "requests": 1,
+      "seconds": 89.25,
+      "passed": false,
+      "checks": {},
+      "turn_stops": [],
+      "provider_error": "stage=transport http status=503: {\"type\": \"error\", \"error\": {\"type\": \"api_error\", \"message\": \"no upstream keys available\"}}",
+      "raw_result_sha256": "a8c5bc510376924d152c76d8fe04ec5964cefc6c7dd92798dbd7c3fe12757bbc"
+    }
+  ]
+}

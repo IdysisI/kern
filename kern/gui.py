@@ -477,7 +477,8 @@ class KernWindow(QMainWindow):
         def done(_):
             if dlg.choice == "a":
                 self._always = True
-            fut.set_result(dlg.choice in ("y", "a"))
+            if not fut.done():
+                fut.set_result(dlg.choice in ("y", "a"))
         dlg.finished.connect(done)
         dlg.open()
         return await fut
@@ -544,6 +545,9 @@ class KernWindow(QMainWindow):
     def _submit(self, text):
         if not text:
             return
+        if self.turn_task and not self.turn_task.done():
+            self._note('A turn is running; interrupt it before sending or changing sessions.')
+            return
         if text.startswith("/"):
             self._slash(text)
             return
@@ -573,6 +577,9 @@ class KernWindow(QMainWindow):
             self.turn_task.cancel()
 
     def _new_session(self):
+        if self.turn_task and not self.turn_task.done():
+            self._note('Interrupt the active turn before changing session.')
+            return
         self.session = create_session(cwd=self.cwd)
         self.sess_lbl.setText(f'<span style="color:{DIM}">{self.session.id}</span>')
         self._clear_chat()

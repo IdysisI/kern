@@ -1,4 +1,6 @@
-.venv/
+.venv*/
+.test-runs/
+dist/
 __pycache__/
 *.pyc
 .pytest_cache/

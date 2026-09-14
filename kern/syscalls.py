@@ -24,8 +24,10 @@ import re
 import subprocess
 import sys
 import threading
+import weakref
 import time
 from pathlib import Path
+from .storage import atomic_write, file_lock, path_key
 
 KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))
 
@@ -81,12 +83,12 @@ SCHEMAS = [
         "name": "memory",
         "description": "Query/annotate this project's persistent memory. QUERY-ONLY design: nothing is ever auto-injected — call it ONLY when the current task plausibly benefits from a past session on this same project. Actions: outline (index), search(pattern), read(path), remember(text, topic) for durable facts, write(path, content) for project.md/atoms/scenarios, forget(pattern) to tombstone stale facts.",
         "parameters": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["outline", "search", "read", "remember", "write", "forget", "reconcile"],
+            "action": {"type": "string", "enum": ["outline", "search", "read", "remember", "write", "forget", "reconcile", "history"],
                        "description": "reconcile: return active ground truth for a topic without superseded or deleted facts"},
             "pattern": {"type": "string"},
-            "path": {"type": "string", "description": "e.g. project.md, atoms/topic.md, scenarios/<name>.md"},
+            "path": {"type": "string", "description": "read a SQLite note using note:<id> returned by search/outline; these are not files. Legacy Markdown: project.md, atoms/topic.md, scenarios/<name>.md"},
             "text": {"type": "string"},
-            "topic": {"type": "string", "description": "topic slug for remember()"}},
+            "topic": {"type": "string", "description": "topic slug for remember()"}, "key": {"type":"string", "description":"Explicit key to supersede an older note; omit to retain both"}},
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "py",
@@ -97,11 +99,11 @@ SCHEMAS = [
             "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "todo",
-        "description": "Set the live task list for this turn's plan. Each item: {text, status: pending|active|done}. Update it as you progress.",
+        "description": "Set the live task list. Each item: {text, status: pending|active|done|blocked}. Mark done only after checking evidence; retain completed work to avoid repeating it.",
         "parameters": {"type": "object", "properties": {
             "items": {"type": "array", "items": {"type": "object", "properties": {
                 "text": {"type": "string"},
-                "status": {"type": "string", "enum": ["pending", "active", "done"]}},
+                "status": {"type": "string", "enum": ["pending", "active", "done", "blocked"]}},
                 "required": ["text", "status"]}}},
             "required": ["items"]}}},
     {"type": "function", "function": {
@@ -159,7 +161,7 @@ class FS:
 
         # Attempt unique fuzzy resolution within self.cwd for relative basenames
         target_name = raw_p.name
-        if target_name and not path.startswith(".."):
+        if target_name and len(raw_p.parts) == 1 and not path.startswith(".."):
             matches = []
             try:
                 for candidate in self.cwd.rglob(target_name):
@@ -188,7 +190,7 @@ def _is_binary_bytes(chunk: bytes) -> bool:
 
 
 def _numbered(p: Path, offset: int, limit: int) -> str:
-    lines = p.read_text(errors="replace").splitlines()
+    lines = p.read_text(encoding="utf-8", errors="strict").splitlines()
     total = len(lines)
     lo = max(1, offset)
     hi = min(total, lo + limit - 1)
@@ -223,7 +225,7 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
     suffix = p.suffix.lower()
 
     # Multimodal Media: Images
-    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
     if suffix in IMAGE_EXTS:
         import base64, mimetypes
         mime = mimetypes.guess_type(str(p))[0] or f"image/{suffix.lstrip('.')}"
@@ -239,16 +241,9 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
     # Multimodal Media: Audio
     AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".flac"}
     if suffix in AUDIO_EXTS:
-        import base64, mimetypes
+        import mimetypes
         mime = mimetypes.guess_type(str(p))[0] or f"audio/{suffix.lstrip('.')}"
-        if size <= 15 * 1024 * 1024:  # up to 15MB
-            try:
-                b64_data = base64.b64encode(p.read_bytes()).decode("ascii")
-                meta = {"media": {"type": "audio", "mime": mime, "data": b64_data, "path": str(p)}}
-                return f"{res_prefix}[audio: {p.name} ({mime}, {size:,} bytes) — audio content attached for multimodal models]", meta
-            except Exception as e:
-                pass
-        return f"{res_prefix}[audio file: {p.name} ({mime}, {size:,} bytes) — raw audio read skipped]", {}
+        return f"{res_prefix}[audio file: {p.name} ({mime}, {size:,} bytes) — this adapter does not transcribe audio; use a configured transcription tool]", {}
 
     # Pure binary files (.so, .bin, .pyc, .exe, zip/tar, or null-byte detection)
     BINARY_EXTS = {".so", ".dylib", ".dll", ".bin", ".exe", ".pyc", ".tar", ".gz", ".zip", ".7z", ".pdf"}
@@ -270,7 +265,7 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
 
     # Standard Text File
     if full:
-        text = p.read_text(errors="replace")
+        text = p.read_text(encoding="utf-8", errors="strict")
         if len(text.splitlines()) <= 2000:
             return f"{res_prefix}{text}", {}
         return (f"{res_prefix}error: file too large for full read ({len(text.splitlines())} lines). "
@@ -279,9 +274,9 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
 
 def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
     p = fs.resolve(path)
-    session.checkpoint([str(p)], cwd=str(fs.cwd))
     p.parent.mkdir(parents=True, exist_ok=True)
-    res = _locked_update(p, lambda _src: content)
+    res = _locked_update(p, lambda _src: content,
+                         before_write=lambda: session.checkpoint([str(p)], cwd=str(fs.cwd)))
     old, _new = res if res else ("", content)
     diff = _unified_diff(p, old, content)
     msg = f"wrote {p} ({len(content)} bytes)"
@@ -292,7 +287,7 @@ def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
     return msg, {"diff": diff, "path": str(p)}
 
 
-def _locked_update(p: Path, fn) -> tuple[str, str] | None:
+def _locked_update(p: Path, fn, before_write=None) -> tuple[str, str] | None:
     """Whole read-modify-write cycle under an exclusive sidecar lock.
     fn(src) -> new_src, or None to refuse (file untouched). Returns
     (old_src, new_src) on success. The atomic rename makes a crash
@@ -300,33 +295,21 @@ def _locked_update(p: Path, fn) -> tuple[str, str] | None:
     this lock (kern tools) are serialized — a non-cooperating external
     process can still race; the edit precondition catches the common case
     by refusing on drifted content."""
-    import fcntl
-    import hashlib
-    lock_dir = KERN_HOME / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_key = hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:16]
-    lock = lock_dir / f"{lock_key}.lock"
-    tmp = p.with_name(p.name + ".kern-tmp")
-    with open(lock, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
-        try:
-            src = p.read_text(errors="replace") if p.exists() else ""
-            new = fn(src)
-            if new is None:
-                return None
-            if new != src:
-                with open(tmp, "w") as f:
-                    f.write(new)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, p)
-            return src, new
-        finally:
-            try:
-                tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-            fcntl.flock(lf, fcntl.LOCK_UN)
+    lock = KERN_HOME / "locks" / (path_key(p) + ".lock")
+    with file_lock(lock):
+        existed = p.exists()
+        raw = p.read_bytes() if existed else b""
+        src = raw.decode("utf-8")
+        newline = "\r\n" if b"\r\n" in raw else "\n"
+        src = src.replace("\r\n", "\n")
+        new = fn(src)
+        if new is None:
+            return None
+        if new != src or not existed:
+            if before_write:
+                before_write()
+            atomic_write(p, new.replace("\r\n", "\n").replace("\n", newline))
+        return src, new
 
 
 def _numbered_lines(lines: list[str], start: int, end: int, cap: int = 30) -> str:
@@ -347,7 +330,7 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
     p = fs.resolve(path)
     if not p.exists():
         return f"error: no such file: {p}. Use write() to create it.", {}
-    src = p.read_text(errors="replace")
+    src = p.read_text(encoding="utf-8", errors="strict")
     lines = src.splitlines()
 
     # Line-range mode: use when old_str is empty or fails.
@@ -380,12 +363,11 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
                 refused.append("precondition")
                 return None
             new_lines = flines[:start_line - 1] + new_str.splitlines() + flines[end_line:]
-            return "\n".join(new_lines)
+            return "\n".join(new_lines) + ("\n" if fresh.endswith("\n") else "")
 
-        _cid = session.checkpoint([str(p)], cwd=str(fs.cwd))
-        res = _locked_update(p, _apply)
+        res = _locked_update(p, _apply, before_write=lambda: session.checkpoint([str(p)], cwd=str(fs.cwd)))
         if res is None:
-            session.drop_checkpoint(_cid)
+            src = p.read_text(encoding='utf-8')
             if refused and refused[0] == "precondition":
                 flines = src.splitlines()
                 return (f"error: precondition failed — lines {start_line}-{end_line} of {p} "
@@ -416,10 +398,9 @@ def tool_edit(fs: FS, session, path: str, old_str: str, new_str: str,
             return None            # refused; details built by the caller below
         return src.replace(old_str, new_str, 1)
 
-    _cid = session.checkpoint([str(p)], cwd=str(fs.cwd))
-    res = _locked_update(p, _apply)
+    res = _locked_update(p, _apply, before_write=lambda: session.checkpoint([str(p)], cwd=str(fs.cwd)))
     if res is None:
-        session.drop_checkpoint(_cid)
+        src = p.read_text(encoding='utf-8')
         count = src.count(old_str)
         if count == 0:
             hint = _fuzzy_hint(src, old_str)
@@ -444,6 +425,7 @@ MAX_LOG_DRAIN = 262144      # max bytes drained per logs call (256 KiB)
 LOG_BUF_CAP = 1048576       # in-memory log tail cap (1 MiB)---------------------------
 
 PROCS: dict[str, dict] = {}
+_PY_PROCS = weakref.WeakSet()
 
 
 def _sandbox_wrap(fs: FS, cmd: str) -> list[str]:
@@ -465,105 +447,111 @@ def _sandbox_wrap(fs: FS, cmd: str) -> list[str]:
 _BWRAP = os.environ.get("KERN_SANDBOX", "1") != "0" and shutil.which("bwrap")
 
 
-def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False) -> tuple[str, dict]:
-    env = dict(os.environ, PAGER="cat", PIP_PROGRESS_BAR="off", TQDM_DISABLE="1")
-    if _BWRAP:
-        # Background jobs get the SAME sandbox as foreground ones — the only
-        # difference is who drains stdout. bwrap --die-with-parent makes the
-        # sandbox non-optional: no unsandboxed code path exists.
-        if background:
-            argv = _sandbox_wrap(fs, cmd)
-            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    cwd=fs.cwd, env=env, text=True, start_new_session=True)
-            hid = f"h{len(PROCS) + 1}"
-            PROCS[hid] = {"proc": proc, "cmd": cmd, "started": time.time(), "buf": "", "pending": b""}
-            return (f"started {hid} (pid {proc.pid}): {cmd}\n"
-                    f"Use proc(handle=\"{hid}\", action=\"logs\") to inspect. "
-                    f"Note: output drains on each logs call; if you never call it, "
-                    f"a chatty process pauses once its pipe fills (~64 KiB)."), {"handle": hid}
-        argv = _sandbox_wrap(fs, cmd)
+def shell_argv(cmd: str) -> list[str]:
+    if os.name == "nt":
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        if not shell:
+            raise RuntimeError("PowerShell is required on Windows")
+        setup = "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); "
+        return [shell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", setup + cmd]
+    return [shutil.which("bash") or "/bin/sh", "-c", cmd]
+
+
+def _stop_process(proc):
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        # Keep the parent alive until taskkill enumerates its descendants.
+        # Killing it first loses the ancestry needed by /T.
+        try:
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                           capture_output=True, timeout=10,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
     else:
-        argv = ["bash", "-c", cmd]
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     try:
-        r = subprocess.run(argv, capture_output=True, text=True,
-                           cwd=fs.cwd, timeout=timeout, env=env)
+        proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
-        return (f"error: timed out after {timeout}s. Re-run with a longer timeout, "
-                f"a narrower command, or background=true."), {}
-    out = (r.stdout or "") + (f"\n[stderr]\n{r.stderr}" if r.stderr else "")
-    if not out.strip():
-        out = "(command ran successfully, no output)"
-    if len(out) > 8000:
-        out = out[:3800] + f"\n\n…[{len(out)-7600:,} bytes elided]…\n\n" + out[-3800:]
-    return (f"exit={r.returncode}\n{out}".rstrip(),
-            {"exit_code": r.returncode, "stdout": r.stdout or "",
-             "stderr": r.stderr or "", "timed_out": False})
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False, *, _cancel=None) -> tuple[str, dict]:
+    import uuid
+    timeout = max(1, min(int(timeout), 3600))
+    env = dict(os.environ, PAGER="cat", PIP_PROGRESS_BAR="off", TQDM_DISABLE="1",
+               PYTHONIOENCODING="utf-8")
+    argv = _sandbox_wrap(fs, cmd) if _BWRAP else shell_argv(cmd)
+    hid = "h" + uuid.uuid4().hex[:12]
+    logdir = KERN_HOME / "processes"
+    logdir.mkdir(parents=True, exist_ok=True)
+    logfile = logdir / (hid + ".log")
+    kwargs = {"start_new_session": True} if os.name != "nt" else {
+        "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    with logfile.open('wb') as output:
+        proc = subprocess.Popen(argv, stdout=output, stderr=subprocess.STDOUT,
+                                cwd=fs.cwd, env=env, **kwargs)
+    PROCS[hid] = {"proc": proc, "cmd": cmd, "started": time.time(), "log": logfile}
+    if background:
+        return f"started {hid} (pid {proc.pid}): {cmd}\nFull output: {logfile}; inspect with proc().", {"handle": hid, "status": "running"}
+    try:
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None:
+            if _cancel is not None and _cancel.is_set():
+                _stop_process(proc)
+                return f'error: interrupted; process tree stopped. Partial effects possible. Output: {logfile}', {
+                    'status':'uncertain', 'interrupted':True, 'output_path':str(logfile)}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            try:
+                proc.wait(timeout=min(.1, remaining))
+            except subprocess.TimeoutExpired:
+                pass
+    except subprocess.TimeoutExpired:
+        _stop_process(proc)
+        return f"error: timed out after {timeout}s; process tree stopped. Partial effects possible. Output: {logfile}", {"status": "uncertain", "timed_out": True}
+    finally:
+        PROCS.pop(hid, None)
+    size = logfile.stat().st_size
+    with logfile.open('rb') as f:
+        if size > 16000:
+            head = f.read(8000)
+            f.seek(-8000, 2)
+            data = head + b"\n[output elided; full log on disk]\n" + f.read()
+        else:
+            data = f.read()
+    out = data.decode('utf-8', errors='replace') or '(no output)'
+    return f"exit={proc.returncode}\n{out}\n[full output: {logfile}]", {
+        "exit_code": proc.returncode, "status": "succeeded" if proc.returncode == 0 else "failed",
+        "output_path": str(logfile), "timed_out": False}
 
 
 def tool_proc(handle: str, action: str, tail: int = 40) -> tuple[str, dict]:
     h = PROCS.get(handle)
     if not h:
-        return f"error: no such handle '{handle}'. Live handles: {list(PROCS)}", {}
-    proc = h["proc"]
-    if action == "status":
-        alive = proc.poll() is None
-        return f"{handle} {'running' if alive else f'exited({proc.returncode})'} pid={proc.pid} cmd={h['cmd']}", {}
-    if action == "kill":
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
-        return f"{handle} killed", {}
-    if action == "logs":
-        # Non-blocking, BOUNDED drain: a live, quiet process never blocks the
-        # engine, and a continuously-writing process cannot monopolize the
-        # call (max MAX_LOG_DRAIN bytes per call) nor grow memory unbounded
-        # (buffer capped to LOG_BUF_CAP bytes; the head is dropped, never
-        # silently lost — the caller is told how much was discarded).
-        # Partial UTF-8 sequences split across reads are held over in
-        # h["pending"] and decoded on the next call.
-        try:
-            fd = proc.stdout.fileno()
-            os.set_blocking(fd, False)
-            got = 0
-            try:
-                while got < MAX_LOG_DRAIN:
-                    chunk = os.read(fd, min(65536, MAX_LOG_DRAIN - got))
-                    if not chunk:
-                        break          # EOF: process exited
-                    got += len(chunk)
-                    h.setdefault("pending", b"")
-                    h["pending"] += chunk
-                    # decode what is safely decodable; keep a partial tail
-                    try:
-                        text = h["pending"].decode("utf-8")
-                        h["pending"] = b""
-                    except UnicodeDecodeError as ude:
-                        # keep the incomplete trailing sequence for next time
-                        keep = ude.start if 0 < ude.start < len(h["pending"]) else len(h["pending"]) - 4
-                        text = h["pending"][:max(0, keep)].decode("utf-8", errors="replace")
-                        h["pending"] = h["pending"][max(0, keep):]
-                    h["buf"] += text
-            except BlockingIOError:
-                pass                    # live process, no more data right now
-            finally:
-                os.set_blocking(fd, True)
-            if len(h["buf"]) > LOG_BUF_CAP:
-                dropped = len(h["buf"]) - LOG_BUF_CAP
-                h["buf"] = h["buf"][-LOG_BUF_CAP:]
-                h["dropped"] = h.get("dropped", 0) + dropped
-        except Exception:
-            pass
-        lines = h["buf"].splitlines()
-        body = "\n".join(lines[-tail:]) if lines else "(no output yet)"
-        note = ""
-        if h.get("dropped"):
-            note = (f"\n[{h['dropped']:,} older bytes dropped from the in-memory tail — "
-                    f"the process output itself was consumed, not lost; redirect to a file "
-                    f"or read fewer lines if you need it all]")
-        return f"--- {handle} logs (last {min(tail, len(lines))} of {len(lines)} lines) ---\n{body}{note}", {}
-    return f"error: unknown action '{action}'", {}
+        return f"error: unknown process {handle}; the process runtime may have restarted", {"status": "failed"}
+    proc = h['proc']
+    if action == 'kill':
+        _stop_process(proc)
+        return f"{handle} stopped", {"status": "succeeded"}
+    if action == 'status':
+        code = proc.poll()
+        return f"{handle}: {'running' if code is None else f'exited({code})'} pid={proc.pid}", {"exit_code": code, "status": "running" if code is None else "succeeded" if code == 0 else "failed"}
+    if action == 'logs':
+        path = h['log']
+        with path.open('rb') as f:
+            f.seek(max(0, path.stat().st_size - LOG_BUF_CAP))
+            text = f.read(LOG_BUF_CAP).decode('utf-8', errors='replace')
+        return "\n".join(text.splitlines()[-max(1,min(int(tail),1000)):]) + f"\n[full output: {path}]", {}
+    return "error: action must be status, logs or kill", {"status": "failed"}
 
 
 # ---- fetch ------------------------------------------------------------------
@@ -634,8 +622,11 @@ def tool_fetch(url: str, max_chars: int = 12000, cache: dict | None = None) -> t
 
 
 def tool_memory(session, cwd: str, action: str, pattern: str = "",
-                path: str = "", text: str = "", topic: str = "general") -> tuple[str, dict]:
+                path: str = "", text: str = "", topic: str = "general", key: str = "") -> tuple[str, dict]:
     """Project-scoped, query-only memory (kern.memory.MemoryTree)."""
+    if action == 'history':
+        from .context import history
+        return history(session, pattern), {}
     from kern.memory import MemoryTree
     try:
         tree = MemoryTree(cwd)
@@ -654,7 +645,9 @@ def tool_memory(session, cwd: str, action: str, pattern: str = "",
         if action == "remember":
             if not text:
                 return "error: remember needs text", {}
-            return tree.remember(text, topic=topic or "general", sid=sid), {}
+            event = next((e['n'] for e in reversed(session.events if session else []) if e['kind']=='action' and e.get('name')=='memory'),None)
+            source = f'session:{sid}:event:{event}:model-note' if event is not None else f'session:{sid}:model-note'
+            return tree.remember(text, topic=topic or "general", sid=sid, key=key, source=source), {}
         if action == "write":
             if not path or text is None:
                 return "error: write needs path and text", {}
@@ -670,120 +663,70 @@ def tool_memory(session, cwd: str, action: str, pattern: str = "",
         return f"error: {type(e).__name__}: {e}", {}
 
 
-_PY_TLS = threading.local()   # per-thread capture routing
-
-
-class _RoutedStream:
-    """sys.stdout/stderr proxy: the py worker thread writes to its capture
-    buffer; every OTHER thread (engine, TUI, main) writes to the real stream.
-    Fixes the process-wide redirect leak: a timed-out py call used to leave
-    sys.stdout pointing at a dead buffer, silencing the entire app."""
-
-    def __init__(self, real, attr: str):
-        self._real = real
-        self._attr = attr
-
-    def write(self, s):
-        buf = getattr(_PY_TLS, self._attr, None)
-        if buf is not None:
-            buf.write(s)
-        else:
-            self._real.write(s)
-        return len(s)
-
-    def flush(self):
-        buf = getattr(_PY_TLS, self._attr, None)
-        if buf is None:
-            self._real.flush()
-
-    def __getattr__(self, item):
-        return getattr(self._real, item)
-
-
-_PY_ROUTER_INSTALLED = False
-
-
-def _install_py_router():
-    """Install the thread-routing proxies ONCE per process. Idempotent."""
-    global _PY_ROUTER_INSTALLED
-    if _PY_ROUTER_INSTALLED:
-        return
-    sys.stdout = _RoutedStream(sys.stdout, "buf")
-    sys.stderr = _RoutedStream(sys.stderr, "err")
-    _PY_ROUTER_INSTALLED = True
-
-
-def tool_py(session, code: str, timeout: int = 60) -> tuple[str, dict]:
-    """Persistent Python REPL: state lives on the session object, survives
-    across calls within this engine's lifetime, dies with the process.
-    Bounded: daemon thread + join(timeout) so a hung call can't freeze the
-    engine or block process exit; output routed per-thread (a leaked timed-out
-    thread can NOT silence the app); output capped head+tail. NOT a security
-    sandbox — same trust level as exec()."""
-    import io, traceback
-    ns = getattr(session, "_py_ns", None)
-    if ns is None:
-        ns = {}
-        session._py_ns = ns
-    if not (code or "").strip():
-        names = sorted(k for k in ns if not k.startswith("_"))
-        return ("fresh call with code. Names in the interpreter: "
-                + (", ".join(names[:40]) if names else "(none yet)")), {}
-    timeout = max(1, min(int(timeout or 60), 300))
-    buf_out, buf_err = io.StringIO(), io.StringIO()
-    _install_py_router()
-
-    def run():
-        _PY_TLS.buf = buf_out
-        _PY_TLS.err = buf_err
-        try:
-            exec(compile(code, "<py>", "exec"), ns)
-        except Exception:
-            traceback.print_exc(file=buf_err)
-        finally:
-            _PY_TLS.buf = None
-            _PY_TLS.err = None
-
-    t = threading.Thread(target=run, daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        return (f"error: py timed out after {timeout}s (thread leaked; interpreter state kept)"), {}
-    out = buf_out.getvalue()
-    err = buf_err.getvalue()
-    result = out + (("\n[stderr]\n" + err) if err.strip() else "")
-    if not result.strip():
-        result = "(no output — state kept for the next py() call)"
-    if len(result) > 8000:
-        result = result[:3800] + f"\n\n…[{len(result)-7600:,} chars elided]…\n\n" + result[-3800:]
-    return result, {}
-
+def tool_py(session, code: str, timeout: int = 60, *, _cancel=None) -> tuple[str, dict]:
+    proc = getattr(session, '_py_proc', None)
+    if proc is None or proc.poll() is not None:
+        kwargs = {"start_new_session": True} if os.name != "nt" else {
+            "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+        proc = subprocess.Popen([sys.executable, '-u', '-m', 'kern.repl_worker'],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True, encoding='utf-8', **kwargs)
+        session._py_proc = proc
+        _PY_PROCS.add(proc)
+    proc.stdin.write(json.dumps({'code': code}) + '\n')
+    proc.stdin.flush()
+    import queue
+    result = queue.Queue()
+    def receive():
+        result.put(proc.stdout.readline())
+    reader = threading.Thread(target=receive, daemon=True)
+    reader.start()
+    try:
+        deadline = time.monotonic() + max(1, min(int(timeout),300))
+        while True:
+            if time.monotonic() >= deadline or (_cancel is not None and _cancel.is_set()):
+                raise queue.Empty
+            try:
+                raw = result.get(timeout=.1)
+                break
+            except queue.Empty:
+                pass
+    except queue.Empty:
+        _stop_process(proc)
+        reader.join(5)
+        session._py_proc = None
+        reason = 'interrupted' if _cancel is not None and _cancel.is_set() else 'timeout'
+        return f'error: py {reason}; interpreter stopped and state reset; partial effects possible', {"status": "uncertain"}
+    if not raw:
+        session._py_proc = None
+        return 'error: Python interpreter exited; state reset', {"status": "uncertain"}
+    data = json.loads(raw)
+    return data['text'], {"status": data['status']}
 
 
 def cleanup_procs() -> int:
-    """Terminate any lingering background processes. Returns count killed."""
-    killed = 0
-    for hid, h in list(PROCS.items()):
-        proc = h.get("proc")
-        if proc and proc.poll() is None:
-            try:
-                import signal
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                killed += 1
-            except Exception:
-                try:
-                    proc.kill()
-                    killed += 1
-                except Exception:
-                    pass
+    count = 0
+    for h in list(PROCS.values()):
+        if h['proc'].poll() is None:
+            _stop_process(h['proc'])
+            count += 1
     PROCS.clear()
-    return killed
+    for proc in list(_PY_PROCS):
+        if proc.poll() is None:
+            _stop_process(proc)
+            count += 1
+    _PY_PROCS.clear()
+    return count
+
 
 import atexit
 atexit.register(cleanup_procs)
 
 
 def tool_todo(items: list[dict]) -> tuple[str, dict]:
+    if not isinstance(items, list) or any(not isinstance(i, dict) or not isinstance(i.get("text"), str)
+            or i.get("status") not in ("pending", "active", "done", "blocked") for i in items):
+        return 'error: items must contain text and status pending|active|done|blocked', {"status": "failed"}
     n = len(items)
     done = sum(1 for i in items if i.get("status") == "done")
     return f"todo updated: {done}/{n} done", {"todo": items}
@@ -791,20 +734,20 @@ def tool_todo(items: list[dict]) -> tuple[str, dict]:
 
 def preview_write(fs: FS, path: str, content: str) -> str:
     p = fs.resolve(path)
-    old = p.read_text(errors="replace") if p.exists() else ""
+    old = p.read_text(encoding="utf-8", errors="strict") if p.exists() else ""
     return _unified_diff(p, old, content)
 
 
 def preview_edit(fs: FS, path: str, old_str: str, new_str: str) -> str:
     p = fs.resolve(path)
-    if not p.exists() or p.read_text(errors="replace").count(old_str) != 1:
+    if not p.exists() or p.read_text(encoding="utf-8", errors="strict").count(old_str) != 1:
         return ""
-    src = p.read_text(errors="replace")
+    src = p.read_text(encoding="utf-8", errors="strict")
     return _unified_diff(p, src, src.replace(old_str, new_str, 1))
 
 
 def _py_compile(p: Path) -> tuple[bool, str]:
-    r = subprocess.run(["python3", "-m", "py_compile", str(p)],
+    r = subprocess.run([sys.executable, "-m", "py_compile", str(p)],
                        capture_output=True, text=True, timeout=30)
     return r.returncode == 0, r.stderr.strip()
 
@@ -857,46 +800,27 @@ def is_safe_readonly(cmd: str) -> bool:
     """True when every pipeline/chain segment is a known read-only command and
     the command contains no redirection, substitution, or chaining into
     mutating actions. Used to auto-approve harmless inspection commands."""
-    s = cmd.strip()
-    if not s:
+    import shlex
+    if os.name == 'nt':
+        # PowerShell's evaluation/alias rules differ from POSIX; no heuristic bypass.
         return False
-    if any(tok in s for tok in _DANGER_TOKENS):
+    if any(c in cmd for c in (';', '&', '|', '$', '`', '>', '<', '\n', '\r')):
         return False
-    # Split on every shell sequence/chain operator: pipes, logical, semicolons, newlines
-    segments = re.split(r"\|\||&&|[|;\n]", s)
-    for seg in segments:
-        seg = seg.strip()
-        if not seg:
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = parts[0]
+    if name not in {'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'rg', 'git'}:
+        return False
+    if name == 'rg':
+        return not any(a.startswith(('--pre', '--hostname-bin', '--search-zip')) for a in parts[1:])
+    if name == 'git':
+        if len(parts) < 2 or parts[1] not in {'status', 'ls-files', 'rev-parse'}:
             return False
-        parts = seg.split()
-        cmd0 = parts[0].rsplit("/", 1)[-1]
-        if cmd0 not in _SAFE_CMDS:
-            return False
-        if any(p in _MUTATING_FLAGS for p in parts[1:]):
-            return False
-        if cmd0 == "git":
-            if len(parts) == 1:
-                return False
-            sub = parts[1]
-            if sub in _MUTATING_GIT_SUBS:
-                # listing forms only: bare "git branch", "git tag --list",
-                # "git stash list", "git remote -v"
-                ok = _GIT_LISTING_OK.get(sub, set())
-                rest = parts[2:]
-                if any(a.startswith("-") for a in rest) and \
-                   not all(a in ok for a in rest if a.startswith("-")):
-                    return False
-                if any(not a.startswith("-") and a not in ok for a in rest):
-                    return False      # a name argument creates/moves something
-                continue
-            if not any(sub.startswith(g) for g in _SAFE_GIT):
-                return False
-            # Disallow destructive flags like branch -D, tag -d. Compare the
-            # flag NAME too so "--output=/path" is caught like "--output".
-            if any(p in _MUTATING_GIT_FLAGS or
-                   p.split("=", 1)[0] in _MUTATING_GIT_FLAGS
-                   for p in parts[1:]):
-                return False
+        return not any(a.startswith(('--output', '--config', '--exec', '-c')) for a in parts[2:])
     return True
 
 
