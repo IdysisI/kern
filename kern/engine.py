@@ -83,6 +83,17 @@ _READ_ONLY_MEMORY_ACTIONS = {"search", "read", "reconcile", "outline", "history"
 _READ_ONLY_SUBAGENT_ACTIONS = {"status", "logs", "wait"}
 
 
+def _looks_like_error(text) -> bool:
+    """Result verification (P6): detect a subagent 'result' that is really an error
+    string (e.g. a 502 surfaced as the final reply) rather than real work. Module-level
+    so it is unit-testable."""
+    if not text or not str(text).strip():
+        return True
+    head = str(text).strip()[:160].lower()
+    return (head.startswith("[error") or "stage=transport" in head
+            or head.startswith("error:") or "http status=5" in head)
+
+
 def _is_read_only(name: str, args: dict) -> bool:
     """True for ops with no side effects. Used to (a) exempt them from replay
     warnings and (b) let the circuit breaker treat a *diverse* read run as progress."""
@@ -501,23 +512,60 @@ class Engine:
 
         sem = _get_subagent_semaphore()
 
+        async def _salvage_artifacts() -> tuple[str, list[str]]:
+            """Collect the child's durable work (scratch files, journal steps) so a
+            crash mid-report never reduces 15 minutes of work to an error string (F2).
+            Returns (salvaged_text, [artifact_paths])."""
+            artifacts: list[str] = []
+            try:
+                scratch = child_session.scratch
+                if scratch.exists():
+                    for p in sorted(scratch.rglob("*")):
+                        if p.is_file() and not p.name.startswith(f"{hid}_"):
+                            artifacts.append(str(p))
+            except Exception:
+                pass
+            parts: list[str] = []
+            if artifacts:
+                parts.append("## Salvaged artifacts (recovered after the run did not "
+                             "produce a clean final report)\n")
+                for a in artifacts:
+                    try:
+                        body = Path(a).read_text(errors="replace")
+                        parts.append(f"### `{a}`\n\n{body}\n")
+                    except Exception:
+                        parts.append(f"### `{a}` (unreadable)\n")
+            return "\n".join(parts), artifacts
+
         async def run_subagent():
             async with sem:
                 try:
                     reply = await child_engine.chat(prompt, max_steps=steps_cap)
                     entry["completed"] = True
+                    # Verify the result is real before accepting it (P6). A 502 mid-
+                    # generation must not become the deliverable — salvage instead (F2).
+                    if _looks_like_error(reply):
+                        salvaged, artifacts = await _salvage_artifacts()
+                        if salvaged.strip():
+                            reply = (f"⚠ subagent ended without a clean final report "
+                                     f"(last output looked like an error). Salvaged work:\n\n"
+                                     f"{salvaged}")
+                            entry["salvaged"] = True
+                        entry["error"] = reply.strip()[:200]
                     entry["result"] = reply
                     report_file = self.session.scratch / f"{hid}_report.md"
                     self.session.scratch.mkdir(parents=True, exist_ok=True)
                     report_file.write_text(
                         f"# Subagent Report ({hid})\nTask: {task}\nModel: {self.model}\n"
-                        f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n{reply}"
+                        f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        f"Requests: {child_engine.requests}\n\n{reply}"
                     )
                     entry["report_path"] = str(report_file)
                     self.session.emit("subagent_finish", handle=hid, result=reply,
-                                      report_path=str(report_file), error=None,
+                                      report_path=str(report_file), error=entry.get("error"),
                                       requests=child_engine.requests)
-                    self.stream_cb("note", f"✓ subagent {hid} finished ({child_engine.requests} requests) -> report saved to {report_file}")
+                    tag = " (salvaged)" if entry.get("salvaged") else ""
+                    self.stream_cb("note", f"✓ subagent {hid} finished{tag} ({child_engine.requests} requests) -> report saved to {report_file}")
                     return reply
                 except asyncio.CancelledError:
                     entry["completed"] = True
@@ -529,10 +577,27 @@ class Engine:
                 except Exception as e:
                     entry["completed"] = True
                     entry["error"] = str(e)
+                    # Salvage whatever the child produced before dying (F2) so a
+                    # raised exception doesn't erase real work.
+                    salvaged, artifacts = await _salvage_artifacts()
+                    report_file = None
+                    if salvaged.strip():
+                        report_file = self.session.scratch / f"{hid}_report.md"
+                        try:
+                            self.session.scratch.mkdir(parents=True, exist_ok=True)
+                            report_file.write_text(
+                                f"# Subagent Report ({hid}) — SALVAGED AFTER ERROR\n"
+                                f"Task: {task}\nError: {e}\n"
+                                f"Requests: {child_engine.requests}\n\n{salvaged}")
+                            entry["report_path"] = str(report_file)
+                            entry["salvaged"] = True
+                        except Exception:
+                            report_file = None
                     self.session.emit("subagent_finish", handle=hid, result=None,
-                                      report_path=None, error=str(e),
-                                      requests=child_engine.requests)
-                    self.stream_cb("note", f"⚠ subagent {hid} failed: {e}")
+                                      report_path=str(report_file) if report_file else None,
+                                      error=str(e), requests=child_engine.requests)
+                    salv = f" (salvaged {len(artifacts)} artifact(s) -> {report_file})" if report_file else ""
+                    self.stream_cb("note", f"⚠ subagent {hid} failed: {e}{salv}")
 
         if background:
             task_obj = asyncio.create_task(run_subagent())
