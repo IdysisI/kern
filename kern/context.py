@@ -4,10 +4,12 @@ Episodes cover exact disjoint event spans. A summary is a navigation aid; the
 journal and structured receipts remain authoritative and searchable.
 """
 from __future__ import annotations
+import asyncio
 import json
 import os
 import re
 import hashlib
+import time as _time
 from .storage import atomic_write
 
 
@@ -131,7 +133,11 @@ class ContextManager:
             raise ValueError('KERN_CONTEXT_WINDOW must be at least 2048 for the tool harness')
         reserve = min(default_max_output_tokens(e.model), window // 3) + 1024
         available = max(1024, window - reserve)
-        target = min(int(os.environ.get('KERN_CONTEXT_TARGET', 16000)), available)
+        env_target = os.environ.get('KERN_CONTEXT_TARGET')
+        if env_target:
+            target = min(int(env_target), available)
+        else:
+            target = min(max(1024, available - 2048), max(16000, available * 3 // 4))
         view = pager.materialize(e.session.events, e.session)
         size = estimate(view, system, tools)
         # Maintenance is incremental and occurs at completed exchange boundaries,
@@ -139,13 +145,25 @@ class ContextManager:
         episodes = [x for x in e.session.events if x['kind'] == 'episode']
         cutoff = max((x['end'] for x in episodes), default=0)
         groups = [x['n'] for x in e.session.events if x['kind'] == 'assistant' and x['n'] >= cutoff]
-        if len(groups) > 4 and (size > target or len(groups) >= 12):
-            end = groups[-3]
+        # Step-count fallback scales with the window: tiny contexts fold early to
+        # stay incremental; large contexts must not amputate working memory every
+        # dozen steps (that reset loop is what made agents re-read the same files).
+        step_trigger = max(12, available // 2048)
+        if len(groups) > 4 and (size > target or len(groups) >= step_trigger):
+            keep = max(4, min(6, len(groups) // 3))
+            end = groups[-keep]
             span = [x for x in e.session.events if cutoff <= x['n'] < end and x['kind'] != 'episode']
             if span:
-                await self.fold(span, cutoff, end)
-                view = pager.materialize(e.session.events, e.session)
-                size = estimate(view, system, tools)
+                # Compaction must never stall the agent. Run it in the background:
+                # the current turn proceeds with the un-compacted (but still
+                # materialized) view, and the folded episode is visible next turn.
+                self._schedule_fold(span, cutoff, end)
+                if size > available:
+                    # Only block when we genuinely cannot proceed: fold inline but
+                    # still under the hard time budget so it stays seconds, not minutes.
+                    await self.fold(span, cutoff, end)
+                    view = pager.materialize(e.session.events, e.session)
+                    size = estimate(view, system, tools)
         e.context_stats = {'estimated_tokens': size, 'context_length': window,
                            'available_input': available, 'target': target, 'estimate': True}
         if size > available:
@@ -153,6 +171,34 @@ class ContextManager:
                                'Use memory history/artifact slices or configure the verified model context window.')
         e.output_budget = min(default_max_output_tokens(e.model), max(256, window-size-1024))
         return view
+
+    def _schedule_fold(self, span, start, end):
+        """Run compaction as a background task so it never stalls the agent.
+
+        A single fold runs at a time; if one is already in flight we skip (the
+        next turn will retry with a fresh cutoff). Errors are surfaced as a
+        stream note, never raised into the turn loop.
+        """
+        task = getattr(self, '_fold_task', None)
+        if task is not None and not task.done():
+            return  # a fold is already running; don't pile up
+        import asyncio as _a
+        try:
+            loop = _a.get_running_loop()
+        except RuntimeError:
+            return  # no running loop (shouldn't happen under the engine)
+
+        async def _run():
+            try:
+                await self.fold(span, start, end)
+            except Exception as err:  # never let compaction kill the agent
+                try:
+                    self.engine.stream_cb('summary',
+                        f'⟳ compaction failed safely (raw span kept): {str(err)[:160]}')
+                except Exception:
+                    pass
+
+        self._fold_task = loop.create_task(_run())
 
     async def fold(self, span, start, end):
         e = self.engine
@@ -192,8 +238,24 @@ class ContextManager:
             length += n
         if batch:
             batches.append(batch)
-        summaries = []
-        for batch in batches:
+        summaries = [None] * len(batches)
+        total = len(batches)
+        # Hard wall-clock budget: compaction must be seconds, not minutes.
+        # Past this we stop calling the model and keep deterministic source indexes.
+        fold_budget = float(os.environ.get('KERN_FOLD_BUDGET', '60'))
+        fold_concurrency = max(1, int(os.environ.get('KERN_FOLD_CONCURRENCY', '8')))
+        deadline = _time.monotonic() + fold_budget
+        llm_done = 0
+
+        if total:
+            e.stream_cb('summary', f'⟳ compacting {end - start} events '
+                        f'({total} chunk{"s" if total > 1 else ""})…')
+
+        async def _fold_one(bi, batch):
+            nonlocal llm_done
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                return
             prompt = ('Summarize this exact historical episode as JSON with string fields '
                       'intent, decisions, completed, pending, constraints. Use an empty string for no items. Include concrete identifiers '
                       'and uncertainties. Tool receipts outrank assistant claims. Do not invent outcomes. '
@@ -202,22 +264,37 @@ class ContextManager:
             try:
                 if estimate([{'role':'user','text':prompt}]) > window-output_budget-512:
                     raise ValueError('summary batch exceeds verified context; source index retained')
-                async for chunk in e.client.stream_chat(e.model, [{'role':'user','text':prompt}],
-                        system='You create attributed navigation notes for an agent journal. Output only JSON.',
-                        tools=None, max_tokens=output_budget):
-                    if chunk.kind == 'text':
-                        answer += chunk.text
-                    elif chunk.kind == 'error':
-                        raise RuntimeError(chunk.error)
-                    elif chunk.kind == 'usage':
-                        e.usage_in += chunk.usage.get('prompt_tokens',chunk.usage.get('input_tokens',0))
-                        e.usage_out += chunk.usage.get('completion_tokens',chunk.usage.get('output_tokens',0))
+                async with asyncio.timeout(remaining):
+                    async for chunk in e.client.stream_chat(e.model, [{'role':'user','text':prompt}],
+                            system='You create attributed navigation notes for an agent journal. Output only JSON.',
+                            tools=None, max_tokens=output_budget):
+                        if chunk.kind == 'text':
+                            answer += chunk.text
+                        elif chunk.kind == 'error':
+                            raise RuntimeError(chunk.error)
+                        elif chunk.kind == 'usage':
+                            e.usage_in += chunk.usage.get('prompt_tokens',chunk.usage.get('input_tokens',0))
+                            e.usage_out += chunk.usage.get('completion_tokens',chunk.usage.get('output_tokens',0))
                 data = json.loads(answer.strip().removeprefix('```json').removesuffix('```').strip())
-                summaries.append(summary_fields(data))
+                summaries[bi] = summary_fields(data)
+                llm_done += 1
             except Exception as err:
                 # Safe fallback is an explicit source index, not a fabricated summary.
-                summaries.append({'unverified_index': [f"{x['n']} {x['kind']}: {str(x.get('text',''))[:240]}" for x in batch],
-                                  'summary_error': str(err)[:200]})
+                summaries[bi] = {'unverified_index': [f"{x['n']} {x['kind']}: {str(x.get('text',''))[:240]}" for x in batch],
+                                  'summary_error': str(err)[:200]}
+            e.stream_cb('summary', f'⟳ compacting… {min(llm_done, total)}/{total} chunks')
+
+        sem = asyncio.Semaphore(fold_concurrency)
+        async def _guarded(bi, batch):
+            async with sem:
+                await _fold_one(bi, batch)
+        await asyncio.gather(*[_guarded(i, b) for i, b in enumerate(batches)])
+        summaries = [s for s in summaries if s is not None]
+        degraded = llm_done < total
+
         text = json.dumps(summaries, ensure_ascii=False)
         e.session.emit('episode', start=start, end=end, source=str(source), text=text)
-        e.stream_cb('summary', f'Episode {start}–{end}: attributed navigation notes; original: {source}\n{text}')
+        done_note = f'Episode {start}–{end}: attributed navigation notes ({llm_done}/{total} chunks summarized); original: {source}\n{text}'
+        if degraded:
+            done_note = f'[degraded: budget {fold_budget:.0f}s reached] ' + done_note
+        e.stream_cb('summary', done_note)

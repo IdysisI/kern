@@ -62,7 +62,6 @@ QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 5px; min-hei
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 """
 
-PYGMENTS_CSS = ""  # filled at runtime
 
 _md = mistune.create_markdown(plugins=["strikethrough", "table", "task_lists"])
 

@@ -60,7 +60,8 @@ async def test_web_http_origin_session(tmp_path, monkeypatch):
         port=server.sockets[0].getsockname()[1]
         async with httpx.AsyncClient() as client:
             page=await client.get(f'http://127.0.0.1:{port}/')
-            assert page.status_code==200 and 'Espace de travail' in page.text
+            # Structural marker, not copy text: the UI served is the real app shell
+            assert page.status_code==200 and 'id="messages"' in page.text and 'id="composer"' in page.text
             assert 'frame-ancestors' in page.headers['content-security-policy']
             assert (await client.get(f'http://127.0.0.1:{port}/app.js')).status_code==200
             evil=await client.get(f'http://127.0.0.1:{port}/',headers={'Origin':'https://evil.invalid'})

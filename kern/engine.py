@@ -27,6 +27,7 @@ from .client import Client, health_of, invalidate_health
 from .journal import Session, create_session
 from . import linker
 from .linker import CapabilityIndex, MCPClient, MountTable
+from .debuglog import dbg as _dbg, dbg_exc as _dbg_exc
 
 
 def _parse_xml_invoke(text: str) -> list[dict]:
@@ -110,6 +111,47 @@ def _is_read_only(name: str, args: dict) -> bool:
     return False
 
 
+# File-path-ish literals a model might open() / read / cat inside a py/exec payload.
+_PY_PATH_RE = re.compile(r"""(?:open|read_text|read_bytes|Path|cat|head|tail|less)\s*\(?\s*['"]([^'"]+)['"]""")
+_SH_TARGET_RE = re.compile(r"""(?:^|[\s|>&])(?:cat|head|tail|less|grep|rg|sed|awk|file|stat|wc|ls|diff)\s+(?:-\S+\s+)*['"]?([^\s'";|&>]+)""")
+
+
+def _inspection_target(name: str, args: dict) -> str:
+    """Extract the *thing being looked at* for typed loop detection. The typed breaker
+    (F1) only works if each tool reports its real target; a tool whose payload we can't
+    see (py/exec) must NOT collapse to a shared '' key, or every distinct file-read
+    counts as revisiting the same target and 20 reads of DIFFERENT files trip the
+    breaker — exactly the Gemini regression.
+
+    Priority: explicit target args > a file path extracted from a py/exec payload >
+    a digest of the payload (so re-running the IDENTICAL code still counts as the same
+    target, but DIFFERENT code is correctly seen as distinct exploration)."""
+    for k in ("path", "url", "query", "handle"):
+        v = args.get(k)
+        if v:
+            return str(v)
+    if name == "exec":
+        cmd = str(args.get("cmd", ""))
+        m = _SH_TARGET_RE.search(cmd)
+        if m:
+            return m.group(1)
+        # no obvious file target: fall back to the whole command so identical reruns
+        # count as the same target, different commands as distinct
+        return "cmd:" + cmd.strip()[:200]
+    if name == "py":
+        code = str(args.get("code", ""))
+        m = _PY_PATH_RE.search(code)
+        if m:
+            return m.group(1)
+        # no file literal: a digest of the code distinguishes distinct snippets while
+        # keeping identical reruns on the same key
+        import hashlib
+        return "code:" + hashlib.sha1(code.encode()).hexdigest()[:16]
+    if name == "memory":
+        return f"mem:{args.get('action')}:{args.get('pattern') or args.get('path') or args.get('key') or ''}"
+    return ""
+
+
 def _step_is_progress(name: str, args: dict) -> bool:
     """True when a call changes user-visible state, advances the plan, or delegates.
     Observation calls (read/fetch/proc, read-only exec/py) return False."""
@@ -191,6 +233,13 @@ class Engine:
         self._inspection_targets: dict[str, int] = {}
         self._consecutive_inspections: int = 0
         self._run_targets: set = set()   # distinct targets seen in current read-run (typed breaker)
+        self._last_inspection_target: str | None = None  # most recent inspection target (breaker diagnostics)
+        # In-turn read-only dedup cache: (tool, canonical args) -> (result, meta).
+        # An identical successful read-only call returns the cached result instead of
+        # re-executing, so a model that re-reads a file it already has pays ~zero for it.
+        # Any successful mutating call (write/edit/exec/py side effect) clears it, because
+        # the on-disk/on-system truth may have changed.
+        self._ro_cache: dict = {}
         self.subagents: dict[str, dict] = runtime["subagents"]
         self._approve_lock = asyncio.Lock()
         if not self.subagents:
@@ -214,15 +263,13 @@ class Engine:
             lines.append(f"{name} (mcp): MOUNTED")
         sys_text = kernel.system_prompt(self.cwd, self.model,
                                         time.strftime("%Y-%m-%d"), git, lines)
+        # Mounted skills are listed by name only — the body was already delivered once
+        # in the mount note (journal) and the source file is on disk. Re-injecting the
+        # full body into the system prompt every turn is pure bloat (up to ~2.5k tokens
+        # per skill per turn) and shifts the prompt on mount, invalidating the cached
+        # prefix. A one-line pointer keeps the cached prefix stable and the prompt lean.
         for name, ref in self.mounts.skills.items():
-            try:
-                body = Path(ref).read_text(encoding='utf-8')
-                sys_text += f"\n<mounted-skill name={name!r} source={ref!r}>\n" + body[:10000]
-                if len(body)>10000:
-                    sys_text += '\n[Skill continues in source file. Read its remaining instructions before applying this skill.]'
-                sys_text += '\n</mounted-skill>'
-            except OSError as err:
-                sys_text += f"\nSkill {name} unavailable: {err}"
+            sys_text += f"\n<mounted-skill name={name!r} source={ref!r}>instructions in the mount note and at {ref}</mounted-skill>"
         return sys_text + "\nPython interpreter: " + sys.executable
 
     def _tools(self, include_fenced: bool = False) -> list[dict] | None:
@@ -348,7 +395,12 @@ class Engine:
                 self.session.emit("mount", action="mount", cap_kind="skill",
                                   name=name, ref=cap.ref, temporary=action == 'mount-once')
                 body = Path(cap.ref).read_text(encoding='utf-8', errors="replace")[:6000]
-                notes.append(f"mounted skill '{name}'. Instructions follow:\n{body}")
+                total = Path(cap.ref).stat().st_size
+                note = f"mounted skill '{name}'. Instructions follow:\n{body}"
+                if total > 6000:
+                    note += (f"\n[Skill file is {total} bytes; only the first 6000 shown. "
+                             f"Read the full instructions at {cap.ref} before applying this skill.]")
+                notes.append(note)
             else:
                 cfg = json.loads(linker.MCP_CONFIG.read_text(encoding='utf-8'))[name]
                 client = MCPClient(cfg["command"], env=cfg.get("env"), cwd=cfg.get("cwd"))
@@ -473,6 +525,32 @@ class Engine:
                 self.stream_cb("note", f"[{hid}] {text}")
             elif kind == "tool":
                 self.stream_cb("note", f"[{hid} tool] {text[:80]}")
+                child_state["last"] = time.monotonic()
+                child_state["label"] = text[:60]
+            elif kind == "thinking":
+                # Throttled heartbeat so a long-thinking subagent still shows life.
+                child_state["thinking"] = child_state.get("thinking", 0) + len(text)
+            elif kind == "text":
+                child_state["text"] = child_state.get("text", 0) + len(text)
+
+        # Periodic liveness: surface what the subagent is doing even when it emits
+        # no note/tool events (e.g. long model thinking), so the TUI never looks dead.
+        child_state: dict = {"last": time.monotonic(), "label": "", "thinking": 0, "text": 0}
+
+        async def _heartbeat():
+            while not child_state.get("done"):
+                await asyncio.sleep(15)
+                if child_state.get("done"):
+                    break
+                bits = []
+                if child_state.get("thinking"):
+                    bits.append(f"thinking {child_state['thinking']} chars")
+                if child_state.get("text"):
+                    bits.append(f"drafting {child_state['text']} chars")
+                if child_state.get("label"):
+                    bits.append(f"last: {child_state['label']}")
+                detail = ", ".join(bits) if bits else "working"
+                self.stream_cb("note", f"[{hid}] … {detail}")
 
         # Approvals serialization: avoid concurrent modal collisions in TUI
         async def child_approve(desc: str, diff: str | None = None) -> bool:
@@ -538,6 +616,14 @@ class Engine:
             return "\n".join(parts), artifacts
 
         async def run_subagent():
+            hb = asyncio.create_task(_heartbeat())
+            try:
+                return await _run_subagent_body()
+            finally:
+                child_state["done"] = True
+                hb.cancel()
+
+        async def _run_subagent_body():
             async with sem:
                 try:
                     reply = await child_engine.chat(prompt, max_steps=steps_cap)
@@ -705,6 +791,10 @@ class Engine:
         reason = "done"
         self.stop_reason = "done"
         self._completion_reviews = 0
+        # Dedup is strictly per-turn: a fresh turn starts with an empty read-only cache,
+        # so the model always re-reads the live truth on a new turn (files may have changed
+        # between turns via other sessions, the user, git, etc.).
+        self._ro_cache.clear()
         try:
             reply = await self._loop(max_steps=max_steps)
             reason = self.stop_reason
@@ -826,7 +916,7 @@ class Engine:
                         self.stream_cb("thinking", ev.text)
                     elif ev.kind == "finish" and ev.text == "length":
                         truncated = True
-                        self.stream_cb("note", "⚠ Le modèle a atteint sa limite de tokens de sortie (max_tokens).")
+                        self.stream_cb("note", "⚠ The model hit its output token limit (max_tokens).")
                     elif ev.kind == "text":
                         text_parts.append(ev.text)
                         self.tokens_streamed += max(1, len(ev.text) // 4)
@@ -941,7 +1031,7 @@ class Engine:
                     continue
                 self._nudged_empty = False
                 if truncated and not display:
-                    msg = "⚠ Le modèle a atteint sa limite de tokens de sortie (max_tokens) pendant son raisonnement."
+                    msg = "⚠ The model hit its output token limit (max_tokens) during its reasoning."
                     self.session.emit("note", text=msg)
                     return msg
                 if not error and not truncated:
@@ -999,13 +1089,47 @@ class Engine:
                         ok = await ok
                 if not ok:
                     text, meta = "denied by user", {"status": "denied"}
+                    ro_key = None
                 else:
+                    # In-turn read-only dedup: an identical successful read-only call this
+                    # turn returns the cached result instead of re-executing. A redundant
+                    # re-read is then ~free, so a weak model that re-reads a file it already
+                    # holds stops burning a billed call on it. Any successful mutating call
+                    # (write/edit/exec/py side effect) clears the cache — see below.
+                    ro_key = None
+                    if _is_read_only(name, args):
+                        try:
+                            ro_key = (name, json.dumps(args, sort_keys=True, default=str))
+                        except (TypeError, ValueError):
+                            ro_key = None
+                        if ro_key is not None and ro_key in self._ro_cache:
+                            text, meta = self._ro_cache[ro_key]
+                            _dbg(self.session, "dedup.hit", tool=name, target=str(_inspection_target(name, args))[:60])
+                            text = (str(text) + "\n\n[harness: identical call already ran this turn — "
+                                               "returning the cached result. You already have this; do not re-read it.]")
+                            # Same delivery path as a real result: journal + stream. The model
+                            # receives it on the next loop iteration via journal replay.
+                            self.session.emit("action", call_id=cid, name=name, arguments=args)
+                            self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
+                                              status="cached")
+                            self.stream_cb("result", str(text))
+                            continue
                     # Action receipt: record intent BEFORE the effect, so a
                     # crash mid-call leaves a dangling intent the pager can
                     # flag as "uncertain — verify before retry".
                     self.session.emit("action", call_id=cid, name=name, arguments=args)
                     text, meta = await self._safe_call(name, args)
                     text = syscalls.redact(str(text))
+                    # Cache / invalidate. A successful read-only call is cached; a successful
+                    # mutating call invalidates the whole cache (truth may have changed).
+                    _succeeded = meta.get("status") not in ("failed", "denied", "error") and not str(text).startswith(("error:", "denied"))
+                    if _succeeded:
+                        if ro_key is not None:
+                            self._ro_cache[ro_key] = (text, meta)
+                        elif not _is_read_only(name, args):
+                            if self._ro_cache:
+                                _dbg(self.session, "dedup.invalidate", tool=name, cleared=len(self._ro_cache))
+                            self._ro_cache.clear()
                 if prior is not None and not _is_read_only(name, args):
                     # Only warn for side-effecting repeats. Re-running a read-only
                     # status/log/read is harmless and must not be flagged (F3).
@@ -1025,35 +1149,73 @@ class Engine:
                 else:
                     self._consecutive_errors.clear()
 
+                _dbg(self.session, "action.result", step=attempt, tool=name,
+                     is_error=is_err, error_streak=len(self._consecutive_errors),
+                     result_head=str(text)[:160])
+
                 # Inspection loop sensor: typed progress, not a naive counter (F1).
                 # A run revisiting the SAME target is a stuck loop -> counts toward the
                 # breaker. A run touching a DISTINCT new target is exploration -> resets,
                 # so legitimate research (many different reads) is never killed.
+                tgt = None
+                novel = False
                 if _step_is_progress(name, args):
+                    _dbg(self.session, "breaker.progress_reset", step=attempt, tool=name,
+                         was_consecutive=self._consecutive_inspections)
                     self._consecutive_inspections = 0
                 else:
-                    tgt = str(args.get("path") or args.get("url") or args.get("cmd")
-                              or args.get("query") or args.get("handle") or "")
+                    tgt = _inspection_target(name, args)
                     novel = bool(tgt) and tgt not in self._run_targets
                     if novel:
                         self._run_targets.add(tgt)
                         self._consecutive_inspections = 1   # new line of inquiry (this one counts)
                     else:
                         self._consecutive_inspections += 1  # revisiting same target
+                    if tgt:
+                        self._last_inspection_target = tgt
 
-                if name == "read":
-                    read_path = str(args.get("path", ""))
-                    if read_path:
-                        self._inspection_targets[read_path] = self._inspection_targets.get(read_path, 0) + 1
-                        if self._inspection_targets[read_path] >= 4:
-                            text = (str(text) + f"\n\n[harness hint: '{read_path}' has been inspected "
-                                               f"{self._inspection_targets[read_path]} times in this session. "
-                                               "You have already inspected this file. Avoid repetitive reading: "
-                                               "synthesize your findings and proceed with implementation or next steps.]")
+                # Per-target repeat hint: same file/command inspected over and over.
+                # Uses _inspection_target so it works for read AND for py/exec that
+                # open files (Gemini reads everything via `py`, so a read-only check
+                # on the `read` tool alone misses the real loop).
+                if not _step_is_progress(name, args) and tgt:
+                    repeat_key = tgt
+                    self._inspection_targets[repeat_key] = self._inspection_targets.get(repeat_key, 0) + 1
+                    seen_n = self._inspection_targets[repeat_key]
+                    if seen_n == 3:
+                        text = (str(text) + f"\n\n[harness hint: you have now read '{repeat_key}' {seen_n} times. "
+                                           "You already have its contents. Do NOT re-read it — act on what you know: "
+                                           "make the edit with write()/edit(), or move to the next distinct file.]")
+                    elif seen_n >= 5:
+                        text = (str(text) + f"\n\n[harness WARNING: '{repeat_key}' read {seen_n} times with no edit. "
+                                           "This is a loop. STOP re-reading. Apply your planned change NOW via edit()/write(), "
+                                           "or if you are blocked, say so and ask the user.]")
 
-                if self._consecutive_inspections == 10:
-                    text = (str(text) + "\n\n[harness hint: 10 consecutive inspection operations without making changes or updating the plan. "
-                                       "Avoid over-inspecting: proceed with implementation using write() or edit(), or update the todo plan.]")
+                # Escalating ladder on consecutive inspection-without-progress.
+                # Each rung is MORE directive than the last and names a concrete next
+                # action, so a weak model is pushed toward acting instead of just being
+                # told it "looped". The breaker only hard-halts as a last resort.
+                ci = self._consecutive_inspections
+                if ci == 5:
+                    files = ", ".join(list(self._inspection_targets)[:6])
+                    text = (str(text) + f"\n\n[harness hint: 5 read-only steps with no file change yet. "
+                                       f"You have already read: {files}. "
+                                       "STOP reading and START editing — apply your planned change with write() or edit() now.]")
+                elif ci == 10:
+                    text = (str(text) + "\n\n[harness DIRECTIVE: 10 consecutive read-only steps and nothing written. "
+                                       "You are looping. Do NOT read another file. Pick the file that most needs the change "
+                                       "and edit() it in your NEXT action. If you genuinely cannot proceed, state the blocker "
+                                       "in plain text and stop.]")
+                elif ci == 15:
+                    text = (str(text) + "\n\n[harness FINAL WARNING: 15 read-only steps, zero edits. The circuit breaker "
+                                       "will halt this turn soon. Make one concrete edit() or write() immediately, or reply "
+                                       "with your findings as text — but do not read again.]")
+
+                _dbg(self.session, "breaker.tick", step=attempt, tool=name,
+                     target=tgt, novel=novel,
+                     consecutive=self._consecutive_inspections,
+                     consecutive_errors=self._consecutive_errors,
+                     distinct_targets=len(self._run_targets))
 
                 self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
                                    status=meta.get("status") or ("failed" if str(text).startswith(("error", "denied")) else "succeeded"),
@@ -1074,15 +1236,48 @@ class Engine:
                     raise asyncio.CancelledError
 
             # Circuit breaker: a whole step completed with only observation calls.
-            # Past the break threshold the turn is halted instead of looping forever;
-            # the model gets the journal back next turn and must answer, not probe.
+            # Past the break threshold the turn is halted instead of looping forever.
+            # Instead of returning an empty halt, give the model ONE forced chance to
+            # produce a useful answer from what it has already read — a weak model often
+            # *has* the information and just needs to be told to stop probing and speak.
             break_at = int(os.environ.get("KERN_INSPECTION_BREAK", "20"))
             if self._consecutive_inspections >= break_at:
+                _dbg(self.session, "breaker.fire", consecutive=self._consecutive_inspections,
+                     threshold=break_at, last_target=self._last_inspection_target,
+                     distinct_targets=len(self._run_targets),
+                     top_repeats=sorted(self._inspection_targets.items(), key=lambda kv: -kv[1])[:5])
                 note = (f"[kern circuit breaker: {self._consecutive_inspections} consecutive read-only steps "
-                        "with no file changes, plan updates or delegation — the turn was looping on inspection. "
-                        "Report your findings and act on the objective now, or ask the user for direction.]")
+                        "with no file changes, plan updates or delegation — the turn was looping on inspection.]")
                 self.session.emit("note", text=note)
                 self.stream_cb("note", note)
+                # Forced recovery: one final text-only directive, no further tool calls.
+                if not final_text:
+                    try:
+                        files = ", ".join(list(self._inspection_targets)[:8]) or "the files"
+                        directive = (
+                            "You have spent this turn reading without writing. Do NOT call any more tools. "
+                            f"Based on everything you have already read ({files}), respond in plain text now: "
+                            "either (a) describe the concrete change you would make, or (b) state your findings "
+                            "and the exact next step. Do not re-read anything.")
+                        self.session.emit("note", text=directive)
+                        # Build a view the normal way (system + prepared context), but with
+                        # tools=None so the model can only answer in text, and append the
+                        # directive as the final user message so it is the last thing seen.
+                        from .context import ContextManager
+                        sys_text = self._system()
+                        view = await ContextManager(self).prepare(sys_text, None)
+                        view = list(view) + [{"role": "user", "content": directive}]
+                        recovery = ""
+                        async for ev in self.client.stream_chat(self.model, view, system=sys_text, tools=None, max_tokens=self.output_budget):
+                            if ev.kind == "text":
+                                recovery += ev.text or ""
+                        recovery = recovery.strip()
+                        if recovery:
+                            final_text = recovery
+                            self.session.emit("assistant", text=recovery)
+                            _dbg(self.session, "breaker.recovered", chars=len(recovery))
+                    except Exception as e:
+                        _dbg_exc(self.session, "breaker.recovery_failed", e)
                 self.stop_reason = "stalled"
                 return final_text or note
 

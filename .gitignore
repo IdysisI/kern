@@ -11,3 +11,5 @@ __pycache__/
 
 *.kern-lock
 *.kern-tmp
+scratch/
+bench/

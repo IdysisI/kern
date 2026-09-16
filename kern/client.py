@@ -186,7 +186,7 @@ class Client:
         instead of the structured delta.tool_calls field. Visible form:
 
           ]<]minimax>[<​tool_call> ]<]minimax>[]<]minimax>[150]<]minimax>[]<]minimax>
-          [573]<]minimax>[]<]minimax>[/home/marty/kern/kern/tui.py]<]minimax>[]<]minimax>
+          [573]<]minimax>[]<]minimax>[kern/tui.py]<]minimax>[]<]minimax>
           [ ]<]minimax>[</​tool_call>
 
         Each value slot is bracketed by literal ']<]minimax>[]<]minimax>[' on the

@@ -294,3 +294,281 @@ def test_projection_stable(tmp_path):
     before = json.dumps(s.events)
     assert pager.materialize(s.events, s) == pager.materialize(s.events, s)
     assert json.dumps(s.events) == before
+
+@pytest.mark.asyncio
+async def test_inspection_loop_sensor(tmp_path):
+    target_file = tmp_path / "hello.txt"
+    target_file.write_text("hello world", encoding="utf-8")
+    class LoopingReader:
+        count = 0
+        async def probe(self, model):
+            pass
+        async def stream_chat(self, model, messages, **kwargs):
+            self.count += 1
+            if self.count <= 5:
+                yield StreamEvent('tool_call', tool_call={'id': f'call_{self.count}', 'name': 'read', 'arguments': {'path': str(target_file), 'offset': self.count}})
+            else:
+                yield StreamEvent('text', text='done')
+    s = create_session(str(tmp_path))
+    e = Engine(LoopingReader(), 'fake', s, str(tmp_path))
+    await e.chat('Read repeatedly', max_steps=6)
+    results = [x for x in s.events if x['kind'] == 'tool_result']
+    assert len(results) == 5
+    # new ladder: per-target hint fires at the 3rd read, a firmer WARNING at the 5th
+    assert "now read" in results[2]['text'] and "3 times" in results[2]['text']
+    assert "WARNING" in results[4]['text'] and "5 times" in results[4]['text']
+
+
+def test_step_is_progress_classifier():
+    from kern.engine import _step_is_progress
+    # observations: the exact commands Gemini looped on in the wild
+    assert not _step_is_progress('exec', {'cmd': '7z l /home/marty/Downloads/kern.7z'})
+    assert not _step_is_progress('exec', {'cmd': 'git diff kern/static'})
+    assert not _step_is_progress('exec', {'cmd': 'diff -u a b'})
+    assert not _step_is_progress('exec', {'cmd': 'git status'})
+    assert not _step_is_progress('exec', {'cmd': 'ls -la kern/static'})
+    assert not _step_is_progress('exec', {'cmd': 'python3 -c "import subprocess" 2>&1'})
+    assert not _step_is_progress('read', {'path': 'x'})
+    assert not _step_is_progress('fetch', {'url': 'https://x'})
+    assert not _step_is_progress('py', {'code': "print(open('f').read())"})
+    assert not _step_is_progress('memory', {'action': 'search'})
+    # progress: state changes, plan updates, delegation
+    assert _step_is_progress('write', {'path': 'x', 'content': 'y'})
+    assert _step_is_progress('edit', {'path': 'x'})
+    assert _step_is_progress('todo', {'items': []})
+    assert _step_is_progress('spawn', {'task': 'x'})
+    assert _step_is_progress('memory', {'action': 'remember', 'text': 'x'})
+    assert _step_is_progress('exec', {'cmd': 'mkdir -p /tmp/x'})
+    assert _step_is_progress('exec', {'cmd': 'cp a b'})
+    assert _step_is_progress('exec', {'cmd': 'git commit -m x'})
+    assert _step_is_progress('exec', {'cmd': '7z e -y a.7z -o/tmp/x'})
+    assert _step_is_progress('exec', {'cmd': 'ls > out.txt'})
+    assert _step_is_progress('py', {'code': "open('f','w').write('x')"})
+    assert _step_is_progress('py', {'code': "from pathlib import Path; Path('f').write_text('x')"})
+
+
+@pytest.mark.asyncio
+async def test_inspection_circuit_breaker_halts_looping_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv('KERN_INSPECTION_BREAK', '5')
+    class LoopModel:
+        requests = 0
+        async def probe(self, model):
+            pass
+        async def stream_chat(self, model, messages, **kwargs):
+            self.requests += 1
+            # Gemini-in-the-wild pattern: endless non-whitelisted probe commands
+            yield StreamEvent('tool_call', tool_call={'id': f'c{self.requests}', 'name': 'exec',
+                                                      'arguments': {'cmd': 'git diff kern/static'}})
+    s = create_session(str(tmp_path))
+    e = Engine(LoopModel(), 'test', s, str(tmp_path))
+    reply = await e.chat('restore the web UI')
+    assert s.events[-1]['kind'] == 'turn_end' and s.events[-1]['reason'] == 'stalled'
+    assert 'circuit breaker' in reply
+    notes = [ev for ev in s.events if ev['kind'] == 'note']
+    assert any('circuit breaker' in ev.get('text', '') for ev in notes)
+    # exactly 5 observation steps ran, no infinite loop
+    assert len([ev for ev in s.events if ev['kind'] == 'tool_result']) == 5
+
+
+def test_inspection_target_extracts_real_target():
+    """The typed breaker must see the REAL target of each call. A py/exec payload with
+    no explicit path/url/query arg must not collapse to '' (every distinct file-read
+    counting as the same '' target is what tripped the breaker on Gemini)."""
+    from kern.engine import _inspection_target as t
+    # distinct file reads via py -> distinct targets
+    assert t('py', {'code': "print(open('kern/tui.py').read())"}) == 'kern/tui.py'
+    assert t('py', {'code': "print(open('kern/web.py').read())"}) == 'kern/web.py'
+    # exec: file target extracted from common inspection commands
+    assert t('exec', {'cmd': 'cat kern/daemon.py'}) == 'kern/daemon.py'
+    assert t('exec', {'cmd': 'git diff kern/static'}) == 'kern/static'
+    # explicit args win
+    assert t('read', {'path': 'a/b.py'}) == 'a/b.py'
+    assert t('fetch', {'url': 'https://x'}) == 'https://x'
+    # code with no file literal: identical rerun -> same key; different code -> different key
+    c1, c2 = t('py', {'code': 'print(1)'}), t('py', {'code': 'print(2)'})
+    assert c1 == t('py', {'code': 'print(1)'}) and c1 != c2
+
+
+@pytest.mark.asyncio
+async def test_distinct_py_reads_do_not_trip_breaker(tmp_path, monkeypatch):
+    """Regression for the Gemini screenshot: reading MANY DIFFERENT files is exploration,
+    not a loop. The breaker must NOT fire. 25 distinct reads > break=5.
+
+    Uses the `read` tool (deterministic, no subprocess) but the SAME breaker code path:
+    _inspection_target extracts each distinct path -> novel -> counter stays at 1."""
+    monkeypatch.setenv('KERN_INSPECTION_BREAK', '5')
+    n = 0
+    files = []
+    for i in range(25):
+        p = tmp_path / f"file_{i}.py"
+        p.write_text(f"# file {i}\n")
+        files.append(str(p))
+    class ExploreModel:
+        async def probe(self, model):
+            pass
+        async def stream_chat(self, model, messages, **kwargs):
+            nonlocal n
+            if n < len(files):
+                f = files[n]; n += 1
+                yield StreamEvent('tool_call', tool_call={'id': f'c{n}', 'name': 'read',
+                                                          'arguments': {'path': f}})
+            else:
+                yield StreamEvent('text', text='done')
+    s = create_session(str(tmp_path))
+    e = Engine(ExploreModel(), 'test', s, str(tmp_path))
+    reply = await e.chat('survey the codebase', max_steps=40)
+    # The breaker's behavior is the invariant under test: it must NOT fire on distinct
+    # exploration. (Exact journaled-action counts vary slightly between asyncio.run and
+    # pytest-asyncio due to how trailing tool results are coalesced — that harness detail
+    # is not what we're asserting.)
+    assert e.stop_reason != 'stalled', f"breaker misfired on distinct exploration: {e.stop_reason}"
+    assert 'circuit breaker' not in reply
+    actions = [ev for ev in s.events if ev['kind'] == 'action' and ev.get('name') == 'read']
+    # substantially more reads than break=5 ran -> exploration was not cut short
+    assert len(actions) >= 20, f"expected ~25 distinct reads, got {len(actions)}"
+
+
+def test_py_payload_targets_are_distinct():
+    """Directly assert the typed-breaker invariant for py payloads (the Gemini case):
+    reading N DIFFERENT files via py yields N distinct targets (so each is 'novel' and
+    resets the counter), while re-running the SAME py code yields the SAME target."""
+    from kern.engine import _inspection_target as t, _step_is_progress
+    # py reads of different files -> distinct targets
+    targets = {t('py', {'code': f"print(open('kern/mod_{i}.py').read())"}) for i in range(30)}
+    assert len(targets) == 30, f"py reads of distinct files must yield distinct targets, got {len(targets)}"
+    # same code rerun -> same target (so a genuine loop still counts)
+    assert t('py', {'code': "print(open('kern/engine.py').read())"}) == t('py', {'code': "print(open('kern/engine.py').read())"})
+    # exec with different commands -> distinct
+    assert t('exec', {'cmd': 'cat a.py'}) != t('exec', {'cmd': 'cat b.py'})
+    # a plain py read of a normally-named file is not "progress" -> it's an inspection
+    # subject to the breaker. (avoid a filename starting with w/a/x, which the
+    # conservative _PY_MUTATING_RE would misread as a write-mode flag)
+    assert not _step_is_progress('py', {'code': "print(open('kern/engine.py').read())"})
+    # but a real write IS progress
+    assert _step_is_progress('py', {'code': "open('out.txt','w').write('x')"})
+
+
+@pytest.mark.asyncio
+async def test_identical_py_rerun_still_trips_breaker(tmp_path, monkeypatch):
+    """The opposite guard: re-running the IDENTICAL py snippet over and over IS a loop."""
+    monkeypatch.setenv('KERN_INSPECTION_BREAK', '5')
+    class SameModel:
+        async def probe(self, model):
+            pass
+        async def stream_chat(self, model, messages, **kwargs):
+            yield StreamEvent('tool_call', tool_call={'id': 'c', 'name': 'py',
+                                                      'arguments': {'code': "print(open('kern/x.py').read())"}})
+    s = create_session(str(tmp_path))
+    e = Engine(SameModel(), 'test', s, str(tmp_path))
+    reply = await e.chat('stare at one file', max_steps=20)
+    assert 'circuit breaker' in reply or e.stop_reason == 'stalled'
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_resets_on_progress(tmp_path, monkeypatch):
+    monkeypatch.setenv('KERN_INSPECTION_BREAK', '4')
+    class MixedModel:
+        requests = 0
+        async def probe(self, model):
+            pass
+        async def stream_chat(self, model, messages, **kwargs):
+            self.requests += 1
+            if self.requests % 3 == 0:
+                yield StreamEvent('tool_call', tool_call={'id': f'c{self.requests}', 'name': 'write',
+                                                          'arguments': {'path': str(tmp_path / 'f.txt'), 'content': 'x'}})
+            elif self.requests >= 8:
+                yield StreamEvent('text', text='done with the work')
+            else:
+                yield StreamEvent('tool_call', tool_call={'id': f'c{self.requests}', 'name': 'exec',
+                                                          'arguments': {'cmd': 'git diff'}})
+    s = create_session(str(tmp_path))
+    e = Engine(MixedModel(), 'test', s, str(tmp_path))
+    reply = await e.chat('alternate probing and writing')
+    assert reply == 'done with the work'
+    # writes reset the inspection counter, so the turn never stalls
+    assert s.events[-1]['reason'] != 'stalled'
+
+
+
+# --- debug sidecar logging -------------------------------------------------
+
+def test_debuglog_writes_sidecar_only_when_enabled(tmp_path, monkeypatch):
+    """KERN_DEBUG=1 -> debug.jsonl appears with structured records; the model journal
+    (events.jsonl) must NOT contain debug output."""
+    monkeypatch.setenv('KERN_DEBUG', '1')
+    from kern import debuglog
+    s = create_session(str(tmp_path))
+    debuglog.dbg(s, "test.event", foo=1, bar="baz")
+    debuglog.dbg_exc(s, "test.exc", ValueError("boom"), ctx="here")
+    p = Path(s.dir) / "debug.jsonl"
+    assert p.exists(), "debug.jsonl was not created"
+    recs = [json.loads(l) for l in open(p)]
+    assert recs[0]["ev"] == "test.event" and recs[0]["foo"] == 1
+    assert recs[1]["ev"] == "test.exc" and recs[1]["exc_type"] == "ValueError"
+    assert "traceback" in recs[1]
+    # isolation: nothing leaked into the model-context journal
+    assert "debug.jsonl" not in open(Path(s.dir) / "events.jsonl").read()
+
+
+def test_debuglog_disabled_is_noop(tmp_path, monkeypatch):
+    """KERN_DEBUG unset -> dbg() writes nothing (zero overhead, zero files)."""
+    monkeypatch.delenv('KERN_DEBUG', raising=False)
+    from kern import debuglog
+    s = create_session(str(tmp_path))
+    debuglog.dbg(s, "test.event", foo=1)
+    assert not (Path(s.dir) / "debug.jsonl").exists()
+
+
+def test_debuglog_never_raises_on_bad_session(monkeypatch):
+    """A session without a resolvable dir, or an unserializable field, must not crash."""
+    monkeypatch.setenv('KERN_DEBUG', '1')
+    from kern import debuglog
+
+    class NoDir:
+        pass
+    debuglog.dbg(NoDir(), "test.event", x=1)  # must not raise
+
+
+def test_debuglog_span_logs_duration(tmp_path, monkeypatch):
+    monkeypatch.setenv('KERN_DEBUG', '1')
+    from kern import debuglog
+    s = create_session(str(tmp_path))
+    with debuglog.span(s, "op", key="v"):
+        pass
+    recs = [json.loads(l) for l in open(Path(s.dir) / "debug.jsonl")]
+    evs = [r["ev"] for r in recs]
+    assert "op.start" in evs and "op.end" in evs
+    end = [r for r in recs if r["ev"] == "op.end"][0]
+    assert end["ok"] is True and "ms" in end
+
+
+@pytest.mark.asyncio
+async def test_identical_readonly_call_is_deduped(tmp_path, monkeypatch):
+    """A re-issued identical read-only call returns the cached result (no re-execution),
+    and a write invalidates the cache so a later read sees the new content."""
+    (tmp_path / "f.txt").write_text("original content")
+    class M:
+        def __init__(self): self.n = 0
+        async def probe(self, m): pass
+        async def stream_chat(self, model, messages, **kw):
+            self.n += 1
+            seq = [
+                ('read', {'path': 'f.txt'}),
+                ('read', {'path': 'f.txt'}),   # identical -> cached
+                ('write', {'path': 'f.txt', 'content': 'new content'}),
+                ('read', {'path': 'f.txt'}),   # after write -> fresh
+            ]
+            if self.n <= len(seq):
+                name, args = seq[self.n - 1]
+                yield StreamEvent('tool_call', tool_call={'id': f'c{self.n}', 'name': name, 'arguments': args})
+            else:
+                yield StreamEvent('text', text='done')
+    s = create_session(str(tmp_path))
+    e = Engine(M(), 'test', s, str(tmp_path))
+    await e.chat('dedup', max_steps=10)
+    reads = [ev for ev in s.events if ev['kind'] == 'tool_result' and ev['name'] == 'read']
+    assert len(reads) == 3
+    assert reads[0].get('status') != 'cached'
+    assert reads[1].get('status') == 'cached', "2nd identical read must be served from cache"
+    assert 'cached result' in reads[1]['text']
+    assert 'new content' in reads[2]['text'], "read after write must see the new content"

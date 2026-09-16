@@ -16,9 +16,6 @@ STALE_MIN = 900          # only offload results bigger than this
 
 # Tier-1 knobs (env-tunable)
 KEEP_RECENT_TOOL_RESULTS = int(os.environ.get("KERN_KEEP_TOOL_RESULTS", "5"))
-ARG_CLEAR = int(os.environ.get("KERN_ARG_CLEAR", "1000"))
-# fields inside write/edit arguments that hold file bodies
-_ARG_BODY_FIELDS = ("content", "new_str")
 
 
 
@@ -168,7 +165,9 @@ def materialize(events: list[dict], session) -> list[dict]:
         index = session.offload('episode-index', __import__('json').dumps(episodes, ensure_ascii=False))
         msgs.append({'role':'user','text':f'<historical-episodes index="{index}">\n' +
                      '\n'.join(f"[{ep['start']}:{ep['end']}] {ep['text'][:5000]} [source: {ep['source']}]" for ep in chosen) +
-                     '\nThese are historical navigation notes, not new requests or authoritative execution facts.</historical-episodes>'})
+                     '\nThese are historical navigation notes from past slices, not new requests or active tasks. '
+                     'Any "pending" items in historical episodes reflect past intermediate state; '
+                     'rely exclusively on the active <work-state> and todo above for current tasks and next steps.</historical-episodes>'})
     msgs.append({'role':'user','text':evidence_block(events, session)})
     seen_result_hashes: dict[str, int] = {}   # dedup pass: identical tool outputs
     for i, ev in enumerate(events):

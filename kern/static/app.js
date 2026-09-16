@@ -6,7 +6,7 @@ const welcome = $('messages').innerHTML;
 
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
 function connected(on) {
-  $('connection').textContent = on ? '● Connecté localement' : '○ Déconnecté · reprise en cours';
+  $('connection').textContent = on ? '● Connected locally' : '○ Disconnected · reconnecting';
   $('connection').classList.toggle('offline', !on);
   for (const id of ['new','set-model','undo','fork','history','capabilities']) $(id).disabled = !on;
   $('send').disabled = !on || running;
@@ -14,14 +14,14 @@ function connected(on) {
 function busy(value) {
   running = value; $('stop').hidden = !value;
   $('send').disabled = value || socket?.readyState !== WebSocket.OPEN;
-  $('activity').textContent = value ? 'Kern travaille…' : 'Prêt à travailler';
+  $('activity').textContent = value ? 'Kern is working…' : 'Ready to work';
   $('undo').disabled = value; $('fork').disabled = value;
 }
 function rpc(method, fields = {}) {
-  if (socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Connexion indisponible'));
+  if (socket?.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Connection unavailable'));
   const id = ++sequence;
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Délai dépassé : ${method}. Vérifiez la session avant de réessayer.`)); }, 30000);
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Timeout: ${method}. Check the session before retrying.`)); }, 30000);
     pending.set(id, {resolve, reject, timer});
     socket.send(JSON.stringify({method, req_id:id, ...fields}));
   });
@@ -118,16 +118,16 @@ function renderPlan(items) {
 async function state() {
   const s=await rpc('state');
   session=s.session;sessionStorage.setItem('kern-session',session);
-  $('cwd').textContent=s.cwd;$('model').value=s.model;$('session-id').textContent=`Session ${session}\n${s.total_events} événements conservés`;
-  const user=s.events.find(e=>e.kind==='user');$('title').textContent=user?user.text.slice(0,65):'Nouvelle session';
+  $('cwd').textContent=s.cwd;$('model').value=s.model;$('session-id').textContent=`Session ${session}\n${s.total_events} events kept`;
+  const user=s.events.find(e=>e.kind==='user');$('title').textContent=user?user.text.slice(0,65):'New session';
   const near=$('messages').scrollHeight-$('messages').scrollTop-$('messages').clientHeight<450;
   renderEvents(s.events); if(near) $('messages').scrollTop=$('messages').scrollHeight;
   renderPlan(s.todo);busy(s.running);
   if(!s.running && s.stop_reason && s.stop_reason!=='done') {
-    $('activity').textContent=({blocked:'Travail bloqué',unverified:'Fin non vérifiée',error:'Tour en erreur',interrupted:'Tour interrompu',step_limit:'Limite atteinte · travail incomplet',output_limit:'Réponse incomplète'}[s.stop_reason] || 'Prêt à travailler');
+    $('activity').textContent=({blocked:'Work blocked',unverified:'Unverified completion',error:'Turn error',interrupted:'Turn interrupted',step_limit:'Limit reached · incomplete work',output_limit:'Incomplete response'}[s.stop_reason] || 'Ready to work');
   }
-  $('mounts').textContent=s.mounts.length?s.mounts.join(' · '):'Aucune · chargement à la demande';
-  $('usage').textContent=`${s.usage.requests || 0} requêtes · dernier tour\n↑ ${s.usage.in || 0} · ↓ ${s.usage.out || 0} tokens`;
+  $('mounts').textContent=s.mounts.length?s.mounts.join(' · '):'None · loaded on demand';
+  $('usage').textContent=`${s.usage.requests || 0} requests · last turn\n↑ ${s.usage.in || 0} · ↓ ${s.usage.out || 0} tokens`;
   if(s.context?.estimated_tokens)$('usage').textContent+=`\nContexte ≈ ${s.context.estimated_tokens.toLocaleString('fr-CH')} / ${s.context.context_length.toLocaleString('fr-CH')}`;
   $('receipts').replaceChildren();
   for(const r of s.receipts.slice(-7).reverse()) {const d=document.createElement('div');d.textContent=`${r.name} · ${r.status}\n${r.arguments.path || r.arguments.cmd || r.id}`;$('receipts').append(d);}
@@ -138,7 +138,7 @@ function sessions() {
   for(const [id,s] of Object.entries(allSessions)) {
     if(!`${id} ${s.preview}`.toLowerCase().includes(q))continue;
     const b=document.createElement('button');b.className='session'+(id===session?' active':'');
-    const title=document.createElement('span');title.textContent=s.preview || 'Nouvelle session';
+    const title=document.createElement('span');title.textContent=s.preview || 'New session';
     const date=document.createElement('small');date.textContent=(s.active?'● En cours · ':'')+(s.last_ts?new Date(s.last_ts*1000).toLocaleString('fr-CH',{dateStyle:'short',timeStyle:'short'}):'');
     b.append(title,date);b.onclick=()=>attach(id).catch(e=>notice(e.message));$('sessions').append(b);
   }
@@ -149,7 +149,7 @@ async function newSession(){notice('');const r=await rpc('new',{model:$('model')
 function showApproval(message){
   $('approval').returnValue='deny';
   approval=message.id;$('approval-desc').textContent=message.desc;$('approval-diff').textContent=message.diff || 'Aucun diff disponible pour cette action.';
-  $('activity').textContent='Votre autorisation est attendue';if(!$('approval').open)$('approval').showModal();
+  $('activity').textContent='Your approval is required';if(!$('approval').open)$('approval').showModal();
 }
 $('approval').addEventListener('close',()=>{if(approval!==null){rpc('approve',{id:approval,allow:$('approval').returnValue==='allow'}).catch(e=>notice(e.message));approval=null;}});
 async function onEvent(m){
@@ -162,9 +162,9 @@ async function onEvent(m){
   else if(m.event==='todo')renderPlan(JSON.parse(m.text));
   else if(m.event==='approve_request')showApproval(m);
   else if(m.event==='turn_end'){busy(false);await state();await refreshSessions();}
-  else if(m.event==='error'){busy(false);notice(m.error || 'Erreur');}
+  else if(m.event==='error'){busy(false);notice(m.error || 'Error');}
   else if(m.event==='note' || m.event==='summary'){$('activity').textContent=m.text.split('\n')[0].slice(0,100);}
-  else if(m.event==='thinking')$('activity').textContent='Réflexion en cours…';
+  else if(m.event==='thinking')$('activity').textContent='Thinking…';
 }
 function connect(){
   clearTimeout(reconnect);socket=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}`);
@@ -172,10 +172,10 @@ function connect(){
     connected(true);
     try{await refreshSessions();if(session && allSessions[session])await attach(session);else await newSession();}
     catch(e){notice(e.message);}
-    rpc('models').then(r=>{$('models').replaceChildren();for(const m of r.models){const o=document.createElement('option');o.value=m.id;$('models').append(o);}}).catch(()=>notice('Catalogue indisponible. Saisissez un identifiant de modèle ; vérifiez KERN_BASE_URL.'));
+    rpc('models').then(r=>{$('models').replaceChildren();for(const m of r.models){const o=document.createElement('option');o.value=m.id;$('models').append(o);}}).catch(()=>notice('Catalog unavailable. Enter a model identifier; check KERN_BASE_URL.'));
   };
   socket.onmessage=e=>{try{const m=JSON.parse(e.data);const p=pending.get(m.req_id);if(p){clearTimeout(p.timer);pending.delete(m.req_id);m.error?p.reject(new Error(m.error)):p.resolve(m.result);return;}onEvent(m).catch(e=>notice(e.message));}catch(e){notice('Message serveur invalide : '+e.message);}};
-  socket.onclose=()=>{connected(false);for(const p of pending.values()){clearTimeout(p.timer);p.reject(new Error('Connexion perdue ; livraison potentiellement effectuée. Aucun renvoi automatique.'));}pending.clear();reconnect=setTimeout(connect,2000);};
+  socket.onclose=()=>{connected(false);for(const p of pending.values()){clearTimeout(p.timer);p.reject(new Error('Connection lost; delivery potentially completed. No automatic resend.'));}pending.clear();reconnect=setTimeout(connect,2000);};
 }
 $('composer').onsubmit=async e=>{e.preventDefault();const text=$('prompt').value.trim();if(!text||running)return;notice('');busy(true);bubble('user',text);try{await rpc('chat',{text});$('prompt').value='';sessionStorage.removeItem('kern-draft');$('messages').scrollTop=$('messages').scrollHeight;}catch(err){busy(false);notice(err.message);}};
 $('prompt').value=sessionStorage.getItem('kern-draft') || '';
@@ -183,16 +183,18 @@ $('prompt').oninput=()=>sessionStorage.setItem('kern-draft',$('prompt').value);
 $('prompt').onkeydown=e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('composer').requestSubmit();}};
 $('new').onclick=()=>newSession().catch(e=>notice(e.message));
 $('stop').onclick=()=>rpc('interrupt').catch(e=>notice(e.message));
-$('set-model').onclick=()=>rpc('model',{model:$('model').value.trim()}).then(()=>notice('Modèle sélectionné pour le prochain tour.')).catch(e=>notice(e.message));
+$('set-model').onclick=()=>rpc('model',{model:$('model').value.trim()}).then(()=>notice('Model selected for next turn.')).catch(e=>notice(e.message));
 $('search').oninput=sessions;
 $('fork').onclick=()=>rpc('fork').then(r=>{session=r.session;return state();}).then(refreshSessions).catch(e=>notice(e.message));
-$('undo').onclick=()=>{if(confirm('Annuler les écritures suivies du dernier tour et revenir à votre demande ?'))rpc('undo').then(state).catch(e=>notice(e.message));};
+$('undo').onclick=()=>{if(confirm('Undo tracked writes from the last turn and return to your request?'))rpc('undo').then(state).catch(e=>notice(e.message));};
 function details(title,text){$('details-title').textContent=title;$('details-body').textContent=text;$('details').showModal();}
 $('history').onclick=async()=>{try{let start=0,events=[],total=1;while(start<total){const r=await rpc('history',{start});events.push(...r.events);total=r.total;start+=200;}details('Journal complet',events.map(e=>JSON.stringify(e,null,2)).join('\n'));}catch(e){notice(e.message);}};
-$('capabilities').onclick=()=>rpc('capabilities').then(r=>details('Capacités disponibles',r.capabilities.join('\n') || 'Aucune capacité configurée.')).catch(e=>notice(e.message));
+$('capabilities').onclick=()=>rpc('capabilities').then(r=>details('Available capabilities',r.capabilities.join('\n') || 'No capabilities configured.')).catch(e=>notice(e.message));
 $('sidebar-toggle').onclick=()=>document.body.classList.toggle('sessions-open');
 $('inspector-toggle').onclick=()=>document.body.classList.toggle('state-open');
 $('inspector-close').onclick=()=>document.body.classList.remove('state-open');
+$('sidebar-close').onclick=()=>document.body.classList.remove('sessions-open');
+$('scrim').onclick=()=>document.body.classList.remove('sessions-open');
 document.addEventListener('keydown',e=>{if(e.key==='Escape')document.body.classList.remove('sessions-open','state-open');});
 document.addEventListener('click',e=>{const b=e.target.closest('[data-prompt]');if(b){$('prompt').value=b.dataset.prompt;$('prompt').focus();}});
 connect();

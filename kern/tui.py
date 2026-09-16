@@ -48,6 +48,7 @@ from textual.widgets import (Button, Collapsible, Label, ListItem, ListView,
 from .client import Client, load_health
 from .engine import Engine
 from .journal import Session, create_session, session_previews
+from .debuglog import dbg as _dbg, dbg_exc as _dbg_exc, span as _span
 from .pager import budget
 
 DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
@@ -567,11 +568,11 @@ class KernApp(App):
         with Horizontal(id="workspace"):
             yield VerticalScroll(id="chat")
             with Vertical(id="inspector"):
-                yield Static('ÉTAT DU TRAVAIL', id='inspector-title', markup=False)
-                yield Static('Nouvelle session', id='work-objective', markup=False)
-                yield Static('Plan : aucun', id='work-plan', markup=False)
-                yield Static('MCP : aucun montage', id='work-mounts', markup=False)
-                yield Static('Preuves : aucun résultat', id='work-proof', markup=False)
+                yield Static('WORK STATE', id='inspector-title', markup=False)
+                yield Static('New session', id='work-objective', markup=False)
+                yield Static('Plan: none', id='work-plan', markup=False)
+                yield Static('MCP: nothing mounted', id='work-mounts', markup=False)
+                yield Static('Proof: no results', id='work-proof', markup=False)
         yield Static("thinking…", id="status")
         yield PromptArea()
         yield Static(id="bar")
@@ -612,20 +613,20 @@ class KernApp(App):
                 fresh = Session(self.session.id)
                 self.session.events = fresh.events
             events = self.session.events
-            objective = next((e.get('text','') for e in reversed(events) if e['kind']=='objective'), 'Nouvelle session')
+            objective = next((e.get('text','') for e in reversed(events) if e['kind']=='objective'), 'New session')
             self.query_one('#work-objective').update(objective[:600])
             items = next((e['items'] for e in reversed(events) if e['kind']=='todo'), [])
             self.query_one('#work-plan').update('PLAN\n' + ('\n'.join(
-                f"{ {'done':'✓','active':'●','pending':'○','blocked':'!'}.get(i['status'],'○')} {i['text']}" for i in items) or 'Aucun plan'))
+                f"{ {'done':'✓','active':'●','pending':'○','blocked':'!'}.get(i['status'],'○')} {i['text']}" for i in items) or 'No plan'))
             mounted = {}
             for ev in events:
                 if ev['kind']=='mount':
                     if ev.get('action')=='mount': mounted[ev['name']]=True
                     else: mounted.pop(ev['name'],None)
-            self.query_one('#work-mounts').update('CAPACITÉS\n' + (', '.join(mounted) or 'Aucun montage'))
+            self.query_one('#work-mounts').update('CAPABILITIES\n' + (', '.join(mounted) or 'Nothing mounted'))
             rows = receipts(events)[-5:]
-            self.query_one('#work-proof').update('DERNIERS RÉSULTATS\n' + ('\n'.join(
-                f"{r['name']}: {r['status']}" for r in rows) or 'Aucun résultat'))
+            self.query_one('#work-proof').update('RECENT RESULTS\n' + ('\n'.join(
+                f"{r['name']}: {r['status']}" for r in rows) or 'No results'))
         except Exception:
             pass
 
@@ -647,13 +648,27 @@ class KernApp(App):
         finally:
             self._pending_rpc.pop(req_id, None)
 
-    async def _connect_daemon(self, tries=4):
+    async def _connect_daemon(self, tries=4, fresh=False):
+        """Connect to the daemon, spawning it if needed.
+
+        fresh=True skips the version probe: used by /restart right after we have
+        already shut the old daemon down ourselves. The probe can otherwise hang up
+        to 10s per try against a socket whose daemon is mid-shutdown — that is the
+        '/restart froze my terminal' bug. With fresh=True we just want ANY live
+        daemon, fast.
+        """
         import websockets as _ws
         import sys as _sys
         last = None
         for i in range(tries):
+            _t0 = time.perf_counter()
             try:
+                _dbg(self.session, "daemon.connect.try", attempt=i, fresh=fresh, uri=KERN_DAEMON_URI)
                 ws = await _ws.connect(KERN_DAEMON_URI, open_timeout=2.0, ping_interval=None, max_size=32 * 1024 * 1024)
+                if fresh:
+                    _dbg(self.session, "daemon.connect.ok", attempt=i, fresh=True,
+                         ms=round((time.perf_counter()-_t0)*1000, 1))
+                    return ws
                 # Check daemon version to ensure it is not running stale code
                 # A busy daemon (e.g. replaying a huge journal) can starve
                 # its event loop and miss a short probe. Patient probe; and
@@ -699,6 +714,8 @@ class KernApp(App):
                                      {'creationflags':subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}))
                 log.close()
                 await asyncio.sleep(0.5 + 0.5 * i)
+                _dbg_exc(self.session, "daemon.connect.fail", e, attempt=i,
+                         ms=round((time.perf_counter()-_t0)*1000, 1))
         raise last
 
     async def _daemon_entry(self):
@@ -1437,6 +1454,8 @@ class KernApp(App):
             # respawn it, re-attach to THIS session. The session id is the
             # anchor — everything is rebuilt from the journal on disk.
             self._chat_note("◈ /restart — saving session, restarting kern…")
+            _dbg(self.session, "restart.begin", session_id=self.session.id, model=self.model)
+            _rt0 = time.perf_counter()
             try:
                 # 1. flush: the journal is fsync-on-critical-events already;
                 #    also drop any half-written tail defensively.
@@ -1456,7 +1475,9 @@ class KernApp(App):
                     await _a.sleep(1.0)
                 # 2. respawn daemon + re-attach to the SAME session
                 try:
-                    self.remote = await self._connect_daemon(tries=8)
+                    # fresh=True: we just shut the old daemon down, so skip the
+                    # (potentially 10s-per-try) version probe — reconnect fast.
+                    self.remote = await self._connect_daemon(tries=8, fresh=True)
                 except Exception as e:
                     self._chat_error(f"restart failed, daemon still down: {e} — "
                                     "local mode: journal is safe on disk, "
@@ -1475,7 +1496,10 @@ class KernApp(App):
                 self._refresh_chrome()
                 self._chat_note(f"◈ restarted — session {self.session.id} re-attached, "
                                 f"{len(self.session.events)} events intact")
+                _dbg(self.session, "restart.done", session_id=self.session.id,
+                     ms=round((time.perf_counter()-_rt0)*1000, 1), events=len(self.session.events))
             except Exception as e:
+                _dbg_exc(self.session, "restart.fail", e, ms=round((time.perf_counter()-_rt0)*1000, 1))
                 self._chat_error(f"/restart failed: {type(e).__name__}: {e}")
         elif cmd == "/new":
             if self.remote is not None:

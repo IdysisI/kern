@@ -115,6 +115,14 @@ async def test_incremental_episode_sources(tmp_path):
         s.emit('action',call_id=str(i),name='read')
         s.emit('tool_result',call_id=str(i),name='read',text='observed ABC123 '+str(i))
     await ContextManager(e).prepare('',[])
+    # Compaction now runs as a background task; drain it before asserting.
+    cm = ContextManager(e)
+    task = getattr(cm, '_fold_task', None)
+    # prepare() created its own ContextManager; find any pending fold task on it.
+    import asyncio as _a
+    pending = [t for t in _a.all_tasks() if t is not _a.current_task()]
+    if pending:
+        await _a.gather(*pending, return_exceptions=True)
     episode = next(ev for ev in s.events if ev['kind']=='episode')
     archived = json.loads(Path(episode['source']).read_text(encoding='utf-8'))
     assert archived[0]['n'] == episode['start']

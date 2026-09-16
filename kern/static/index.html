@@ -1,15 +1,144 @@
 <!doctype html>
-<html lang="fr">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Kern · Espace de travail</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>kern — console</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%230b0e0b'/%3E%3Ctext x='3' y='12' font-family='monospace' font-size='11' fill='%23e8b73f'%3Ek%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
 <body>
-<aside id="sidebar"><div class="brand"><span class="logo">k</span><strong>kern</strong><span class="tag">LOCAL</span></div>
-<button id="new" class="primary">＋ Nouvelle session</button><label class="search-label" for="search">Conversations</label><input id="search" type="search" placeholder="Rechercher une session…"><nav id="sessions" aria-label="Sessions"></nav><footer>Votre travail reste ici.<br>Le contexte s’adapte à la tâche.</footer></aside>
-<main><header><button id="sidebar-toggle" aria-label="Afficher les sessions">☰</button><div><h1 id="title">Espace de travail</h1><div id="cwd" class="muted">Chargement du dossier…</div></div><span id="connection" role="status">Connexion…</span></header>
-<div class="toolbar"><label for="model">Modèle</label><input id="model" list="models" placeholder="Identifiant du modèle"><datalist id="models"></datalist><button id="set-model">Appliquer</button><div class="spacer"></div><button id="inspector-toggle" aria-label="Afficher l’état du travail">État</button><button id="history">Historique</button><button id="fork">Dupliquer</button><button id="undo">Annuler le tour</button></div>
-<div id="notice" role="alert" hidden></div>
-<section id="messages" aria-label="Conversation" aria-live="polite"><div class="welcome"><div class="eyebrow">UN ESPACE POUR AVANCER</div><h2>Une idée. Un plan.<br>Du travail accompli.</h2><p>Kern travaille dans votre dossier, garde la trace de ses actions et vous laisse la main sur les changements.</p><div class="suggestions"><button data-prompt="Explore ce projet et explique son architecture.">Explorer le projet ↗</button><button data-prompt="Trouve un bug reproductible, corrige-le et vérifie le résultat.">Résoudre un problème ↗</button></div></div></section>
-<form id="composer"><label class="sr-only" for="prompt">Votre demande</label><textarea id="prompt" rows="3" placeholder="Que voulez-vous accomplir ?" required></textarea><div class="compose-actions"><span id="activity">Prêt à travailler</span><span class="muted shortcut">Entrée pour envoyer · Maj+Entrée pour une ligne</span><button id="stop" type="button" hidden>Interrompre</button><button id="send" class="primary" type="submit">Envoyer ↑</button></div></form></main>
-<aside id="inspector"><button id="inspector-close" class="close" aria-label="Fermer l’état du travail">×</button><div class="eyebrow">ÉTAT DE LA SESSION</div><h2>Le fil du travail</h2><div id="usage" class="metric">Aucun appel</div><h3>Plan</h3><ol id="plan"><li class="muted">Aucun plan pour le moment.</li></ol><h3>Capacités montées</h3><div id="mounts" class="muted">Aucune · chargement à la demande</div><button id="capabilities">Voir les capacités disponibles</button><h3>Dernières actions</h3><div id="receipts" class="muted">Les résultats apparaîtront ici.</div><div class="session-foot" id="session-id"></div></aside>
-<dialog id="approval"><form method="dialog"><div class="eyebrow">AUTORISATION</div><h2>Valider cette action</h2><p id="approval-desc"></p><pre id="approval-diff"></pre><div class="dialog-actions"><button value="deny">Refuser</button><button value="allow" class="primary">Autoriser</button></div></form></dialog>
-<dialog id="details"><form method="dialog"><button class="close" aria-label="Fermer">Fermer ×</button><h2 id="details-title">Détails</h2><pre id="details-body"></pre></form></dialog>
-</body></html>
+<svg width="0" height="0" class="sprite" aria-hidden="true">
+  <defs>
+    <symbol id="i-plus" viewBox="0 0 12 12"><path d="M6 1v10M1 6h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-search" viewBox="0 0 12 12"><circle cx="5" cy="5" r="3.4" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7.6 7.6 11 11" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-close" viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 12 12"><path d="M1.5 10.5 10 2M4 1.5h6.5V8" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 12 12"><rect x="1" y="1.5" width="10" height="9" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M7.5 1.5v9" stroke="currentColor" stroke-width="1.3"/></symbol>
+    <symbol id="i-side" viewBox="0 0 12 12"><rect x="1" y="1.5" width="10" height="9" rx="1" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M4.5 1.5v9" stroke="currentColor" stroke-width="1.3"/></symbol>
+  </defs>
+</svg>
+
+<div class="layout">
+
+  <!-- ── sessions : the kernel's process table ── -->
+  <aside id="sidebar" aria-label="Sessions">
+    <header class="panel-head">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">▮</span>
+        <span class="brand-name">kern<span class="brand-dim">://console</span></span>
+      </div>
+      <button id="sidebar-close" class="iconbtn" aria-label="Close session list"><svg><use href="#i-close"/></svg></button>
+    </header>
+    <div class="sidebar-tools">
+      <button id="new" class="btn solid"><svg class="glyph" aria-hidden="true"><use href="#i-plus"/></svg>New process</button>
+      <label class="searchbox">
+        <svg class="glyph" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="search" type="search" placeholder="filter sessions" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+    <div class="table-head" aria-hidden="true"><span>last output</span><span>status · timestamp</span></div>
+    <nav id="sessions" aria-label="Session list"></nav>
+  </aside>
+  <div id="scrim" hidden></div>
+
+  <!-- ── chat : the live tty ── -->
+  <main>
+    <header class="panel-head tty-head">
+      <button id="sidebar-toggle" class="iconbtn" aria-label="Open session list"><svg><use href="#i-side"/></svg></button>
+      <span id="title" class="tty-title" title="Current session">—</span>
+      <span id="activity" class="activity" role="status"></span>
+      <span id="connection" class="status off">offline</span>
+      <button id="inspector-toggle" class="iconbtn" aria-label="Toggle telemetry"><svg><use href="#i-panel"/></svg></button>
+    </header>
+
+    <div id="messages" aria-live="polite">
+      <div class="welcome" role="note">
+        <p class="boot-line"><span class="prompt-sign">kern&gt;</span> local console — no session attached.</p>
+        <p class="boot-line dim">Describe a task, or start from an angle:</p>
+        <div class="suggestions">
+          <button class="suggestion" data-prompt="List the projects we worked on recently.">resume a project<svg aria-hidden="true"><use href="#i-arrow"/></svg></button>
+          <button class="suggestion" data-prompt="Audit this repo: structure, hotspots, and suggest three concrete improvements.">audit this repo<svg aria-hidden="true"><use href="#i-arrow"/></svg></button>
+          <button class="suggestion" data-prompt="Write an implementation plan broken into verifiable steps, without touching code yet.">prepare a plan<svg aria-hidden="true"><use href="#i-arrow"/></svg></button>
+          <button class="suggestion" data-prompt="Debug with me: I describe the symptom, you formulate hypotheses and tests to narrow it down.">debug together<svg aria-hidden="true"><use href="#i-arrow"/></svg></button>
+        </div>
+      </div>
+    </div>
+
+    <form id="composer">
+      <div id="notice" class="notice" hidden></div>
+      <div class="inputrow">
+        <span class="prompt-sign" aria-hidden="true">&gt;</span>
+        <textarea id="prompt" rows="1" placeholder="Describe the task… (Enter to send, Shift+Enter for newline)" autocomplete="off"></textarea>
+        <button id="stop" class="btn danger" type="button" disabled hidden title="Stop current run">stop</button>
+        <button id="send" class="btn solid" type="submit" title="Send (Enter)">run</button>
+      </div>
+    </form>
+  </main>
+
+  <!-- ── inspector : session telemetry ── -->
+  <aside id="inspector" aria-label="Session telemetry">
+    <header class="panel-head">
+      <span class="head-label">telemetry</span>
+      <button id="inspector-close" class="iconbtn" aria-label="Close telemetry"><svg><use href="#i-close"/></svg></button>
+    </header>
+    <div class="inspector-body">
+
+      <section class="block">
+        <div class="kv">
+          <div class="kv-row"><dt>session</dt><dd id="session-id" class="mono">—</dd></div>
+          <div class="kv-row"><dt>directory</dt><dd id="cwd" class="mono">—</dd></div>
+          <div class="kv-row"><dt>model</dt><dd class="modelrow"><input id="model" list="models" placeholder="system default" autocomplete="off" spellcheck="false"><datalist id="models"></datalist><button id="set-model" class="btn mini" title="Apply to next turn">ok</button></dd></div>
+          <div class="kv-row"><dt>usage</dt><dd id="usage" class="mono">—</dd></div>
+        </div>
+        <div class="btnrow">
+          <button id="undo" class="btn" title="Undo last turn writes">undo</button>
+          <button id="fork" class="btn" title="Fork this session">fork</button>
+          <button id="history" class="btn" title="View raw history">history</button>
+          <button id="capabilities" class="btn" title="View tools and memory">capabilities</button>
+        </div>
+      </section>
+
+      <section class="block">
+        <div class="log-head" aria-hidden="true"><span>plan</span></div>
+        <ol id="plan" class="plan"></ol>
+      </section>
+
+      <section class="block">
+        <div class="log-head" aria-hidden="true"><span>mounted tools</span></div>
+        <p id="mounts" class="mounts">—</p>
+      </section>
+
+      <section class="block grow">
+        <div class="log-head" aria-hidden="true"><span>execution receipts</span></div>
+        <div id="receipts" class="receipts"></div>
+      </section>
+
+    </div>
+  </aside>
+
+</div>
+
+<dialog id="approval">
+  <form method="dialog">
+    <p class="approval-lede">The agent requests permission to execute:</p>
+    <div id="approval-desc" class="approval-desc"></div>
+    <pre id="approval-diff"></pre>
+    <div class="approval-actions">
+      <button id="deny" class="btn danger" value="deny">Deny</button>
+      <button id="allow" class="btn solid" value="allow">Allow</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="details">
+  <form method="dialog">
+    <p id="details-title" class="details-title">Details</p>
+    <pre id="details-body"></pre>
+    <div class="approval-actions"><button class="btn" value="close">Close</button></div>
+  </form>
+</dialog>
+
+<script src="app.js"></script>
+</body>
+</html>

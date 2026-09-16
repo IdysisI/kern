@@ -995,34 +995,6 @@ def _replace_nth(src: str, old_str: str, new_str: str, occurrence: int,
 
 # ---- safety & hygiene --------------------------------------------------------
 
-_SAFE_CMDS = {"ls", "cat", "head", "tail", "rg", "grep", "find", "pwd", "wc",
-              "file", "stat", "which", "env", "date", "uname", "df", "du",
-              "tree", "jq", "sort", "uniq", "echo", "printf", "realpath",
-              "basename", "dirname", "uname", "id", "whoami", "hostname",
-              "git", "ps", "ss", "free", "uptime", "lsblk", "lscpu"}
-_SAFE_GIT = {"status", "diff", "log", "show", "branch", "ls-files", "rev-parse",
-             "remote", "blame", "shortlog", "describe", "tag", "stash list"}
-_DANGER_TOKENS = (">", "<", "$(", "`", "&>", "&>>", ">(", "<(")
-# Mutating/destructive flags on otherwise read-only tools
-_MUTATING_GIT_FLAGS = {"-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--force", "-f",
-                       "--edit", "-a", "--all", "--set-upstream", "-u",
-                       "--output", "-o", "--no-index"}
-# Mutating flags on other allow-listed tools (find -delete/-fprint, sort -o,
-# tee anything, cp/mv — none of these should ever auto-approve)
-_MUTATING_FLAGS = {"-delete", "-fprint", "-fprint0", "-fprintf", "-fls", "-ok", "-okdir",
-                   "-exec", "-execdir", "-o", "--output", "--output-file", "-i",
-                   "--in-place", "-s", "--symbolic-link"}
-# git subcommands that are write-by-default; pure-listing forms (branch, tag,
-# remote) are only auto-approved with a listing/inspection flag or no argument
-_MUTATING_GIT_SUBS = {"add", "commit", "push", "pull", "merge", "rebase", "reset",
-                      "checkout", "switch", "clean", "rm", "mv", "stash", "apply",
-                      "am", "cherry-pick", "revert", "restore", "gc", "prune",
-                      "init", "clone", "fetch", "tag", "branch", "remote", "config"}
-_GIT_LISTING_OK = {"branch": {"--list", "--show-current", "--all", "-a", "-v", "-vv", "--format"},
-                   "tag": {"--list", "-l", "-n"},
-                   "remote": {"-v", "--verbose", "show"},
-                   "stash": {"list"}}
-
 
 def is_safe_readonly(cmd: str) -> bool:
     """True when every pipeline/chain segment is a known read-only command and
