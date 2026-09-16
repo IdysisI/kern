@@ -14,13 +14,14 @@ import asyncio
 import inspect
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-from . import kernel, pager, syscalls
+from . import kernel, pager, syscalls, resilience
 from .storage import turn_lease
 from .client import Client, health_of, invalidate_health
 from .journal import Session, create_session
@@ -49,6 +50,69 @@ def _parse_xml_invoke(text: str) -> list[dict]:
     return calls
 
 FENCED_RE = re.compile(r"```tool\s*\n(.*?)\s*```", re.S)
+
+# --- stall detection: progress vs observation ---------------------------------
+# Independent from syscalls.is_safe_readonly: that helper gates auto-approval and
+# must stay conservative. This classifier drives the inspection-loop sensor, where
+# only unambiguous state changes or plan updates count as progress.
+
+_MUTATING_CMD_RE = re.compile(
+    r"(?:^|\s)(?:sudo\s+)?(?:pip3?|uv\s+pip|uv\s+(?:add|remove|sync)|apt(?:-get)?|dpkg|npm|pnpm|yarn|bun|cargo|gem|brew|pacman|dnf|yum|zypper)\b"
+    r"|\b(?:cp|mv|rm|rmdir|mkdir|touch|chmod|chown|chgrp|ln|install|patch|truncate|dd|tee|kill|pkill|systemctl|service)\b"
+    r"|\bgit\s+(?:add|commit|push|pull|checkout|restore|reset|merge|rebase|apply|am|clean|init|clone|stash|tag|cherry-pick)\b"
+    r"|\b7z\s+[ex]\b|\btar\s+[xzj]|\bunzip\b"
+    r"|\bsed\s+(?:-[^-\s]*\s+)*-i\b"
+    r"|(?<![->|])>>?(?!&)"
+)
+
+_PY_MUTATING_RE = re.compile(
+    r"open\([^)]*['\"][wax]\+?['\"]"
+    r"|\.write_text\(|\.write_bytes\(|\.writelines\(|\.touch\("
+    r"|\bos\.(?:remove|unlink|rename|replace|mkdir|makedirs|rmdir|removedirs|chmod|chown)\b"
+    r"|\bshutil\.(?:move|copy|copy2|copytree|rmtree)\b"
+    r"|\bsubprocess\.(?:run|call|check_call|check_output|Popen)\s*\([^)]*"
+    r"(?:pip|apt|npm|\bcp\b|\bmv\b|\brm\b|mkdir|git\s+(?:add|commit|push)|7z\s+[ex])"
+)
+
+
+# Ops that never cause side effects. Replay warnings must NOT fire for these (F3):
+# re-reading a status/log/file is not a repeated dangerous action. Research, by
+# contrast, is a LONG run of these — which must not trip the circuit breaker (F1).
+_READ_ONLY_TOOLS = {"read", "fetch", "scrape", "search", "proc", "todo"}
+_READ_ONLY_MEMORY_ACTIONS = {"search", "read", "reconcile", "outline", "history"}
+_READ_ONLY_SUBAGENT_ACTIONS = {"status", "logs", "wait"}
+
+
+def _is_read_only(name: str, args: dict) -> bool:
+    """True for ops with no side effects. Used to (a) exempt them from replay
+    warnings and (b) let the circuit breaker treat a *diverse* read run as progress."""
+    if name in _READ_ONLY_TOOLS:
+        return True
+    if name == "memory":
+        return args.get("action") in _READ_ONLY_MEMORY_ACTIONS
+    if name == "subagent":
+        return args.get("action") in _READ_ONLY_SUBAGENT_ACTIONS
+    if name == "exec":
+        return not _MUTATING_CMD_RE.search(str(args.get("cmd", "")))
+    if name == "py":
+        return not _PY_MUTATING_RE.search(str(args.get("code", "")))
+    return False
+
+
+def _step_is_progress(name: str, args: dict) -> bool:
+    """True when a call changes user-visible state, advances the plan, or delegates.
+    Observation calls (read/fetch/proc, read-only exec/py) return False."""
+    if name in ("write", "edit", "todo", "spawn"):
+        return True
+    if name == "memory":
+        return args.get("action") in ("remember", "write", "forget")
+    if "__" in name:
+        return True   # mounted MCP tools may have effects; never stall-break on them
+    if name == "exec":
+        return bool(_MUTATING_CMD_RE.search(str(args.get("cmd", ""))))
+    if name == "py":
+        return bool(_PY_MUTATING_RE.search(str(args.get("code", ""))))
+    return False
 
 
 def _human_desc(name: str, args: dict) -> str:
@@ -107,8 +171,15 @@ class Engine:
         self.usage_out = 0
         self.requests = 0                 # paid API requests this engine made
         self._stream_fails = 0            # consecutive transport failures
+        self._rng = random.Random()       # jitter source for backoff (seedable in tests)
+        self._retry_budget = resilience.RetryBudget(
+            max_billed=int(os.environ.get("KERN_RETRY_BUDGET", "3")))
+        self.cost = resilience.CostMeter()
         self._fetch_cache: dict = runtime["fetch"]      # url+max_chars -> wrapped body (session scope)
         self._consecutive_errors: list[str] = []
+        self._inspection_targets: dict[str, int] = {}
+        self._consecutive_inspections: int = 0
+        self._run_targets: set = set()   # distinct targets seen in current read-run (typed breaker)
         self.subagents: dict[str, dict] = runtime["subagents"]
         self._approve_lock = asyncio.Lock()
         if not self.subagents:
@@ -293,6 +364,10 @@ class Engine:
             return f"$ {args.get('cmd', '')}"
         if name == "fetch":
             return f"fetch {args.get('url', '')}"
+        if name == "search":
+            return f"search \"{args.get('query', '')}\""
+        if name == "scrape":
+            return f"scrape {args.get('url', '')}"
         return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
 
     def _prior_execution(self, name: str, args: dict) -> str | None:
@@ -345,6 +420,8 @@ class Engine:
             "exec": lambda: syscalls.tool_exec(self.fs, **args, _cancel=cancel),
             "proc": lambda: syscalls.tool_proc(**args),
             "fetch": lambda: syscalls.tool_fetch(**args, cache=self._fetch_cache),
+            "search": lambda: syscalls.tool_search(**args),
+            "scrape": lambda: syscalls.tool_scrape(**args),
             "memory": lambda: syscalls.tool_memory(self.session, self.cwd, **args),
             "py": lambda: syscalls.tool_py(self.session, **args, _cancel=cancel),
             "todo": lambda: syscalls.tool_todo(**args),
@@ -583,6 +660,7 @@ class Engine:
             self.mounts.temporary.clear()
             # per-turn request accounting (the client counts every paid call)
             self.requests = getattr(self.client, "requests", 0) - self._req0
+            self.cost.model_calls = self.requests   # authoritative sync (kills "0 requests" lie)
             try:
                 self.session.emit("turn_end", reason=reason)
             except Exception:
@@ -668,11 +746,12 @@ class Engine:
             calls: list[dict] = []
             error = ""
             truncated = False
-            # TRANSPORT RETRY: a proxy that drops the connection before ANY
-            # content arrives burns a paid request for nothing. Retry once
-            # after a short backoff — safe, because nothing was executed and
-            # nothing was journaled from this attempt.
-            for attempt in range(2):
+            # RETRY LOOP: transport/server/rate-limit failures are retried with
+            # exponential backoff under a per-turn BILLED budget (see resilience.py).
+            # The budget (not the raw attempt count) is the real cap; range is a
+            # generous upper bound so a free transport retry doesn't get cut short.
+            max_attempts = self._retry_budget.max_billed + 2
+            for attempt in range(max_attempts):
                 text_parts = []
                 calls = []
                 error = ""
@@ -698,12 +777,31 @@ class Engine:
                         # never silent: a stream error in a MIXED turn (text and/or
                         # valid calls present) must still be journaled and shown.
                         self.stream_cb("note", f"⚠ {error}")
-                retryable = ("stage=transport" in error) and not text_parts and not calls
-                if not retryable or attempt:
+                if not error:
+                    break   # clean stream — nothing to retry, leave error empty
+                produced_output = bool(text_parts or calls)
+                decision = resilience.decide_retry(
+                    error, produced_output=produced_output, attempt=attempt,
+                    budget=self._retry_budget, rng=self._rng)
+                if not decision.retry:
+                    if decision.cls != "transport" or "stage=transport" not in error:
+                        error = f"{error} [{decision.cls}: {decision.reason}]"
                     break
-                self.stream_cb("note", f"transport died before any content — retrying once ({error[:120]})")
-                await asyncio.sleep(2.0)
-            if "stage=transport" in error:
+                # preserve partial output as a checkpoint before any retry — it is
+                # never discarded silently (a mid-stream 502 must not lose work).
+                if produced_output:
+                    self.session.emit("checkpoint", reason="retry_with_partial",
+                                      text_len=sum(len(t) for t in text_parts),
+                                      calls=len(calls))
+                self._retry_budget.record(decision.cls, decision.billed, decision.delay)
+                self.cost.note_retry(decision.billed)
+                tag = "billed" if decision.billed else "free"
+                self.stream_cb("note",
+                    f"{decision.cls} error — retrying in {decision.delay:.1f}s "
+                    f"({tag}, attempt {attempt + 1}; budget {self._retry_budget.billed_used}/"
+                    f"{self._retry_budget.max_billed}) [{error[:100]}]")
+                await asyncio.sleep(decision.delay)
+            if "stage=transport" in error or resilience.classify_error(error) in ("server", "rate_limit"):
                 self._stream_fails += 1
                 if self._stream_fails >= 3:
                     # health said this model works, but it keeps failing:
@@ -843,10 +941,13 @@ class Engine:
                     self.session.emit("action", call_id=cid, name=name, arguments=args)
                     text, meta = await self._safe_call(name, args)
                     text = syscalls.redact(str(text))
-                if prior is not None:
+                if prior is not None and not _is_read_only(name, args):
+                    # Only warn for side-effecting repeats. Re-running a read-only
+                    # status/log/read is harmless and must not be flagged (F3).
+                    prior_clean = re.sub(r"^\[kern replay warning:[^\]]+\]\s*", "", prior).strip()
                     text = (f"[kern replay warning: an identical {name} call was already "
                             f"executed earlier this session — prior result: "
-                            f"{prior[:120]!r}. You have just re-run it; side effects "
+                            f"{prior_clean[:120]!r}. You have just re-run it; side effects "
                             f"may have been repeated.]\n{text}")
                 # Error loop sensor: prevent agents from stubbornly brute-forcing failing calls
                 is_err = "error:" in str(text) or ("exit=" in str(text) and "exit=0" not in str(text))
@@ -858,6 +959,36 @@ class Engine:
                                            "or test a fundamentally different approach before repeating.]")
                 else:
                     self._consecutive_errors.clear()
+
+                # Inspection loop sensor: typed progress, not a naive counter (F1).
+                # A run revisiting the SAME target is a stuck loop -> counts toward the
+                # breaker. A run touching a DISTINCT new target is exploration -> resets,
+                # so legitimate research (many different reads) is never killed.
+                if _step_is_progress(name, args):
+                    self._consecutive_inspections = 0
+                else:
+                    tgt = str(args.get("path") or args.get("url") or args.get("cmd")
+                              or args.get("query") or args.get("handle") or "")
+                    novel = bool(tgt) and tgt not in self._run_targets
+                    if novel:
+                        self._run_targets.add(tgt)
+                        self._consecutive_inspections = 1   # new line of inquiry (this one counts)
+                    else:
+                        self._consecutive_inspections += 1  # revisiting same target
+
+                if name == "read":
+                    read_path = str(args.get("path", ""))
+                    if read_path:
+                        self._inspection_targets[read_path] = self._inspection_targets.get(read_path, 0) + 1
+                        if self._inspection_targets[read_path] >= 4:
+                            text = (str(text) + f"\n\n[harness hint: '{read_path}' has been inspected "
+                                               f"{self._inspection_targets[read_path]} times in this session. "
+                                               "You have already inspected this file. Avoid repetitive reading: "
+                                               "synthesize your findings and proceed with implementation or next steps.]")
+
+                if self._consecutive_inspections == 10:
+                    text = (str(text) + "\n\n[harness hint: 10 consecutive inspection operations without making changes or updating the plan. "
+                                       "Avoid over-inspecting: proceed with implementation using write() or edit(), or update the todo plan.]")
 
                 self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
                                    status=meta.get("status") or ("failed" if str(text).startswith(("error", "denied")) else "succeeded"),
@@ -876,6 +1007,19 @@ class Engine:
                 if getattr(self, "_cancel_after_receipt", False):
                     self._cancel_after_receipt = False
                     raise asyncio.CancelledError
+
+            # Circuit breaker: a whole step completed with only observation calls.
+            # Past the break threshold the turn is halted instead of looping forever;
+            # the model gets the journal back next turn and must answer, not probe.
+            break_at = int(os.environ.get("KERN_INSPECTION_BREAK", "20"))
+            if self._consecutive_inspections >= break_at:
+                note = (f"[kern circuit breaker: {self._consecutive_inspections} consecutive read-only steps "
+                        "with no file changes, plan updates or delegation — the turn was looping on inspection. "
+                        "Report your findings and act on the objective now, or ask the user for direction.]")
+                self.session.emit("note", text=note)
+                self.stream_cb("note", note)
+                self.stop_reason = "stalled"
+                return final_text or note
 
         self.stop_reason = "step_limit"
         self.session.emit("note", text="Execution step limit reached; the task may be incomplete.")
