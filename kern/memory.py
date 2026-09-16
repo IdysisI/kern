@@ -58,6 +58,11 @@ class MemoryTree:
                 text TEXT NOT NULL, source TEXT NOT NULL, created REAL NOT NULL,
                 status TEXT NOT NULL DEFAULT 'active', supersedes TEXT)""")
             db.execute('CREATE INDEX IF NOT EXISTS notes_topic ON notes(topic,status)')
+            # pinned: explicit user/agent flag that floats a note to the top of recall.
+            try:
+                db.execute("ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass  # column already exists
 
     @contextmanager
     def connect(self):
@@ -120,28 +125,46 @@ class MemoryTree:
             return f'error: {e}'
 
     def search(self, pattern, max_results=20):
-        # Literal lexical ranking: predictable for identifiers, no external rg.
-        terms = re.findall(r"\w+", pattern.casefold())
-        found = []
-        for row in self._rows():
-            score = sum(t in (row['id'] + ' ' + row['text'] + ' ' + row['topic']).casefold() for t in terms)
-            if score:
-                found.append((score, row['created'], f"note:{row['id']} [{row['topic']}] {row['text']} [source:{row['source']}]"))
+        # Deterministic BM25 ranking (kern.recall) over notes + legacy markdown.
+        # Zero model calls; ranks by true term-relevance + recency instead of the old
+        # naive "count of distinct terms present" which treated all matches equally.
+        from .recall import BM25Index, Doc
+        rows = self._rows()
+        # Exact id lookup first: searching by a note id must always find it (a 32-hex
+        # id has no lexical overlap with the body, so BM25 alone would miss it).
+        pat = (pattern or '').strip().removeprefix('note:')
+        if re.fullmatch(r"[0-9a-f]{16,64}", pat):
+            for row in rows:
+                if row['id'] == pat:
+                    return f"note:{row['id']} [{row['topic']}] {row['text']} [source:{row['source']}]"
+        docs: list[Doc] = []
+        for row in rows:
+            docs.append(Doc(id=f"note:{row['id']}",
+                            text=f"[{row['topic']}] {row['text']} [source:{row['source']}]",
+                            tokens=[], pinned=bool(row.get('pinned')), ts=float(row.get('created', 0)),
+                            source=f"note:{row['id']}"))
         for p in self.root.rglob('*.md'):
             if not p.resolve().is_relative_to(self.root.resolve()):
                 continue
             for n, line in enumerate(p.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
                 if '<!-- deleted' in line or '<!-- superseded' in line:
                     continue
-                score = sum(t in line.casefold() for t in terms)
-                if score:
-                    found.append((score, 0, f'legacy:{p.relative_to(self.root).as_posix()}:{n}: {line}'))
-        found.sort(reverse=True)
-        if not found:
+                docs.append(Doc(id=f"legacy:{p.relative_to(self.root).as_posix()}:{n}",
+                                text=line, tokens=[], ts=0, source="legacy"))
+        idx = BM25Index()
+        idx.build(docs)
+        ranked = idx.search(pattern, half_life_s=7 * 86400.0, recency_weight=0.1)
+        if not ranked:
             return '(no matching memory)'
+        lines = []
+        for doc, _s in ranked[:max_results]:
+            if doc.id.startswith('note:'):
+                lines.append(f"{doc.id} {doc.text}")
+            else:
+                lines.append(doc.id + ': ' + doc.text)
         return ('SQLite notes: read the full record with memory(action="read", path="note:<id>"). '
                 'These identifiers are not Markdown filenames.\n' +
-                '\n'.join(x[2][:1200] for x in found[:max_results]))
+                '\n'.join(x[:1200] for x in lines))
 
     def reconcile(self, topic):
         rows = [r for r in self._rows() if r['topic'] == topic]
