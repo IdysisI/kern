@@ -37,9 +37,25 @@ _STOP = frozenset(
     "over after before between through during out off up down".split())
 
 
+def _stem(tok: str) -> str:
+    """Ultra-light suffix stripping so 'billing'/'bills'/'billed' match 'bill'.
+    Not a full Porter stemmer — just enough to bridge common English inflections so
+    recall doesn't miss obvious variants (deterministic, no model)."""
+    if len(tok) <= 3:
+        return tok
+    for suf in ("ing", "ies", "ied", "ed", "es", "s"):
+        if tok.endswith(suf) and len(tok) - len(suf) >= 3:
+            base = tok[:-len(suf)]
+            if suf in ("ies", "ied"):
+                base += "y"
+            return base
+    return tok
+
+
 def tokenize(text: str) -> list[str]:
     """Tokens for BM25/dedup. Paths (kern/memory.py) stay whole; colon refs
-    (note:abc123) yield BOTH the full ref and its id part so either form matches."""
+    (note:abc123) yield BOTH the full ref and its id part so either form matches.
+    Purely-alphabetic tokens are lightly stemmed so inflections match."""
     toks: list[str] = []
     for t in _TOKEN_RE.findall(text or ""):
         tl = t.lower()
@@ -50,6 +66,10 @@ def tokenize(text: str) -> list[str]:
             frag = tl.split(":")[-1]
             if frag and frag not in _STOP:
                 toks.append(frag)
+        if tl.isalpha() and len(tl) > 3:    # stem words (not paths/ids)
+            st = _stem(tl)
+            if st != tl:
+                toks.append(st)
     return toks
 
 
