@@ -454,4 +454,62 @@ class ContextManager:
         done_note = f'Episode {start}–{end}: attributed navigation notes ({llm_done}/{total} chunks summarized); original: {source}\n{text}'
         if degraded:
             done_note = f'[degraded: budget {fold_budget:.0f}s reached] ' + done_note
+        # M4: consolidate durable facts into attributed project memory (deterministic,
+        # 0 LLM). Only high-signal user constraints/decisions and (when no episodic
+        # projection is available) the goal itself are promoted to atoms — the
+        # rest stays in the session episode. Absorber/dedupe make this idempotent.
+        try:
+            cons = self._consolidate_fold_atoms(e, start, end, structured)
+            if cons:
+                done_note += f'\n[memory: {cons} durable atom(s) consolidated]'
+        except Exception:
+            pass
         e.stream_cb('summary', done_note)
+
+    _CONSTRAINT_MARK = (
+        'always', 'never', 'must', 'do not', "don't", 'prefer', 'limit', 'at most',
+        'at least', 'maximum', 'minimum', 'no more', 'budget', 'only ', 'instead of',
+        'stop ', 'use ', 'from now on', 'going forward', 'i want', 'keep ',
+    )
+
+    def _consolidate_fold_atoms(self, e, start: int, end: int, structured: dict) -> int:
+        """Promote genuinely durable, high-signal facts from a folded span into
+        attributed project memory. Conservative by design (an over-eager memory is
+        worse than a smaller one): user-authored constraint/decision sentences only,
+        capped per fold. Returns the number of atoms remembered. 0 LLM calls."""
+        from hashlib import sha1
+        mem = getattr(e, 'memory', None)
+        if mem is None or not hasattr(mem, 'remember'):
+            return 0
+        remember = getattr(mem, 'remember', None)
+        if not callable(remember):
+            return 0
+        sid = getattr(getattr(e, 'session', None), 'sid', '') or getattr(e, 'sid', '') or ''
+        src = f'session:{sid}:fold:{start}-{end}'
+        seen: set = set()
+        out = 0
+
+        def _note(text: str, topic: str, key: str) -> None:
+            nonlocal out
+            text = ' '.join(str(text).split()).strip()
+            if len(text) < 12 or len(text) > 400:
+                return
+            if text.lower() in seen:
+                return
+            seen.add(text.lower())
+            try:
+                r = remember(text, topic=topic, sid=sid, key=key, source=src)
+            except Exception:
+                return
+            if isinstance(r, str) and ('remembered note:' in r or 'already remembered' in r):
+                out += 1
+
+        limit = 8
+        for d in (structured.get('decisions') or []):
+            if out >= limit:
+                break
+            dl = str(d).lower()
+            if not any(m in dl for m in self._CONSTRAINT_MARK):
+                continue
+            _note(d, 'decisions', key=sha1(d.lower().encode()).hexdigest()[:16])
+        return out
