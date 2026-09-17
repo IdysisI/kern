@@ -11,11 +11,16 @@
 ## What it does
 
 - **Stops the loops.** A typed circuit breaker detects repeated identical actions (same file, same command, same target) and escalating harness hints push the model to act instead of re-reading. Per-target repeat tracking works across `read`, `py`, and `exec` — so an agent that reads everything through Python can't evade it.
+- **Knows your codebase before it reads a line.** A deterministic structural code graph (SQLite, built with zero LLM calls) plus a `map` tool answer "where is X / what depends on Y / outline of this file" from a precomputed index instead of re-grepping. A compact repo map is injected on first contact — bounded, so it orients without bloating context.
+- **Onboards itself.** On first contact with a repo, Kern writes a lean `KERN.md` — detected stack, entry points, the full dev workflow (test/build/lint/run), and conventions. No setup step, no `/init`. Your edits below the marker are preserved across regenerations.
 - **Keeps the plan.** A durable todo plan survives compaction; the agent always knows what it decided and what's next.
+- **Never freezes.** Compaction runs on the event loop with a hard budget and streams progress; tools execute off-loop. The spinner keeps moving even during a slow model call.
 - **Reliable edits.** An `edit` tool with retry, ambiguity detection, and verification — so a failed edit surfaces immediately instead of silently corrupting the file.
-- **Real memory.** After each turn, the agent reflects and writes its learnings to a persistent store (SQLite + FTS5). Next session, relevant experience is recalled and injected — automatically.
+- **Real memory.** After each turn, the agent reflects and writes its learnings to a persistent store (SQLite + FTS5). Long-horizon user constraints and decisions are consolidated into attributed memory on fold. Next session, relevant experience is recalled and injected — automatically.
+- **Isolated subagents.** Fork parallel subagents with their own session and context; opt-in `isolate` runs a mutating subagent in a fresh git worktree so it can't collide with your working tree.
 - **Skills that become tools.** A well-performing agent can crystallize its own methods into reusable *skills*, then *promote* them into compiled tools (the "midas" command). The agent literally expands its own toolbox.
-- **Lean by default.** ~13 tools at rest, ~1,600 tokens of system prompt. Capabilities are *mounted* on demand (and unmounted when done) — you never pay prompt budget for what you aren't using.
+- **Updates itself.** A hot self-update fetches and fast-forwards in place with daemon re-exec and session resume — guarded against dirty trees, verified end-to-end against a real git remote.
+- **Lean by default.** 14 tools at rest, ~1,600 tokens of system prompt. Capabilities are *mounted* on demand (and unmounted when done) — you never pay prompt budget for what you aren't using.
 
 ---
 
