@@ -58,7 +58,7 @@ def main():
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description='Kern — personal agent, TUI and local web workspace')
-    parser.add_argument('interface', nargs='?', choices=('tui','web','serve','gui'), default='tui')
+    parser.add_argument('interface', nargs='?', choices=('tui','web','serve','gui','update','restart','check-update'), default='tui')
     parser.add_argument('--model', help='model identifier (defaults to KERN_MODEL)')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--task', nargs='+', help='headless task; actions are automatically approved')
@@ -80,9 +80,62 @@ def main():
     elif args.interface == "gui":
         from . import gui
         gui.main()
+    elif args.interface in ("update", "restart", "check-update"):
+        _daemon_ctl(args.interface)
     else:
         from .tui import entry
         entry()
+
+
+async def _async_daemon_ctl(cmd):
+    """Send an update/restart/check-update command to the running daemon."""
+    try:
+        import websockets
+    except ImportError:
+        print('websockets not available; is the daemon interface installed?', file=sys.stderr)
+        return 2
+    from . import daemon as d
+    uri = f'ws://{d.HOST}:{d.PORT}/ws'
+    try:
+        async with websockets.connect(uri, max_size=32*1024*1024) as ws:
+            if cmd == 'check-update':
+                await ws.send(json.dumps({'id': 0, 'method': 'check_update'}))
+            elif cmd == 'update':
+                await ws.send(json.dumps({'id': 0, 'method': 'update'}))
+            else:
+                await ws.send(json.dumps({'id': 0, 'method': 'restart'}))
+            # Read until the reply for our id.
+            while True:
+                try:
+                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+                except asyncio.TimeoutError:
+                    print('daemon did not respond in time', file=sys.stderr)
+                    return 2
+                if ev.get('id') == 0 or ev.get('req_id') == 0:
+                    res = ev.get('result', ev)
+                    break
+            if cmd == 'check-update':
+                print(res.get('update', 'unknown'))
+                if res.get('detail'):
+                    print(res['detail'])
+            elif cmd == 'update':
+                print(res.get('update', ''))
+                if not res.get('ok'):
+                    print(res.get('reason', 'update failed'), file=sys.stderr)
+                    return 1
+                if res.get('restart'):
+                    print('restarting daemon into new code… (sessions persist and resume)')
+            else:
+                print('restarting daemon… (sessions persist and resume)')
+            return 0
+    except OSError as err:
+        print(f'no Kern daemon is running on this account — start one with: kern web ({err})', file=sys.stderr)
+        return 2
+
+
+def _daemon_ctl(cmd):
+    code = asyncio.run(_async_daemon_ctl(cmd))
+    sys.exit(code)
 
 
 if __name__ == "__main__":

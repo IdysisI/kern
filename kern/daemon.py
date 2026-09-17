@@ -22,6 +22,7 @@ import websockets
 from .client import Client, load_health
 from .engine import Engine
 from .journal import Session, create_session, list_sessions, session_previews
+from . import updater
 
 HOST = os.environ.get("KERN_SERVE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KERN_SERVE_PORT", "8766"))
@@ -253,6 +254,53 @@ def _preview(s: Session) -> str:
 
 REG = Registry()
 SHUTDOWN = None
+RESTART = False  # set True to re-exec into new code after graceful shutdown
+
+
+async def _request_restart():
+    """Gracefully shut the daemon down and re-exec into current code.
+
+    Sessions are persisted incrementally to their journals, so setting SHUTDOWN
+    + RESTART is enough: run_server's finally-block interrupts workers, then
+    re-execs; on boot the journal replays and resume() picks up dangling turns.
+    """
+    global RESTART
+    RESTART = True
+    if SHUTDOWN is not None:
+        SHUTDOWN.set()
+
+
+async def auto_update_watcher(notify=None):
+    """Poll the watched branch and hot-restart when new commits land.
+
+    Enabled only when KERN_AUTO_UPDATE=1. Never interrupts a running turn: if
+    any session is busy it defers and retries next interval. A failed or
+    non-fast-forward update is reported (and skipped), never fatal.
+    """
+    if not updater.should_autoupdate():
+        return
+    interval = updater.autoupdate_interval()
+    while SHUTDOWN is not None and not SHUTDOWN.is_set():
+        await asyncio.sleep(interval)
+        if SHUTDOWN.is_set():
+            break
+        try:
+            st = await asyncio.to_thread(updater.check_update)
+            if st.ok and st.changed:
+                busy = any(w.running for w in REG.workers.values())
+                if busy:
+                    if notify:
+                        notify('update available; waiting for a quiet moment to restart')
+                    continue
+                applied = await asyncio.to_thread(updater.apply_update)
+                if applied.ok and applied.changed:
+                    if notify:
+                        notify(f'auto-updating: {applied.summary()} — restarting')
+                    await _request_restart()
+                    return
+        except Exception:
+            # Auto-update must never crash the daemon; try again next interval.
+            continue
 
 
 async def handler(ws):
@@ -267,12 +315,13 @@ async def handler(ws):
                 await ws.send(json.dumps({"event": "error", "error": "request must be an object"}))
                 continue
             m = msg.get("method")
-            req_id = msg.get("req_id")
+            req_id = msg.get("req_id") if msg.get("req_id") is not None else msg.get("id")
 
             def reply(data, is_result=True):
                 payload = {"result": data} if is_result else {"event": "error", "error": str(data)}
                 if req_id is not None:
                     payload["req_id"] = req_id
+                    payload["id"] = req_id
                 return json.dumps(payload, ensure_ascii=False)
 
             try:
@@ -288,6 +337,33 @@ async def handler(ws):
                     await ws.send(reply({"shutdown": True}))
                     if SHUTDOWN is not None:
                         SHUTDOWN.set()
+                elif m == "check_update":
+                    # Read-only: report whether the watched branch has new commits.
+                    st = await asyncio.to_thread(updater.check_update)
+                    await ws.send(reply({"update": st.summary(), "changed": st.changed,
+                                         "ok": st.ok, "detail": st.detail}))
+                elif m == "update":
+                    # Pull new code and restart into it. If a turn is in flight we
+                    # refuse unless forced — sessions persist and resume on boot,
+                    # but the user may not want an interruption mid-task.
+                    force = bool(msg.get("force"))
+                    busy = [w for w in REG.workers.values() if w.running]
+                    if busy and not force:
+                        await ws.send(reply({"ok": False, "restart": False,
+                            "reason": f"{len(busy)} session(s) busy; retry with force to restart anyway"}))
+                    else:
+                        st = await asyncio.to_thread(updater.apply_update)
+                        if st.ok and st.changed:
+                            await ws.send(reply({"ok": True, "restart": True, "update": st.summary()}))
+                            await _request_restart()
+                        else:
+                            await ws.send(reply({"ok": st.ok, "restart": False,
+                                                 "update": st.summary(), "reason": st.reason}))
+                elif m == "restart":
+                    # Restart into the *current* working-tree code (no pull). Used
+                    # after a local edit/patch, or by the auto-update watcher.
+                    await ws.send(reply({"ok": True, "restart": True}))
+                    await _request_restart()
                 elif m == "sessions":
                     # parse journals OFF the event loop: listing() reads every
                     # events.jsonl on disk; on a busy daemon (mid-replay of a

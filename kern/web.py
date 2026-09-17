@@ -58,12 +58,15 @@ async def run_server():
     if daemon.HOST not in ('127.0.0.1','localhost','::1'):
         raise RuntimeError('Kern serves only loopback. Use an authenticated local tunnel for remote access.')
     daemon.SHUTDOWN = asyncio.Event()
+    watcher = asyncio.create_task(daemon.auto_update_watcher(
+        notify=lambda m: print(f'[kern] {m}', flush=True)))
     try:
         async with serve(safe_handler,daemon.HOST,daemon.PORT,process_request=process_request,
                          max_size=32*1024*1024, ping_interval=20):
             print(f'Kern: http://{daemon.HOST}:{daemon.PORT} — TUI and browser share persistent sessions',flush=True)
             await daemon.SHUTDOWN.wait()
     finally:
+        watcher.cancel()
         for worker in daemon.REG.workers.values():
             await worker.interrupt()
             runtime = getattr(worker.session,'_runtime',{})
@@ -75,3 +78,9 @@ async def run_server():
             mounts = runtime.get('mounts')
             if mounts:
                 await asyncio.gather(*(c.stop() for c in mounts.mcps.values()),return_exceptions=True)
+    # Graceful shutdown complete. If a restart was requested (hot-update or
+    # explicit), re-exec into the current working-tree code. Never returns.
+    if getattr(daemon,'RESTART',False):
+        from . import updater
+        updater.exec_restart()
+    return 0
