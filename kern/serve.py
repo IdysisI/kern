@@ -29,7 +29,7 @@ import websockets
 
 from .client import Client, load_health
 from .engine import Engine
-from .journal import Session, create_session, list_sessions
+from .journal import create_session, list_sessions
 from .pager import budget
 
 HOST = os.environ.get("KERN_SERVE_HOST", "127.0.0.1")

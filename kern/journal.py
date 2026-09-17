@@ -14,14 +14,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import subprocess
 import time
 import re
 import hashlib
 from .storage import atomic_write, file_lock, path_key, redact_value
 from pathlib import Path
 
-from .syscalls import redact as _redact
 
 KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))
 SESSIONS = KERN_HOME / "sessions"

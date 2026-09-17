@@ -17,7 +17,6 @@ fragment, and gives the correct shape.
 from __future__ import annotations
 
 import difflib
-import hashlib
 import html.parser
 import shutil
 import json

@@ -22,7 +22,6 @@ Anything outside those markers is never touched.
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
 MARK_BEGIN = '<!-- kern:auto -->'

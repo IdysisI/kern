@@ -1,7 +1,6 @@
 """Local browser UI and persistent WebSocket runtime on the same origin."""
 from __future__ import annotations
 import asyncio
-import mimetypes
 from pathlib import Path
 from urllib.parse import urlsplit
 from websockets.asyncio.server import serve

@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import kernel, pager, syscalls, resilience, auth
+from . import kernel, syscalls, resilience, auth
 from .storage import turn_lease
 from .client import Client, health_of, invalidate_health
 from .journal import Session, create_session
