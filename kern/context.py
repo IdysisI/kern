@@ -216,6 +216,15 @@ class ContextManager:
             # (b) KERN.md guidance (user-authored project conventions).
             try:
                 kp = _P(cwd) / 'KERN.md'
+                if not kp.is_file():
+                    # First contact with this repo: Kern orients itself — generate
+                    # a lean KERN.md so future sessions start informed (user does
+                    # nothing). Only in a git repo, so we never litter scratch dirs.
+                    if (_P(cwd) / '.git').exists():
+                        from .kernfile import ensure_kern_md
+                        res = ensure_kern_md(cwd)
+                        if res.get('created'):
+                            e.stream_cb('note', f"created {res['path']} (auto-detected project map)")
                 if kp.is_file():
                     txt = kp.read_text(errors='replace').strip()
                     if txt:
