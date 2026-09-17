@@ -1,278 +1,271 @@
-"""kern.memory — SOTA Tri-Layer Context & Memory Graph (TLCMG).
-
-Synthesized from Tencent H-MEM (ACL 2026), MemGate (arXiv 2606.06054),
-LCM (arXiv 2605.04050), and OMEGA entity isolation:
-
-  1. ZERO-REQUEST ATOM EXTRACTION: At session compaction, atomic facts
-     (decisions, key facts, resolved gotchas) are parsed mechanically from
-     the existing summary and deposited into L1 atoms/ with zero extra LLM calls.
-  2. MEMGATE ADMISSION MAP: A ~25-token cache-stable scope map tells the
-     model exactly what knowledge exists in the project without context pollution.
-  3. CANONICAL KEYED SUPERSESSION: Updates to entities/decisions automatically
-     supersede older values by canonical key matching (S-P-V pattern).
-  4. ACTIVE RECONCILIATION: memory(action="reconcile") filters tombstones and
-     superseded facts, returning only the crisp, current ground truth.
-  5. PROJECT-SCOPED & LOSSLESS: Namespaces are keyed by project directory hash;
-     raw events remain append-only in events.jsonl forever.
+"""Attributed project memory. Notes are claims, never execution ground truth.
+SQLite transactions serialize edits; explicit keys alone supersede older values.
+Legacy markdown stays readable, without automatic promotion into new facts.
 """
 from __future__ import annotations
-
+from contextlib import contextmanager
 import hashlib
+import json
 import os
-import re
-import subprocess
-import time
 from pathlib import Path
+import re
+import sqlite3
+import time
+import uuid
+from .storage import atomic_write, file_lock
 
-KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))
+KERN_HOME = Path(os.environ.get("KERN_HOME", "~/.kern")).expanduser()
 ROOT = KERN_HOME / "memory"
 
 
-def project_slug(cwd: str) -> str:
-    """Stable, human-readable per-project namespace: dirname + short hash."""
-    base = os.path.basename(os.path.normpath(cwd or os.getcwd())) or "root"
-    h = hashlib.sha1(os.path.abspath(cwd or os.getcwd()).encode()).hexdigest()[:6]
-    return re.sub(r"[^\w.-]+", "-", base)[:32] + "-" + h
-
-
-def _extract_canonical_key(text: str) -> str:
-    """Extract a canonical subject/key for supersession matching.
-    Handles 'key: value', 'key = value', 'key -> value', or bracket '[key] text'.
-    Falls back to the first 4 meaningful words."""
-    cleaned = text.strip().lstrip("-* ").strip()
-    cleaned = re.sub(r"^\d{4}-\d{2}-\d{2}:\s*", "", cleaned)
-    # Pattern 1: [Subject] ...
-    m_bracket = re.match(r"^\[([^\]]+)\]", cleaned)
-    if m_bracket:
-        return re.sub(r"[^a-z0-9_.-]+", ".", m_bracket.group(1).lower().strip()).strip(".")
-    # Pattern 2: key: val, key = val, key -> val
-    m_delim = re.split(r"[:=→]|->", cleaned, maxsplit=1)
-    if len(m_delim) > 1 and len(m_delim[0].strip().split()) <= 4:
-        return re.sub(r"[^a-z0-9_.-]+", ".", m_delim[0].lower().strip()).strip(".")
-    # Pattern 3: First 3 words
-    words = [re.sub(r"[^a-z0-9]", "", w.lower()) for w in cleaned.split()[:3]]
-    return ".".join(w for w in words if w)
+def project_slug(cwd):
+    path = os.path.normcase(str(Path(cwd or os.getcwd()).resolve()))
+    name = re.sub(r"[^\w.-]+", "-", Path(path).name)[:32] or "root"
+    return name + "-" + hashlib.sha1(path.encode()).hexdigest()[:6]
 
 
 class MemoryTree:
-    def __init__(self, cwd: str, root: Path | None = None):
-        self.cwd = os.path.abspath(cwd or os.getcwd())
+    def __init__(self, cwd, root=None):
+        self.cwd = str(Path(cwd or os.getcwd()).resolve())
         self.slug = project_slug(self.cwd)
         self.root = (Path(root) if root else ROOT) / self.slug
         self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / "atoms").mkdir(exist_ok=True)
-        (self.root / "scenarios").mkdir(exist_ok=True)
+        # The previous release hashed the unnormalised absolute path. On
+        # Windows the canonical namespace differs; copy legacy notes once,
+        # retaining the originals and never promoting them into verified facts.
+        old_path = os.path.abspath(cwd or os.getcwd())
+        old_name = re.sub(r'[^\w.-]+', '-', os.path.basename(os.path.normpath(old_path)) or 'root')[:32]
+        legacy = (Path(root) if root else ROOT) / (old_name + '-' + hashlib.sha1(old_path.encode()).hexdigest()[:6])
+        marker = self.root / 'legacy-import.json'
+        if legacy != self.root and legacy.is_dir() and not marker.exists():
+            with file_lock(self.root / '.migration.lock'):
+                if not marker.exists():
+                    imported = []
+                    for path in legacy.rglob('*.md'):
+                        if not path.resolve().is_relative_to(legacy.resolve()):
+                            continue
+                        dest = self.root / path.relative_to(legacy)
+                        if not dest.exists():
+                            atomic_write(dest, path.read_bytes())
+                            imported.append(str(path))
+                    atomic_write(marker, json.dumps({'source':str(legacy), 'files':imported, 'unverified':True}))
+        for sub in ('atoms', 'scenarios'):
+            (self.root / sub).mkdir(exist_ok=True)
+        self.db = self.root / 'memory.sqlite3'
+        with self.connect() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS notes (
+                id TEXT PRIMARY KEY, topic TEXT NOT NULL, key TEXT,
+                text TEXT NOT NULL, source TEXT NOT NULL, created REAL NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active', supersedes TEXT)""")
+            db.execute('CREATE INDEX IF NOT EXISTS notes_topic ON notes(topic,status)')
+            # pinned: explicit user/agent flag that floats a note to the top of recall.
+            try:
+                db.execute("ALTER TABLE notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass  # column already exists
 
-    # ---- MemGate Admission Map (~25 tokens, cache-stable) --------------------
+    @contextmanager
+    def connect(self):
+        db = sqlite3.connect(self.db, timeout=15)
+        db.row_factory = sqlite3.Row
+        db.execute('PRAGMA busy_timeout=15000')
+        db.execute('PRAGMA synchronous=FULL')
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
-    def scope_hint(self, max_chars: int = 400) -> str:
-        """Compact access map for the system prompt: tells the agent what
-        topics exist in this project's memory so it never starts cold,
-        without leaking irrelevant details or invalidating prompt cache."""
-        atoms = list((self.root / "atoms").glob("*.md"))
-        scenarios = list((self.root / "scenarios").glob("*.md"))
-        proj = self.root / "project.md"
-        if not atoms and not scenarios and not proj.exists():
-            return ""
-        topics = []
-        if proj.exists():
-            topics.append("project.md")
-        for p in sorted(atoms, key=lambda x: x.name):
-            # count active lines
-            lines = [l for l in p.read_text(errors="replace").splitlines()
-                     if l.strip() and not l.strip().startswith("#") and "deleted" not in l]
-            topics.append(f"atoms/{p.stem} ({len(lines)})")
-        if scenarios:
-            topics.append(f"scenarios ({len(scenarios)} runs)")
-        return (f"<memory-scope project=\"{self.slug}\">\n"
-                f"available: {', '.join(topics)}\n"
-                f"query: memory(action=\"search\", pattern=\"...\") or "
-                f"memory(action=\"reconcile\", topic=\"...\")\n"
-                f"</memory-scope>")[:max_chars]
+    def _path(self, rel):
+        if not isinstance(rel, str) or not rel or "\\" in rel or ':' in rel:
+            raise ValueError('invalid memory path')
+        path = (self.root / rel).resolve()
+        if not path.is_relative_to(self.root.resolve()) or path.suffix != '.md':
+            raise ValueError('memory path must stay inside the project namespace')
+        return path
 
-    # ---- Query-only API (called on demand) -----------------------------------
+    def _rows(self):
+        with self.connect() as db:
+            return [dict(r) for r in db.execute("SELECT * FROM notes WHERE status='active' ORDER BY created DESC")]
 
-    def outline(self, max_chars: int = 1500) -> str:
-        """Hierarchical index: project summary + atom outlines + scenario index."""
-        out = [f"memory index for {self.cwd} ({self.slug})"]
-        proj = self.root / "project.md"
-        if proj.exists():
-            out.append("project.md:")
-            for line in proj.read_text(errors="replace").splitlines()[:10]:
-                out.append("  " + line[:120])
-        for sub in ("atoms", "scenarios"):
-            files = sorted((self.root / sub).glob("*.md"),
-                           key=lambda p: p.stat().st_mtime, reverse=True)
-            for p in files[:8]:
-                lines = [l.strip() for l in p.read_text(errors="replace").splitlines()
-                         if l.strip() and not l.strip().startswith("#")]
-                first = lines[0] if lines else "(empty)"
-                out.append(f"{sub}/{p.name} [{len(lines)} items]: {first[:100]}")
-            if len(files) > 8:
-                out.append(f"… {len(files) - 8} more in {sub}/ (use memory(search))")
-        return "\n".join(out)[:max_chars] if len(out) > 1 else "(no memory yet for this project)"
+    def scope_hint(self, max_chars=400):
+        rows = self._rows()
+        if not rows and not any(self.root.rglob('*.md')):
+            return ''
+        topics = ', '.join(sorted({r['topic'] for r in rows}))[:200]
+        return f'<memory-index>Attributed project notes: {len(rows)}; topics: {topics}. Query memory when relevant; notes can be stale.</memory-index>'
 
-    def read(self, rel: str) -> str:
-        rel = (rel or "").strip().strip("/")
-        if not rel or ".." in rel.split("/"):
-            return "error: invalid memory path"
-        p = self.root / rel
-        if not p.exists() or not p.is_file():
-            near = [q.name for q in p.parent.glob("*.md")] if p.parent.exists() else []
-            return (f"no such memory file: {rel} — available in directory: {', '.join(near[:8]) or '(none)'}\n"
-                    f"Use memory(action=\"outline\") or memory(action=\"search\") to locate records.")
-        return p.read_text(errors="replace")
+    def outline(self, max_chars=1500):
+        rows = self._rows()
+        lines = [f'Project notes for {self.cwd} (claims, not verified facts)']
+        for r in rows[:20]:
+            lines.append(f"note:{r['id']} [{r['topic']}] {r['text'][:120]} (source {r['source']})")
+        lines += [f'legacy: {p.relative_to(self.root).as_posix()}' for p in self.root.rglob('*.md')][:20]
+        return '\n'.join(lines)[:max_chars]
 
-    def write(self, rel: str, text: str) -> str:
-        rel = (rel or "").strip().strip("/")
-        ok = rel == "project.md" or rel.startswith(("atoms/", "scenarios/"))
-        if not ok or ".." in rel.split("/") or not rel.endswith(".md"):
-            return "error: writable targets are project.md, atoms/<topic>.md, scenarios/<name>.md"
-        p = self.root / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text)
-        return f"wrote memory:{rel} ({len(text)} chars)"
+    def read(self, rel):
+        if rel.startswith('note:'):
+            with self.connect() as db:
+                row = db.execute('SELECT * FROM notes WHERE id=?', (rel[5:],)).fetchone()
+            return json.dumps(dict(row), ensure_ascii=False) if row else 'error: unknown note'
+        try:
+            path = self._path(rel)
+            return '[legacy or manually authored note; unverified]\n' + path.read_text(encoding='utf-8')
+        except (OSError, ValueError) as e:
+            return f'error: {e}'
 
-    def search(self, pattern: str, max_results: int = 20) -> str:
-        if not any(self.root.rglob("*.md")):
-            return f"(no memory yet for this project — nothing matches {pattern!r})"
-        r = subprocess.run(["rg", "--line-number", "--no-heading", "--color=never",
-                            "-i", "--max-count", str(max_results),
-                            pattern, str(self.root)],
-                           capture_output=True, text=True, timeout=15)
-        lines = r.stdout.splitlines()
-        if not lines:
-            return f"no memory matches for {pattern!r}"
-        return "\n".join(l.replace(str(self.root) + "/", "memory:")[:200]
-                          for l in lines[:max_results])
+    def write(self, rel, text):
+        try:
+            path = self._path(rel)
+            if rel != 'project.md' and not rel.startswith(('atoms/', 'scenarios/')):
+                raise ValueError('use project.md, atoms/<topic>.md or scenarios/<name>.md')
+            atomic_write(path, text)
+            return f'wrote memory:{rel} (manually authored, unverified)'
+        except (ValueError, OSError) as e:
+            return f'error: {e}'
 
-    def reconcile(self, topic: str) -> str:
-        """Return the crisp, CURRENT ground truth for a topic:
-        automatically filters out superseded facts and deleted tombstones."""
-        topic_slug = re.sub(r"[^\w.-]+", "-", (topic or "general").strip().lower())
-        candidates = [self.root / "atoms" / f"{topic_slug}.md"]
-        if topic_slug in ("project", "root", "main"):
-            candidates.append(self.root / "project.md")
-        target = next((c for c in candidates if c.exists()), None)
-        if not target:
-            near = [p.stem for p in (self.root / "atoms").glob("*.md")]
-            return f"no topic '{topic}' found. Active atom topics: {', '.join(near) or '(none)'}"
-        lines = target.read_text(errors="replace").splitlines()
-        active = []
-        for l in lines:
-            s = l.strip()
-            if not s or s.startswith("#") or "<!-- deleted" in s or "<!-- superseded" in s:
+    def search(self, pattern, max_results=20):
+        # Deterministic BM25 ranking (kern.recall) over notes + legacy markdown.
+        # Zero model calls; ranks by true term-relevance + recency instead of the old
+        # naive "count of distinct terms present" which treated all matches equally.
+        from .recall import BM25Index, Doc
+        rows = self._rows()
+        # Exact id lookup first: searching by a note id must always find it (a 32-hex
+        # id has no lexical overlap with the body, so BM25 alone would miss it).
+        pat = (pattern or '').strip().removeprefix('note:')
+        if re.fullmatch(r"[0-9a-f]{16,64}", pat):
+            for row in rows:
+                if row['id'] == pat:
+                    return f"note:{row['id']} [{row['topic']}] {row['text']} [source:{row['source']}]"
+        docs: list[Doc] = []
+        for row in rows:
+            docs.append(Doc(id=f"note:{row['id']}",
+                            text=f"[{row['topic']}] {row['text']} [source:{row['source']}]",
+                            tokens=[], pinned=bool(row.get('pinned')), ts=float(row.get('created', 0)),
+                            source=f"note:{row['id']}"))
+        for p in self.root.rglob('*.md'):
+            if not p.resolve().is_relative_to(self.root.resolve()):
                 continue
-            active.append(l)
-        body = "\n".join(active) if active else "(no active facts remaining — all superseded or tombstoned)"
-        return f"# Active Ground Truth: {topic}\n{body}"
+            for n, line in enumerate(p.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
+                if '<!-- deleted' in line or '<!-- superseded' in line:
+                    continue
+                docs.append(Doc(id=f"legacy:{p.relative_to(self.root).as_posix()}:{n}",
+                                text=line, tokens=[], ts=0, source="legacy"))
+        idx = BM25Index()
+        idx.build(docs)
+        ranked = idx.search(pattern, half_life_s=7 * 86400.0, recency_weight=0.1)
+        if not ranked:
+            return '(no matching memory)'
+        lines = []
+        for doc, _s in ranked[:max_results]:
+            if doc.id.startswith('note:'):
+                lines.append(f"{doc.id} {doc.text}")
+            else:
+                lines.append(doc.id + ': ' + doc.text)
+        return ('SQLite notes: read the full record with memory(action="read", path="note:<id>"). '
+                'These identifiers are not Markdown filenames.\n' +
+                '\n'.join(x[:1200] for x in lines))
 
-    # ---- Knowledge Evolution & Supersession ----------------------------------
+    def _norm_text(self, text: str) -> str:
+        """Normalize a note body for dedupe: lowercase, collapse whitespace."""
+        return ' '.join(text.casefold().split())
 
-    def remember(self, text: str, topic: str = "general", sid: str = "", key: str = "") -> str:
-        """L1 atomic fact: dated, attributed with session ID, with canonical
-        supersession. If an existing active fact shares the canonical key,
-        it is cleanly superseded instead of accumulating contradictory duplicates."""
-        topic = re.sub(r"[^\w.-]+", "-", (topic or "general").strip().lower()) or "general"
-        p = self.root / "atoms" / f"{topic}.md"
-        stamp = time.strftime("%Y-%m-%d")
-        src = f" [src:{sid[-6:]}]" if sid else ""
-        canon_key = (key or _extract_canonical_key(text)).strip().lower()
+    def _source_rank(self, source: str) -> int:
+        """Higher = more authoritative. Verified receipts outrank model claims."""
+        s = (source or '')
+        if s.startswith('receipt') or 'tool_result' in s or 'verified' in s:
+            return 3
+        if s.startswith('session:'):
+            return 2
+        if s.startswith('manual'):
+            return 1
+        return 0
 
-        existing = p.read_text(errors="replace") if p.exists() else ""
-        lines = existing.splitlines()
-        updated_lines = []
-        superseded_count = 0
+    def reconcile(self, topic):
+        """Return the active claims for a topic, resolving contradictions.
 
-        if canon_key and len(canon_key) >= 3:
-            for line in lines:
-                # check if this active line shares the canonical key
-                if "<!-- superseded" not in line and "<!-- deleted" not in line:
-                    line_key = _extract_canonical_key(line).strip().lower()
-                    if line_key and (line_key == canon_key or (len(canon_key) > 5 and canon_key in line_key)):
-                        updated_lines.append(line + f"  <!-- superseded {stamp} by [{canon_key}] -->")
-                        superseded_count += 1
-                        continue
-                updated_lines.append(line)
-        else:
-            updated_lines = lines
+        M3 hygiene: notes sharing the same ``key`` are already superseded at
+        write time. For *unkeyed* notes that assert conflicting values about the
+        same subject, we surface only the newest / highest-source-rank claim as
+        'current' and list the rest as 'superseded candidates', so retrieval
+        never silently returns a stale or self-contradicting set. Raw rows are
+        untouched (nothing is deleted — decay lowers rank, never deletes).
+        """
+        rows = [r for r in self._rows() if r['topic'] == topic]
+        if not rows:
+            return f'No attributed claims for topic "{topic}".'
+        # Rank: newest first, then source authority, then pinned.
+        ranked = sorted(rows, key=lambda r: (
+            r.get('pinned', 0), self._source_rank(r['source']), r['created']), reverse=True)
+        # Dedupe by normalized text, keeping the highest-ranked copy.
+        seen = set()
+        current, superseded = [], []
+        for r in ranked:
+            k = self._norm_text(r['text'])
+            if k in seen:
+                superseded.append(r)
+                continue
+            seen.add(k)
+            current.append(r)
+        lines = [f'Attributed claims for "{topic}" (current; {len(superseded)} duplicate/conflicting elided):']
+        for r in current:
+            lines.append(f"note:{r['id']}: {r['text']} [source:{r['source']}]")
+        if superseded:
+            lines.append('Elided as duplicate/lower-rank (recoverable via history):')
+            for r in superseded:
+                lines.append(f"  ~ note:{r['id']}: {r['text'][:80]} [source:{r['source']}]")
+        return '\n'.join(lines)
 
-        new_entry = f"- {stamp}: [{canon_key}] {text.strip()}{src}" if canon_key else f"- {stamp}: {text.strip()}{src}"
-        updated_lines.append(new_entry)
-        p.write_text("\n".join(updated_lines) + "\n")
-        msg = f"remembered in memory:atoms/{topic}.md"
-        if superseded_count:
-            msg += f" (superseded {superseded_count} older statement)"
-        return msg
+    def remember(self, text, topic='general', sid='', key='', source=''):
+        from .syscalls import redact
+        if not text.strip():
+            raise ValueError('empty memory note')
+        source = source or (f'session:{sid}:model-note' if sid else 'manual:unverified')
+        norm = self._norm_text(text)
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            old = []
+            if key:
+                old = [r['id'] for r in db.execute("SELECT id FROM notes WHERE topic=? AND key=? AND status='active'", (topic,key))]
+                db.execute("UPDATE notes SET status='superseded' WHERE topic=? AND key=? AND status='active'", (topic,key))
+            else:
+                # M3 dedupe: an identical active note in this topic already exists —
+                # return it instead of inserting a duplicate row (kills pollution).
+                for r in db.execute("SELECT id,text FROM notes WHERE topic=? AND status='active'", (topic,)):
+                    if self._norm_text(r['text']) == norm:
+                        return f'already remembered as note:{r["id"]} (deduped)'
+            nid = uuid.uuid4().hex
+            db.execute('INSERT INTO notes(id,topic,key,text,source,created,supersedes) VALUES(?,?,?,?,?,?,?)',
+                       (nid, topic, key or None, redact(text.strip()), source, time.time(), json.dumps(old)))
+        return f'remembered note:{nid} [source:{source}]' + (f'; superseded {len(old)} explicitly keyed notes' if old else '')
 
-    def forget(self, pattern: str) -> str:
-        """Mark matching facts as deleted (tombstone, preserving provenance)."""
-        removed = 0
-        targets = list((self.root / "atoms").glob("*.md"))
-        if (self.root / "project.md").exists():
-            targets.append(self.root / "project.md")
-        for p in targets:
-            lines = p.read_text(errors="replace").splitlines()
-            keep = []
-            for line in lines:
-                if re.search(pattern, line, re.I) and "<!-- deleted" not in line:
-                    keep.append(line + "  <!-- deleted -->")
-                    removed += 1
-                else:
-                    keep.append(line)
-            p.write_text("\n".join(keep) + "\n")
-        return f"tombstoned {removed} memory lines matching {pattern!r}"
+    def forget(self, pattern):
+        if not pattern.strip():
+            raise ValueError('nonempty forget pattern required')
+        rows = [r for r in self._rows() if pattern.casefold() in r['text'].casefold()]
+        with self.connect() as db:
+            db.executemany("UPDATE notes SET status='deleted' WHERE id=?", [(r['id'],) for r in rows])
+        legacy_count = 0
+        for path in self.root.rglob('*.md'):
+            if not path.resolve().is_relative_to(self.root.resolve()):
+                continue
+            with file_lock(path.with_suffix('.kern-lock')):
+                original = path.read_text(encoding='utf-8')
+                lines = []
+                changed = False
+                for line in original.splitlines(keepends=True):
+                    if pattern.casefold() in line.casefold() and '<!-- deleted' not in line:
+                        line = '<!-- deleted --> ' + line
+                        legacy_count += 1
+                        changed = True
+                    lines.append(line)
+                if changed:
+                    atomic_write(path, ''.join(lines))
+        return f'tombstoned {len(rows)} attributed notes and {legacy_count} legacy lines'
 
-    def absorb(self, sid: str, summary: str, title: str = "") -> str:
-        """Dual-action compaction deposit:
-        1. Writes the full L2 scenario block to scenarios/.
-        2. Automatically parses decisions, key facts, and resolved gotchas
-           into L1 atoms/ with ZERO extra LLM requests (pure deterministic regex)."""
-        if not title:
-            first = next((l.strip() for l in summary.splitlines() if l.strip()), "")
-            title = re.sub(r"[^\w -]+", "", first)[:48].strip().replace(" ", "-").lower() or "session"
-        name = f"{time.strftime('%Y%m%d')}-{title}-{sid[-6:]}.md"
-        (self.root / "scenarios" / name).write_text(
-            f"# scenario: {title}\nsession: {sid}\ndate: {time.strftime('%Y-%m-%d')}\n\n"
-            f"{summary}\n\n(full raw history: ~/.kern/sessions/{sid}/events.jsonl)\n")
-
-        # Zero-request atomic distillation from the summary
-        self._distill_atoms_from_summary(summary, sid)
-
-        # Scenarios rotation: keep 30 active, archive older
-        scen = sorted((self.root / "scenarios").glob("*.md"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in scen[30:]:
-            archive = self.root / "scenarios-archive"
-            archive.mkdir(exist_ok=True)
-            old.rename(archive / old.name)
-        return f"absorbed into memory:scenarios/{name}"
-
-    def _distill_atoms_from_summary(self, summary: str, sid: str) -> None:
-        """Parse structured sections out of the summary and deposit into atoms/."""
-        # Extract decisions (section 3)
-        m_dec = re.search(r"(?:3\.\s*decisions|decisions:?)\s*[—\-:]?\s*(.*?)(?=\n\s*\d+\.|\Z)",
-                          summary, re.DOTALL | re.I)
-        if m_dec:
-            for item in m_dec.group(1).splitlines():
-                clean = item.strip().lstrip("-* ").strip()
-                if clean and len(clean) > 8 and "none" not in clean.lower()[:8]:
-                    self.remember(clean, topic="decisions", sid=sid)
-
-        # Extract key facts (section 7)
-        m_facts = re.search(r"(?:7\.\s*key_facts|key_facts:?)\s*[—\-:]?\s*(.*?)(?=\n\s*\d+\.|\Z)",
-                            summary, re.DOTALL | re.I)
-        if m_facts:
-            for item in m_facts.group(1).splitlines():
-                clean = item.strip().lstrip("-* ").strip()
-                if clean and len(clean) > 8 and "none" not in clean.lower()[:8]:
-                    self.remember(clean, topic="facts", sid=sid)
-
-        # Extract errors/gotchas (section 4)
-        m_err = re.search(r"(?:4\.\s*errors_encountered|errors_encountered:?)\s*[—\-:]?\s*(.*?)(?=\n\s*\d+\.|\Z)",
-                          summary, re.DOTALL | re.I)
-        if m_err:
-            for item in m_err.group(1).splitlines():
-                clean = item.strip().lstrip("-* ").strip()
-                if clean and len(clean) > 8 and "none" not in clean.lower()[:8]:
-                    self.remember(clean, topic="gotchas", sid=sid)
+    def absorb(self, sid, summary, title=''):
+        # Compatibility export only. Summaries are not automatically facts.
+        name = f'{time.time_ns()}-{sid}.md'
+        atomic_write(self.root / 'scenarios' / name,
+                     f'# Unverified session summary\nsource: session:{sid}\n\n{summary}')
+        return f'scenarios/{name}'

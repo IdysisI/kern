@@ -22,6 +22,7 @@ import websockets
 from .client import Client, load_health
 from .engine import Engine
 from .journal import Session, create_session, list_sessions, session_previews
+from . import updater
 
 HOST = os.environ.get("KERN_SERVE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KERN_SERVE_PORT", "8766"))
@@ -42,7 +43,10 @@ class Worker:
         self.pending_approval: tuple[int, str, str | None] | None = None
         self._approvals: dict[int, asyncio.Future] = {}
         self._approval_seq = 0
+        self._approval_lock = asyncio.Lock()
+        self._turn_lock = asyncio.Lock()
         self.usage = {"in": 0, "out": 0, "requests": 0}
+        self.context = {}
 
     # ---- outbound -----------------------------------------------------------
 
@@ -53,6 +57,7 @@ class Worker:
             pass
 
     async def broadcast(self, **msg):
+        msg.setdefault("session", self.session.id)
         for ws in list(self.clients):
             await self.send(ws, **msg)
 
@@ -66,6 +71,10 @@ class Worker:
     # ---- approvals: wait for a human, even across terminal deaths -----------
 
     async def approve(self, desc: str, diff: str | None = None) -> bool:
+        async with self._approval_lock:
+            return await self._approve_one(desc, diff)
+
+    async def _approve_one(self, desc: str, diff: str | None = None) -> bool:
         self._approval_seq += 1
         aid = self._approval_seq
         fut = asyncio.get_running_loop().create_future()
@@ -94,21 +103,22 @@ class Worker:
         return self.turn is not None and not self.turn.done()
 
     async def chat(self, text: str):
-        if self.running:
-            await self.broadcast(event="busy", text="turn already running; interrupt first")
-            return
-        await self.broadcast(event="turn_start")
-        self._run_turn(eng_cb=lambda e: e.chat(text))
+        async with self._turn_lock:
+            if self.running:
+                raise RuntimeError("turn already running; interrupt first")
+            await self.broadcast(event="turn_start")
+            self._run_turn(eng_cb=lambda e: e.chat(text))
 
     async def resume(self):
         """A daemon crash left the journal mid-turn (user message, no
         turn_end). Pick the turn back up: the pager flags dangling actions
         as uncertain, so the model verifies instead of re-firing side effects."""
-        if self.running or not self.session.turn_is_open():
-            return False
-        await self.broadcast(event="turn_start", resumed=True)
-        self._run_turn(eng_cb=lambda e: e.resume())
-        return True
+        async with self._turn_lock:
+            if self.running or not self.session.turn_is_open():
+                return False
+            await self.broadcast(event="turn_start", resumed=True)
+            self._run_turn(eng_cb=lambda e: e.resume())
+            return True
 
     def _run_turn(self, eng_cb):
         eng = self.engine()
@@ -118,7 +128,8 @@ class Worker:
                 reply = await eng_cb(eng)
                 self.usage = {"in": eng.usage_in, "out": eng.usage_out,
                               "requests": eng.requests}
-                await self.broadcast(event="turn_end", reply=reply, usage=self.usage)
+                self.context = getattr(eng,'context_stats',{})
+                await self.broadcast(event="turn_end", reply=reply, usage=self.usage, stop_reason=eng.stop_reason)
             except asyncio.CancelledError:
                 await self.broadcast(event="turn_end", reply="", interrupted=True)
             except Exception as e:
@@ -129,7 +140,10 @@ class Worker:
     async def interrupt(self):
         if self.running:
             self.turn.cancel()
-            await asyncio.sleep(0)
+            try:
+                await self.turn
+            except asyncio.CancelledError:
+                pass
 
     # ---- journal mutations (the daemon owns the session; clients ask) -------
 
@@ -139,19 +153,8 @@ class Worker:
         while self.running:
             await asyncio.sleep(0.05)
         n = self.session.undo_to_last_user()
-        restored = []
-        if n:
-            try:
-                ckpts = sorted(self.session.ckpt.glob("c*"),
-                               key=lambda p: int(p.name[1:]))
-                for c in reversed(ckpts):
-                    man = json.loads((c / "manifest.json").read_text())
-                    if man.get("event_n", 1 << 30) <= len(self.session.events):
-                        restored = self.session.restore(int(c.name[1:]))
-                        break
-            except Exception:
-                pass
-        return {"dropped": n, "events": len(self.session.events), "restored": restored}
+        return {"dropped": n, "events": len(self.session.events),
+                "restored": getattr(self.session, 'last_restored', [])}
 
     async def rewind(self, cid: int) -> dict:
         await self.interrupt()
@@ -161,13 +164,11 @@ class Worker:
         return {"restored": restored, "events": len(self.session.events)}
 
     async def fork(self, at_n: int | None = None) -> dict:
-        """Branch the session; this Worker switches to the child so the
-        attached client keeps streaming against the new journal."""
+        """Create a child without moving other attached clients off the parent."""
         await self.interrupt()
         while self.running:
             await asyncio.sleep(0.05)
         child = self.session.fork(at_n)
-        self.session = child
         return {"session": child.id, "events": len(child.events)}
 
 
@@ -176,6 +177,7 @@ class Registry:
 
     def __init__(self):
         self.workers: dict[str, Worker] = {}
+        self.lock = asyncio.Lock()
 
     def ensure(self, sid: str, model: str | None = None) -> Worker:
         if sid in self.workers:
@@ -184,6 +186,8 @@ class Registry:
                 w.model = model
             return w
         sess = Session(sid)
+        if not sess.log.is_file():
+            raise ValueError('unknown session')
         w = Worker(sess, model or os.environ.get("KERN_MODEL", "gemini-3.8-flash-api"))
         self.workers[sid] = w
         return w
@@ -249,6 +253,54 @@ def _preview(s: Session) -> str:
 
 
 REG = Registry()
+SHUTDOWN = None
+RESTART = False  # set True to re-exec into new code after graceful shutdown
+
+
+async def _request_restart():
+    """Gracefully shut the daemon down and re-exec into current code.
+
+    Sessions are persisted incrementally to their journals, so setting SHUTDOWN
+    + RESTART is enough: run_server's finally-block interrupts workers, then
+    re-execs; on boot the journal replays and resume() picks up dangling turns.
+    """
+    global RESTART
+    RESTART = True
+    if SHUTDOWN is not None:
+        SHUTDOWN.set()
+
+
+async def auto_update_watcher(notify=None):
+    """Poll the watched branch and hot-restart when new commits land.
+
+    Enabled only when KERN_AUTO_UPDATE=1. Never interrupts a running turn: if
+    any session is busy it defers and retries next interval. A failed or
+    non-fast-forward update is reported (and skipped), never fatal.
+    """
+    if not updater.should_autoupdate():
+        return
+    interval = updater.autoupdate_interval()
+    while SHUTDOWN is not None and not SHUTDOWN.is_set():
+        await asyncio.sleep(interval)
+        if SHUTDOWN.is_set():
+            break
+        try:
+            st = await asyncio.to_thread(updater.check_update)
+            if st.ok and st.changed:
+                busy = any(w.running for w in REG.workers.values())
+                if busy:
+                    if notify:
+                        notify('update available; waiting for a quiet moment to restart')
+                    continue
+                applied = await asyncio.to_thread(updater.apply_update)
+                if applied.ok and applied.changed:
+                    if notify:
+                        notify(f'auto-updating: {applied.summary()} — restarting')
+                    await _request_restart()
+                    return
+        except Exception:
+            # Auto-update must never crash the daemon; try again next interval.
+            continue
 
 
 async def handler(ws):
@@ -259,109 +311,176 @@ async def handler(ws):
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(msg, dict):
+                await ws.send(json.dumps({"event": "error", "error": "request must be an object"}))
+                continue
             m = msg.get("method")
-            req_id = msg.get("req_id")
+            req_id = msg.get("req_id") if msg.get("req_id") is not None else msg.get("id")
 
             def reply(data, is_result=True):
                 payload = {"result": data} if is_result else {"event": "error", "error": str(data)}
                 if req_id is not None:
                     payload["req_id"] = req_id
+                    payload["id"] = req_id
                 return json.dumps(payload, ensure_ascii=False)
 
-            if m == "version":
-                await ws.send(reply({"version": DAEMON_VERSION, "pid": os.getpid()}))
-            elif m == "shutdown":
-                await ws.send(reply({"shutdown": True}))
-                asyncio.get_event_loop().call_later(0.1, lambda: os._exit(0))
-            elif m == "sessions":
-                # parse journals OFF the event loop: listing() reads every
-                # events.jsonl on disk; on a busy daemon (mid-replay of a
-                # huge journal) doing it inline starved the loop, handshakes
-                # timed out, and TUIs fell back to local mode (or worse,
-                # killed a healthy daemon). Never block the loop on disk.
-                current_cwd = msg.get("cwd")
-                listing = await asyncio.to_thread(REG.listing, current_cwd=current_cwd)
-                await ws.send(reply({"sessions": listing}))
-            elif m == "new":
-                new_worker = REG.new(msg.get("cwd", os.getcwd()), msg.get("model"))
-                if worker is not None and worker is not new_worker:
+            try:
+                if m == "models":
+                    try:
+                        models = await Client().list_models()
+                        await ws.send(reply({'models':models, 'health':load_health()}))
+                    except Exception as e:
+                        await ws.send(reply(str(e),is_result=False))
+                elif m == "version":
+                    await ws.send(reply({"version": DAEMON_VERSION, "pid": os.getpid(), "running": any(w.running for w in REG.workers.values())}))
+                elif m == "shutdown":
+                    await ws.send(reply({"shutdown": True}))
+                    if SHUTDOWN is not None:
+                        SHUTDOWN.set()
+                elif m == "check_update":
+                    # Read-only: report whether the watched branch has new commits.
+                    st = await asyncio.to_thread(updater.check_update)
+                    await ws.send(reply({"update": st.summary(), "changed": st.changed,
+                                         "ok": st.ok, "detail": st.detail}))
+                elif m == "update":
+                    # Pull new code and restart into it. If a turn is in flight we
+                    # refuse unless forced — sessions persist and resume on boot,
+                    # but the user may not want an interruption mid-task.
+                    force = bool(msg.get("force"))
+                    busy = [w for w in REG.workers.values() if w.running]
+                    if busy and not force:
+                        await ws.send(reply({"ok": False, "restart": False,
+                            "reason": f"{len(busy)} session(s) busy; retry with force to restart anyway"}))
+                    else:
+                        st = await asyncio.to_thread(updater.apply_update)
+                        if st.ok and st.changed:
+                            await ws.send(reply({"ok": True, "restart": True, "update": st.summary()}))
+                            await _request_restart()
+                        else:
+                            await ws.send(reply({"ok": st.ok, "restart": False,
+                                                 "update": st.summary(), "reason": st.reason}))
+                elif m == "restart":
+                    # Restart into the *current* working-tree code (no pull). Used
+                    # after a local edit/patch, or by the auto-update watcher.
+                    await ws.send(reply({"ok": True, "restart": True}))
+                    await _request_restart()
+                elif m == "sessions":
+                    # parse journals OFF the event loop: listing() reads every
+                    # events.jsonl on disk; on a busy daemon (mid-replay of a
+                    # huge journal) doing it inline starved the loop, handshakes
+                    # timed out, and TUIs fell back to local mode (or worse,
+                    # killed a healthy daemon). Never block the loop on disk.
+                    current_cwd = msg.get("cwd")
+                    listing = await asyncio.to_thread(REG.listing, current_cwd=current_cwd)
+                    await ws.send(reply({"sessions": listing}))
+                elif m == "new":
+                    new_worker = REG.new(msg.get("cwd", os.getcwd()), msg.get("model"))
+                    if worker is not None and worker is not new_worker:
+                        worker.clients.discard(ws)
+                    worker = new_worker
+                    worker.clients.add(ws)
+                    await ws.send(reply({"attached": worker.session.id, "model": worker.model}))
+                elif m == "attach":
+                    requested_model = msg.get("model")
+                    # Session(sid) parses the whole journal — off the loop (a
+                    # huge replay here starved handshakes; see "sessions").
+                    # ensure() itself only hits disk on the FIRST attach of a
+                    # session; afterwards it's a dict lookup.
+                    async with REG.lock:
+                        new_worker = await asyncio.to_thread(REG.ensure, msg["session"], requested_model)
+                    if worker is not None and worker is not new_worker:
+                        worker.clients.discard(ws)
+                    worker = new_worker
+                    if requested_model:
+                        worker.model = requested_model
+                    worker.clients.add(ws)
+                    # LIMIT 1: auto-resume an open turn left by a daemon crash
+                    # (user message journaled, no turn_end marker after it).
+                    await worker.resume()
+                    await ws.send(reply({
+                        "attached": worker.session.id,
+                        "running": worker.running,
+                        "model": worker.model}))
+                    if worker.running:
+                        await worker.send(ws, event="turn_start", resumed=True)
+                    await worker.replay_pending_approval(ws)
+                elif m == "detach":
+                    if worker:
+                        worker.clients.discard(ws)
+                    worker = None
+                    await ws.send(reply({"detached": True}))
+                elif worker is None:
+                    await ws.send(reply("attach or new first", is_result=False))
+                elif m == "state":
+                    from .context import receipts
+                    runtime = getattr(worker.session, '_runtime', {})
+                    mounts = runtime.get('mounts')
+                    await ws.send(reply({
+                        'session':worker.session.id, 'cwd':worker.cwd, 'model':worker.model,
+                        'running':worker.running, 'events':worker.session.events[-200:],
+                        'stop_reason':next((e.get('reason') for e in reversed(worker.session.events) if e['kind']=='turn_end'),None),
+                        'context':worker.context,
+                        'review':next((e for e in reversed(worker.session.events) if e['kind']=='review'),None),
+                        'total_events':len(worker.session.events), 'usage':worker.usage,
+                        'todo':next((e['items'] for e in reversed(worker.session.events) if e['kind']=='todo'),[]),
+                        'mounts':list(mounts.mcps) + list(mounts.skills) if mounts else [],
+                        'approval':worker.pending_approval,
+                        'receipts':receipts(worker.session.events)[-15:]}))
+                elif m == "history":
+                    start = max(0, int(msg.get('start',0)))
+                    await ws.send(reply({'events':worker.session.events[start:start+200], 'total':len(worker.session.events)}))
+                elif m == "capabilities":
+                    from .linker import CapabilityIndex
+                    await ws.send(reply({'capabilities':CapabilityIndex().lines()}))
+                elif m == "chat":
+                    if worker.running:
+                        await ws.send(reply('turn already running',is_result=False))
+                    elif not isinstance(msg.get('text'),str) or not msg['text'].strip():
+                        await ws.send(reply('nonempty text required',is_result=False))
+                    else:
+                        await worker.chat(msg['text'])
+                        if req_id is not None:
+                            await ws.send(reply({"started": True}))
+                elif m == "approve":
+                    fut = worker._approvals.pop(int(msg.get("id", 0)), None)
+                    if fut and not fut.done():
+                        fut.set_result(bool(msg.get("allow")))
+                    if req_id is not None:
+                        await ws.send(reply({"approved": True}))
+                elif m == "interrupt":
+                    await worker.interrupt()
+                    if req_id is not None:
+                        await ws.send(reply({"interrupted": True}))
+                elif m == "model":
+                    new_model = msg.get("model")
+                    if new_model:
+                        worker.model = new_model
+                    await ws.send(reply({"model": worker.model}))
+                elif m == "undo":
+                    res = await worker.undo()
+                    await ws.send(reply(res))
+                elif m == "rewind":
+                    cid = int(msg.get("id", 0))
+                    res = await worker.rewind(cid)
+                    await ws.send(reply(res))
+                elif m == "fork":
+                    res = await worker.fork(msg.get("at"))
+                    child = REG.ensure(res['session'], worker.model)
                     worker.clients.discard(ws)
-                worker = new_worker
-                worker.clients.add(ws)
-                await ws.send(reply({"attached": worker.session.id, "model": worker.model}))
-            elif m == "attach":
-                requested_model = msg.get("model")
-                # Session(sid) parses the whole journal — off the loop (a
-                # huge replay here starved handshakes; see "sessions").
-                # ensure() itself only hits disk on the FIRST attach of a
-                # session; afterwards it's a dict lookup.
-                new_worker = await asyncio.to_thread(REG.ensure, msg["session"], requested_model)
-                if worker is not None and worker is not new_worker:
-                    worker.clients.discard(ws)
-                worker = new_worker
-                if requested_model:
-                    worker.model = requested_model
-                worker.clients.add(ws)
-                # LIMIT 1: auto-resume an open turn left by a daemon crash
-                # (user message journaled, no turn_end marker after it).
-                await worker.resume()
-                await ws.send(reply({
-                    "attached": worker.session.id,
-                    "running": worker.running,
-                    "model": worker.model}))
-                if worker.running:
-                    await worker.send(ws, event="turn_start", resumed=True)
-                await worker.replay_pending_approval(ws)
-            elif m == "detach":
-                if worker:
-                    worker.clients.discard(ws)
-                await ws.send(reply({"detached": True}))
-            elif worker is None:
-                await ws.send(reply("attach or new first", is_result=False))
-            elif m == "chat":
-                await worker.chat(msg.get("text", ""))
-                if req_id is not None:
-                    await ws.send(reply({"started": True}))
-            elif m == "approve":
-                fut = worker._approvals.pop(int(msg.get("id", 0)), None)
-                if fut and not fut.done():
-                    fut.set_result(bool(msg.get("allow")))
-                if req_id is not None:
-                    await ws.send(reply({"approved": True}))
-            elif m == "interrupt":
-                await worker.interrupt()
-                if req_id is not None:
-                    await ws.send(reply({"interrupted": True}))
-            elif m == "model":
-                new_model = msg.get("model")
-                if new_model:
-                    worker.model = new_model
-                await ws.send(reply({"model": worker.model}))
-            elif m == "undo":
-                res = await worker.undo()
-                await ws.send(reply(res))
-            elif m == "rewind":
-                cid = int(msg.get("id", 0))
-                res = await worker.rewind(cid)
-                await ws.send(reply(res))
-            elif m == "fork":
-                old_sid = worker.session.id
-                res = await worker.fork(msg.get("at"))
-                # re-key the registry: the worker now owns the CHILD journal.
-                # Without this, attaching to child_sid would spawn a SECOND
-                # worker over the same events.jsonl (split-brain corruption).
-                REG.workers[res["session"]] = worker
-                REG.workers.pop(old_sid, None)
-                await ws.send(reply(res))
-            elif m == "replay":
-                for ev in worker.session.events:
-                    await worker.send(ws, event="replay", ev=ev)
-                await ws.send(reply({"replayed": True}))
-            elif m == "context":
-                from .pager import budget
-                await ws.send(reply(budget(worker.session.events, worker.session)))
-            else:
-                await ws.send(reply(f"unknown method {m!r}", is_result=False))
+                    worker = child
+                    worker.clients.add(ws)
+                    await ws.send(reply(res))
+                elif m == "replay":
+                    for ev in worker.session.events:
+                        await worker.send(ws, event="replay", ev=ev)
+                    await ws.send(reply({"replayed": True}))
+                elif m == "context":
+                    from .pager import budget
+                    await ws.send(reply(budget(worker.session.events, worker.session)))
+                else:
+                    await ws.send(reply(f"unknown method {m!r}", is_result=False))
+            except (ValueError, TypeError, KeyError, OSError, RuntimeError) as err:
+                await ws.send(reply(f"{type(err).__name__}: {err}", is_result=False))
     except websockets.ConnectionClosed:
         pass
     finally:
@@ -371,16 +490,9 @@ async def handler(ws):
 
 
 def main():
-    async def _run():
-        async with websockets.serve(
-            handler, HOST, PORT,
-            ping_interval=None,
-            max_size=32 * 1024 * 1024
-        ):
-            print(f"kern daemon on ws://{HOST}:{PORT} — sessions survive their terminals")
-            await asyncio.Future()
-    asyncio.run(_run())
+    from .web import run_server
+    asyncio.run(run_server())
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -16,6 +16,9 @@ import os
 import shutil
 import subprocess
 import time
+import re
+import hashlib
+from .storage import atomic_write, file_lock, path_key, redact_value
 from pathlib import Path
 
 from .syscalls import redact as _redact
@@ -26,6 +29,8 @@ SESSIONS = KERN_HOME / "sessions"
 
 class Session:
     def __init__(self, sid: str):
+        if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,120}", sid):
+            raise ValueError("invalid session id")
         self.id = sid
         self.dir = SESSIONS / sid
         self.log = self.dir / "events.jsonl"
@@ -33,41 +38,60 @@ class Session:
         self.ckpt = self.dir / "ckpt"
         self.events: list[dict] = []
         self._warn: list[str] = []
-        if self.log.exists():
-            with open(self.log) as f:
-                for i, l in enumerate(f):
-                    if not l.strip():
-                        continue
-                    # Torn-tail tolerance: a crash mid-write leaves one partial
-                    # final line. Skip it (it is already lost) instead of making
-                    # the whole session unopenable. Full lines must still parse.
-                    try:
-                        self.events.append(json.loads(l))
-                    except json.JSONDecodeError:
-                        if i < sum(1 for _ in open(self.log)) - 1:
-                            raise   # malformed line mid-file = real corruption
-                        self._warn.append(
-                            f"torn final line (n={i}) skipped — journal was "
-                            f"interrupted mid-write; that event is lost")
+        self._reload()
 
-    # ---- writing -----------------------------------------------------------
+    def _reload(self):
+        if not self.log.exists():
+            return
+        stat = self.log.stat()
+        signature = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
+        if getattr(self, '_signature', None) == signature:
+            return
+        raw = self.log.read_bytes()
+        lines = raw.splitlines(keepends=True)
+        events = []
+        valid = 0
+        for i, line in enumerate(lines):
+            try:
+                ev = json.loads(line)
+                if not isinstance(ev, dict) or "kind" not in ev:
+                    raise ValueError("invalid journal event")
+                events.append(ev)
+                valid += len(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                if i != len(lines) - 1 or line.endswith(b"\n"):
+                    raise
+                self._warn.append("torn final journal line; preserved before next append")
+                break
+        self.events = events
+        self._valid_bytes = valid
+        self._disk_bytes = len(raw)
+        self._signature = signature
 
     def emit(self, kind: str, **fields) -> dict:
-        ev = {"n": len(self.events), "ts": time.time(), "kind": kind, **fields}
-        # Disk-redaction: secrets must never sit in the journal, whatever the
-        # path in (user text, assistant text, tool result). Local-only pass.
-        for k in ("text", "preview"):
-            if k in ev and isinstance(ev[k], str):
-                ev[k] = _redact(ev[k])
-        self.events.append(ev)
-        self.dir.mkdir(parents=True, exist_ok=True)
-        with open(self.log, "a") as f:
-            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-            if kind in ("turn_end", "user", "action", "tool_result"):
-                # user input + every model/tool step must survive a crash;
-                # buffering them means losing a turn's provenance wholesale.
+        with file_lock(self.dir / ".journal.lock"):
+            self._reload()
+            if getattr(self, "_valid_bytes", 0) < getattr(self, "_disk_bytes", 0):
+                raw = self.log.read_bytes()
+                atomic_write(self.dir / f"torn-{time.time_ns()}.bin", raw[self._valid_bytes:])
+                atomic_write(self.log, raw[:self._valid_bytes])
+            ev = redact_value({"n": len(self.events), "ts": time.time(), "kind": kind, **fields})
+            data = (json.dumps(ev, ensure_ascii=False) + "\n").encode('utf-8')
+            # A valid final JSON record without newline also needs a separator.
+            prefix = b""
+            if self.log.exists() and self.log.stat().st_size:
+                with self.log.open('rb') as f:
+                    f.seek(-1, 2)
+                    if f.read(1) != b"\n":
+                        prefix = b"\n"
+            with self.log.open('ab') as f:
+                f.write(prefix + data)
                 f.flush()
                 os.fsync(f.fileno())
+            self.events.append(ev)
+            stat = self.log.stat()
+            self._signature = (stat.st_size, stat.st_mtime_ns, stat.st_ino)
+            self._valid_bytes = self._disk_bytes = stat.st_size
         return ev
 
     # ---- checkpoints: full undo = files + journal --------------------------
@@ -81,111 +105,111 @@ class Session:
             pass
 
     def checkpoint(self, files: list[str], cwd: str | None = None) -> int:
-        """Snapshot the given files + the untracked-files list of the repo,
-        so restore() can (a) put file contents back and (b) delete anything
-        the agent created afterwards. `event_n` marks the journal position:
-        restore() truncates every event after it."""
-        cid = len([d for d in self.ckpt.glob("c*") if (d / "manifest.json").exists()]) \
-            if self.ckpt.exists() else 0
+        with file_lock(self.dir / ".checkpoint.lock"):
+            ids = [int(p.name[1:]) for p in self.ckpt.glob("c*") if p.name[1:].isdigit()]
+            cid = max(ids, default=-1) + 1
+            dest = self.ckpt / f"c{cid}"
+            dest.mkdir(parents=True, exist_ok=False)
+            saved, missing, blobs, modes = [], [], {}, {}
+            for fp in dict.fromkeys(files):
+                p = Path(fp).absolute()
+                if p.is_file():
+                    key = path_key(p)
+                    atomic_write(dest / key, p.read_bytes())
+                    saved.append(str(p))
+                    blobs[str(p)] = key
+                    modes[str(p)] = p.stat().st_mode
+                elif not p.exists():
+                    missing.append(str(p))
+            atomic_write(dest / "manifest.json", json.dumps({
+                "files": saved, "missing": missing, "blobs": blobs, "modes": modes,
+                "cwd": cwd, "event_n": len(self.events)}, ensure_ascii=False))
+            return cid
+
+    def _restore_files(self, cid: int) -> list[str]:
         dest = self.ckpt / f"c{cid}"
-        dest.mkdir(parents=True, exist_ok=True)
-        saved, missing = [], []
-        for fp in files:
+        man = json.loads((dest / "manifest.json").read_text(encoding="utf-8"))
+        if man.get("inactive"):
+            raise ValueError("checkpoint belongs to an archived journal branch")
+        restored, payloads = [], {}
+        for fp in man["files"]:
+            legacy = str(fp).lstrip("/").replace("/", "__")
+            src = dest / man.get("blobs", {}).get(fp, legacy)
+            if not src.is_file():
+                raise RuntimeError(f"missing snapshot for {fp}")
+            payloads[fp] = src.read_bytes()
+        # Preserve the state being replaced, including external edits, before
+        # restoring anything. Undo is inspectable and recoverable on disk.
+        backup = self.dir / 'restore-backups' / str(time.time_ns())
+        backup_manifest = {}
+        for fp in man['files'] + man.get('missing', []):
             p = Path(fp)
-            rel = str(p).lstrip("/").replace("/", "__")
             if p.is_file():
-                shutil.copy2(p, dest / rel)
-                saved.append(str(p))
+                key = path_key(p)
+                atomic_write(backup / key, p.read_bytes())
+                backup_manifest[fp] = {'blob':key, 'mode':p.stat().st_mode}
+            elif p.exists():
+                raise RuntimeError(f'restore target is no longer a file: {fp}')
             else:
-                # file existed in git but is already gone from disk, or is
-                # untracked-and-not-yet-created — remember its absence
-                missing.append(str(p))
-        # untracked files present NOW (baseline): anything created by the
-        # agent later and NOT in this set must be deleted on restore
-        untracked: list[str] = []
-        if cwd:
-            try:
-                out = subprocess.run(
-                    ["git", "ls-files", "--others", "--exclude-standard"],
-                    cwd=cwd, capture_output=True, text=True, timeout=5)
-                if out.returncode == 0:
-                    untracked = [str(Path(cwd) / l) for l in out.stdout.splitlines() if l.strip()]
-            except Exception:
-                pass
-        (dest / "manifest.json").write_text(json.dumps({
-            "files": saved, "missing": missing, "untracked": untracked,
-            "cwd": cwd, "event_n": len(self.events)}))
-        # Durability: a checkpoint that advertises undo but whose copies are
-        # still in page cache would silently break restore after a crash.
-        try:
-            for fp in saved:
-                with open(dest / str(Path(fp)).lstrip("/").replace("/", "__"), "rb") as f:
-                    os.fsync(f.fileno())
-            fd = os.open(dest, os.O_RDONLY)
-            try:
-                os.fsync(fd)     # entries: copies + manifest
-            finally:
-                os.close(fd)
-        except OSError:
-            pass
-        return cid
+                backup_manifest[fp] = {'missing':True}
+        atomic_write(backup / 'manifest.json', json.dumps(backup_manifest, ensure_ascii=False))
+        for fp, data in payloads.items():
+            atomic_write(Path(fp), data)
+            if fp in man.get('modes', {}):
+                os.chmod(fp, man['modes'][fp])
+            restored.append(fp)
+        # Only explicitly checkpointed absences, never unrelated untracked files.
+        for fp in man.get("missing", []):
+            p = Path(fp)
+            if p.is_file():
+                p.unlink()
+                restored.append(f"deleted {fp}")
+        return restored
+
+    def _truncate(self, upto: int, reason: str):
+        with file_lock(self.dir / ".journal.lock"):
+            self._reload()
+            tail = self.events[upto:]
+            if tail:
+                atomic_write(self.dir / f"{reason}-{time.time_ns()}.jsonl",
+                             "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in tail))
+            kept = [dict(e, n=i) for i, e in enumerate(self.events[:upto])]
+            atomic_write(self.log, "".join(json.dumps(e, ensure_ascii=False) + "\n" for e in kept))
+            self.events = kept
+        # Keep snapshots for inspection, but never apply an abandoned branch's
+        # snapshots to later edits that happen to reuse the same event offsets.
+        with file_lock(self.dir / ".checkpoint.lock"):
+            for path in self.ckpt.glob("c*/manifest.json"):
+                manifest = json.loads(path.read_text(encoding="utf-8"))
+                if manifest["event_n"] >= upto and not manifest.get("inactive"):
+                    manifest["inactive"] = True
+                    atomic_write(path, json.dumps(manifest, ensure_ascii=False))
+        self.emit("turn_end", reason=reason)
 
     def restore(self, cid: int) -> list[str]:
-        dest = self.ckpt / f"c{cid}"
-        man = json.loads((dest / "manifest.json").read_text())
+        if not isinstance(cid, int) or cid < 0:
+            raise ValueError("invalid checkpoint id")
+        man = json.loads((self.ckpt / f"c{cid}" / "manifest.json").read_text(encoding="utf-8"))
+        if man.get('inactive'):
+            raise ValueError('checkpoint belongs to an archived journal branch')
+        later = []
+        for path in self.ckpt.glob('c*/manifest.json'):
+            item = json.loads(path.read_text(encoding='utf-8'))
+            other = int(path.parent.name[1:])
+            if other >= cid and not item.get('inactive'):
+                later.append(other)
         restored = []
-        # 1. put back snapshotted contents
-        for fp in man["files"]:
-            rel = str(fp).lstrip("/").replace("/", "__")
-            src = dest / rel
-            if src.exists():
-                Path(fp).parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, fp)
-                restored.append(fp)
-        # 2. files the agent DELETED since the checkpoint: they were dirty in
-        #    git status (so in `files`) but absent on disk now — restore()
-        #    above already puts them back if they were snapshotted. Nothing
-        #    else to do here.
-        # 3. files the agent CREATED since the checkpoint: present on disk,
-        #    untracked, and not in the baseline untracked set -> delete.
-        cwd = man.get("cwd")
-        if cwd:
-            try:
-                out = subprocess.run(
-                    ["git", "ls-files", "--others", "--exclude-standard"],
-                    cwd=cwd, capture_output=True, text=True, timeout=5)
-                if out.returncode == 0:
-                    baseline = set(man.get("untracked", []))
-                    for l in out.stdout.splitlines():
-                        fp = str(Path(cwd) / l)
-                        if fp not in baseline and Path(fp).is_file():
-                            # never nuke our own session dir
-                            if not fp.startswith(str(self.dir)):
-                                Path(fp).unlink()
-                                restored.append(f"deleted {fp}")
-            except Exception:
-                pass
-        # 4. truncate the journal back to the checkpoint position
-        upto = man["event_n"]
-        tail = self.events[upto:]
-        if tail:
-            with open(self.dir / f"rewound-{int(time.time())}.jsonl", "a") as f:
-                for ev in tail:
-                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-            self.events = self.events[:upto]
-            for i, ev in enumerate(self.events):
-                ev["n"] = i
-            with open(self.log, "w") as f:
-                for ev in self.events:
-                    f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        self.emit("turn_end", reason="rewind")   # deliberate stop, not a crash
+        for other in sorted(later, reverse=True):
+            restored.extend(self._restore_files(other))
+        self._truncate(man["event_n"], "rewind")
         return restored
 
     def last_checkpoint(self) -> int | None:
         if not self.ckpt.exists():
             return None
         ids = [int(d.name[1:]) for d in self.ckpt.glob("c*")
-               if d.name[1:].isdigit() and (d / "manifest.json").exists()]
+               if d.name[1:].isdigit() and (d / "manifest.json").exists()
+               and not json.loads((d / "manifest.json").read_text(encoding="utf-8")).get("inactive")]
         return max(ids) if ids else None
 
     def compact_into(self, upto_n: int, summary: str, facts: str = "") -> int:
@@ -198,7 +222,7 @@ class Session:
         if not old:
             return 0
         # Snapshot the compacted slice into an archive file for provenance
-        with open(self.dir / f"compacted-{int(time.time())}.jsonl", "a") as f:
+        with open(self.dir / f"compacted-{int(time.time())}.jsonl", "a", encoding="utf-8") as f:
             for ev in old:
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
         compact_ev = self.emit("compact", upto_n=upto_n, text=summary,
@@ -206,34 +230,31 @@ class Session:
         return len(old)
 
     def undo_to_last_user(self, keep_last_user: bool = True) -> int:
-        """Drop everything after the most recent user message (the agent's
-        last run). If keep_last_user, the user message itself is kept so the
-        conversation can resume from it. Returns how many events were dropped.
-        The dropped tail is archived, never destroyed."""
-        user_idx = [i for i, ev in enumerate(self.events) if ev["kind"] == "user"]
+        user_idx = [i for i, e in enumerate(self.events) if e["kind"] == "user"]
         if not user_idx:
             return 0
-        cut = user_idx[-1] + (1 if keep_last_user else 0)
-        tail = self.events[cut:]
-        if not tail:
-            return 0
-        self.dir.mkdir(parents=True, exist_ok=True)
-        with open(self.dir / f"undone-{int(time.time())}.jsonl", "a") as f:
-            for ev in tail:
-                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        self.events = self.events[:cut]
-        for i, ev in enumerate(self.events):
-            ev["n"] = i
-        with open(self.log, "w") as f:
-            for ev in self.events:
-                f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        self.emit("turn_end", reason="undo")   # deliberate stop, not a crash
-        return len(tail)
+        cut = user_idx[-1] + int(keep_last_user)
+        count = len(self.events) - cut
+        self.last_restored = []
+        checkpoints = []
+        for p in self.ckpt.glob("c*/manifest.json"):
+            man = json.loads(p.read_text(encoding="utf-8"))
+            if not man.get("inactive") and cut <= man["event_n"] <= len(self.events):
+                checkpoints.append((man["event_n"], int(p.parent.name[1:])))
+        for _, cid in sorted(checkpoints, reverse=True):
+            self.last_restored.extend(self._restore_files(cid))
+        if count:
+            self._truncate(cut, "undo")
+        return count
 
     def fork(self, at_n: int | None = None) -> "Session":
+        if at_n is not None and (not isinstance(at_n,int) or not 0 <= at_n <= len(self.events)):
+            raise ValueError('fork boundary outside journal')
         child = create_session(cwd=self.meta().get("cwd", os.getcwd()), parent=self.id)
         upto = at_n if at_n is not None else len(self.events)
         for ev in self.events[:upto]:
+            if ev["kind"] in ("meta", "mount", "subagent_spawn", "subagent_finish"):
+                continue
             child.emit(**{k: v for k, v in ev.items() if k not in ("n", "ts")})
         if child.turn_is_open():
             # a fork cut mid-turn must NOT look like a crash to auto-resume
@@ -262,14 +283,21 @@ class Session:
     # ---- paging scratchpad --------------------------------------------------
 
     def offload(self, tag: str, content: str) -> str:
+        if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,100}',tag):
+            raise ValueError('invalid artifact tag')
         self.scratch.mkdir(parents=True, exist_ok=True)
-        p = self.scratch / f"{tag}.txt"
-        p.write_text(content)
+        digest = hashlib.sha256(content.encode('utf-8')).hexdigest()[:24]
+        p = self.scratch / f"{tag}-{digest}.txt"
+        if not p.exists():
+            atomic_write(p, content)
         return str(p)
 
 
 def create_session(cwd: str | None = None, parent: str | None = None) -> Session:
-    sid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(3).hex()
+    cwd = str(Path(cwd or os.getcwd()).resolve())
+    if not Path(cwd).is_dir():
+        raise ValueError('session working directory must exist')
+    sid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(12).hex()
     s = Session(sid)
     s.emit("meta", cwd=cwd or os.getcwd(), parent=parent)
     return s
@@ -332,7 +360,6 @@ def session_previews(limit: int = 60, current_cwd: str | None = None, include_te
     candidates.sort(key=lambda x: x[2], reverse=True)
 
     out = []
-    test_out = []
     for sid, log, mtime in candidates:
         try:
             cwd = ""
@@ -369,17 +396,11 @@ def session_previews(limit: int = 60, current_cwd: str | None = None, include_te
                 "preview": first_user[:100],
                 "ts": mtime,
             }
-            if is_test_session(cwd, first_user):
-                test_out.append(entry)
-            else:
-                out.append(entry)
-                if len(out) >= limit:
-                    break
+            out.append(entry)
+            if len(out) >= limit:
+                break
         except Exception:
             pass
-
-    if include_tests and len(out) < limit:
-        out.extend(test_out[:(limit - len(out))])
 
     if current_cwd:
         out.sort(key=lambda r: (r.get("cwd") == current_cwd, r.get("ts", 0)), reverse=True)

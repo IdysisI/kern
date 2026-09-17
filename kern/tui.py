@@ -20,6 +20,7 @@ from . import __version__ as KERN_VERSION
 DAEMON_VERSION = KERN_VERSION
 
 from rich.markdown import Markdown as RichMarkdown
+from rich.text import Text
 from rich.table import Table as RichTable
 from textual.markup import escape
 
@@ -47,6 +48,7 @@ from textual.widgets import (Button, Collapsible, Label, ListItem, ListView,
 from .client import Client, load_health
 from .engine import Engine
 from .journal import Session, create_session, session_previews
+from .debuglog import dbg as _dbg, dbg_exc as _dbg_exc, span as _span
 from .pager import budget
 
 DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
@@ -72,7 +74,13 @@ Screen { background: transparent; }
 #tleft  { width: auto; color: $text-muted; }
 #tright { width: 1fr; text-align: right; color: $text-muted; }
 
-#chat { height: 1fr; padding: 0 2; background: transparent;
+#workspace { height: 1fr; }
+#inspector { width: 34; border-left: solid #3e5140; padding: 1 2; overflow-y: auto; }
+#inspector-title { color: #bde596; text-style: bold; margin-bottom: 1; }
+#work-plan { margin-top: 1; }
+#work-mounts { margin-top: 1; color: $text-muted; }
+#work-proof { margin-top: 1; color: $text-muted; }
+#chat { width: 1fr; height: 1fr; padding: 0 2; background: transparent;
         scrollbar-color: $border transparent; scrollbar-background: transparent; }
 
 /* activity line while a turn runs (hidden when idle) */
@@ -258,7 +266,7 @@ class ToolCard(Static):
         if self.result is None and self.diff is None:
             return   # nothing to show yet — keep the pending look
         if self.result is not None:
-            ok = not self.result.startswith(("error", "denied"))
+            ok = not self.result.startswith(("error", "denied")) and not __import__("re").search(r"^exit=(?!0(?:\s|$))-?\d+", self.result)
             mark = "[#9ece6a]✓[/]" if ok else "[#f7768e]✗[/]"
         else:
             mark = f"[#e0af68]{self._frame}[/]"   # still running
@@ -557,7 +565,14 @@ class KernApp(App):
         with Horizontal(id="topbar"):
             yield Static(id="tleft")
             yield Static(id="tright")
-        yield VerticalScroll(id="chat")
+        with Horizontal(id="workspace"):
+            yield VerticalScroll(id="chat")
+            with Vertical(id="inspector"):
+                yield Static('WORK STATE', id='inspector-title', markup=False)
+                yield Static('New session', id='work-objective', markup=False)
+                yield Static('Plan: none', id='work-plan', markup=False)
+                yield Static('MCP: nothing mounted', id='work-mounts', markup=False)
+                yield Static('Proof: no results', id='work-proof', markup=False)
         yield Static("thinking…", id="status")
         yield PromptArea()
         yield Static(id="bar")
@@ -576,12 +591,44 @@ class KernApp(App):
         self.query_one("#status").display = False
         self._refresh_chrome()
         self.set_interval(0.12, self._on_tick)
+        self.set_interval(1, self._refresh_inspector)
+        self._refresh_inspector()
         if not os.environ.get("KERN_LOCAL"):
             self.run_worker(self._daemon_entry(), name="daemon", exclusive=False)
         else:
             self._welcome()
         self.query_one("#prompt").focus()
         self.run_worker(self._load_catalog(), name="catalog", exclusive=False)
+
+    def on_resize(self, event):
+        try:
+            self.query_one('#inspector').display = event.size.width >= 110
+        except Exception:
+            pass
+
+    def _refresh_inspector(self):
+        try:
+            from .context import receipts
+            if self.remote is not None:
+                fresh = Session(self.session.id)
+                self.session.events = fresh.events
+            events = self.session.events
+            objective = next((e.get('text','') for e in reversed(events) if e['kind']=='objective'), 'New session')
+            self.query_one('#work-objective').update(objective[:600])
+            items = next((e['items'] for e in reversed(events) if e['kind']=='todo'), [])
+            self.query_one('#work-plan').update('PLAN\n' + ('\n'.join(
+                f"{ {'done':'✓','active':'●','pending':'○','blocked':'!'}.get(i['status'],'○')} {i['text']}" for i in items) or 'No plan'))
+            mounted = {}
+            for ev in events:
+                if ev['kind']=='mount':
+                    if ev.get('action')=='mount': mounted[ev['name']]=True
+                    else: mounted.pop(ev['name'],None)
+            self.query_one('#work-mounts').update('CAPABILITIES\n' + (', '.join(mounted) or 'Nothing mounted'))
+            rows = receipts(events)[-5:]
+            self.query_one('#work-proof').update('RECENT RESULTS\n' + ('\n'.join(
+                f"{r['name']}: {r['status']}" for r in rows) or 'No results'))
+        except Exception:
+            pass
 
     # ---- remote (daemon) mode: sessions outlive this terminal ----------------
 
@@ -601,13 +648,27 @@ class KernApp(App):
         finally:
             self._pending_rpc.pop(req_id, None)
 
-    async def _connect_daemon(self, tries=4):
+    async def _connect_daemon(self, tries=4, fresh=False):
+        """Connect to the daemon, spawning it if needed.
+
+        fresh=True skips the version probe: used by /restart right after we have
+        already shut the old daemon down ourselves. The probe can otherwise hang up
+        to 10s per try against a socket whose daemon is mid-shutdown — that is the
+        '/restart froze my terminal' bug. With fresh=True we just want ANY live
+        daemon, fast.
+        """
         import websockets as _ws
         import sys as _sys
         last = None
         for i in range(tries):
+            _t0 = time.perf_counter()
             try:
+                _dbg(self.session, "daemon.connect.try", attempt=i, fresh=fresh, uri=KERN_DAEMON_URI)
                 ws = await _ws.connect(KERN_DAEMON_URI, open_timeout=2.0, ping_interval=None, max_size=32 * 1024 * 1024)
+                if fresh:
+                    _dbg(self.session, "daemon.connect.ok", attempt=i, fresh=True,
+                         ms=round((time.perf_counter()-_t0)*1000, 1))
+                    return ws
                 # Check daemon version to ensure it is not running stale code
                 # A busy daemon (e.g. replaying a huge journal) can starve
                 # its event loop and miss a short probe. Patient probe; and
@@ -628,7 +689,7 @@ class KernApp(App):
                     # until the next clean restart).
                     last = RuntimeError("daemon busy — version probe unanswered")
                     raise last
-                if ver != DAEMON_VERSION:
+                if ver != DAEMON_VERSION and not raw.get("result",{}).get("running"):
                     # CONFIRMED stale daemon: shut it down; the outer except
                     # respawns it with the CURRENT code on the next loop
                     # iteration (spawn runs when i == 0).
@@ -645,10 +706,16 @@ class KernApp(App):
                 # (re)spawn on EVERY failed iteration: if an old daemon just
                 # died, a later retry can still recover. Concurrent spawns
                 # are safe — losers exit on "address already in use".
-                log = open(os.path.expanduser("~/.kern/daemon.log"), "ab")
+                logpath = __import__('pathlib').Path(os.environ.get('KERN_HOME','~/.kern')).expanduser() / 'daemon.log'
+                logpath.parent.mkdir(parents=True,exist_ok=True)
+                log = logpath.open('ab')
                 subprocess.Popen([_sys.executable, "-m", "kern.daemon"],
-                                 start_new_session=True, stdout=log, stderr=log)
+                                 stdout=log, stderr=log, **({'start_new_session':True} if os.name!='nt' else
+                                     {'creationflags':subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}))
+                log.close()
                 await asyncio.sleep(0.5 + 0.5 * i)
+                _dbg_exc(self.session, "daemon.connect.fail", e, attempt=i,
+                         ms=round((time.perf_counter()-_t0)*1000, 1))
         raise last
 
     async def _daemon_entry(self):
@@ -746,7 +813,7 @@ class KernApp(App):
     async def _attach_remote(self, sid: str):
         """Attach to a daemon session: replay the journal from disk, then
         stream live events. Closing this terminal DETACHES only."""
-        self.session = Session(sid)
+        candidate = Session(sid)
         req_kwargs = {"session": sid}
         if self._explicit_model:
             req_kwargs["model"] = self.model
@@ -755,6 +822,9 @@ class KernApp(App):
         except Exception as e:
             self._chat_error(f"could not attach to {sid}: {e}")
             return
+        self.session = candidate
+        self.cwd = candidate.meta().get('cwd',self.cwd)
+        self._queue.clear()
         if not self._explicit_model and res.get("model"):
             self.model = res["model"]
         self._todo_card = None
@@ -793,6 +863,8 @@ class KernApp(App):
                     continue
 
                 # 2. Live stream events
+                if msg.get("session") and msg["session"] != self.session.id:
+                    continue
                 ev = msg.get("event")
                 if ev in ("text", "thinking", "tool", "result", "diff",
                           "note", "todo", "handle", "summary"):
@@ -830,7 +902,6 @@ class KernApp(App):
                                                    classes="assistant"))
                     if self._queue:
                         nxt = self._queue.pop(0)
-                        self.chat.mount(UserMsg(nxt))
                         self.chat.scroll_end(animate=False)
                         self._remote_send_chat(nxt)
                     else:
@@ -843,6 +914,9 @@ class KernApp(App):
                 elif ev == "busy":
                     self._chat_note("⚠ " + str(msg.get("text", "")))
                 elif ev == "error":
+                    self._remote_running = False
+                    self._dismiss_waiting()
+                    self._flush_stream()
                     self._chat_note("⚠ " + str(msg.get("error", "")))
         except Exception:
             if self.remote is not None:
@@ -873,9 +947,8 @@ class KernApp(App):
         except Exception as e:
             self._remote_running = False
             self._dismiss_waiting()
-            self._chat_error(f"failed to send to daemon ({e}) — running locally:")
+            self._chat_error(f"delivery uncertain ({e}); reconnect and inspect the session before resending")
             self.remote = None
-            self._start_turn(text)
 
     async def _remote_approve(self, aid, desc, diff):
         if self._always:
@@ -990,8 +1063,13 @@ class KernApp(App):
         out = []
         for w in self.chat.children:
             if isinstance(w, Static):
-                r = w.render()
-                out.append(str(r))
+                content = w.content
+                if isinstance(content, RichMarkdown):
+                    out.append(content.markup)
+                elif isinstance(content, Text):
+                    out.append(content.plain)
+                else:
+                    out.append(str(content))
             elif isinstance(w, Markdown):
                 out.append(getattr(w, "_markdown", ""))
         return "\n".join(out)
@@ -1224,9 +1302,8 @@ class KernApp(App):
         return w is not None and w.is_running
 
     def action_interrupt(self):
-        if self.remote is not None:
-            if self._remote_running:
-                asyncio.ensure_future(self.remote.send('{"method": "interrupt"}'))
+        if self.remote is not None and self._remote_running:
+            asyncio.ensure_future(self.remote.send('{"method": "interrupt"}'))
             return
         if self._turn_running():
             self.turn_worker.cancel()
@@ -1341,6 +1418,8 @@ class KernApp(App):
     def _load_session(self, sid: str):
         """Replay a journal back into widgets — the log is the truth."""
         self.session = Session(sid)
+        self.cwd = self.session.meta().get("cwd",self.cwd)
+        self._queue.clear()
         self._render_journal()
         self._chat_note(f"resumed {sid} — {len(self.session.events)} events replayed")
 
@@ -1349,6 +1428,9 @@ class KernApp(App):
     async def _slash(self, text: str):
         cmd, _, arg = text.partition(" ")
         arg = arg.strip()
+        if self.remote is None and self._turn_running() and cmd in ('/new','/resume','/fork','/rewind','/undo'):
+            self._chat_note('Interrupt the active turn before changing its session.')
+            return
         if cmd == "/help":
             self._chat_note(HELP)
         elif cmd == "/model" and arg:
@@ -1372,6 +1454,8 @@ class KernApp(App):
             # respawn it, re-attach to THIS session. The session id is the
             # anchor — everything is rebuilt from the journal on disk.
             self._chat_note("◈ /restart — saving session, restarting kern…")
+            _dbg(self.session, "restart.begin", session_id=self.session.id, model=self.model)
+            _rt0 = time.perf_counter()
             try:
                 # 1. flush: the journal is fsync-on-critical-events already;
                 #    also drop any half-written tail defensively.
@@ -1391,7 +1475,9 @@ class KernApp(App):
                     await _a.sleep(1.0)
                 # 2. respawn daemon + re-attach to the SAME session
                 try:
-                    self.remote = await self._connect_daemon(tries=8)
+                    # fresh=True: we just shut the old daemon down, so skip the
+                    # (potentially 10s-per-try) version probe — reconnect fast.
+                    self.remote = await self._connect_daemon(tries=8, fresh=True)
                 except Exception as e:
                     self._chat_error(f"restart failed, daemon still down: {e} — "
                                     "local mode: journal is safe on disk, "
@@ -1410,7 +1496,10 @@ class KernApp(App):
                 self._refresh_chrome()
                 self._chat_note(f"◈ restarted — session {self.session.id} re-attached, "
                                 f"{len(self.session.events)} events intact")
+                _dbg(self.session, "restart.done", session_id=self.session.id,
+                     ms=round((time.perf_counter()-_rt0)*1000, 1), events=len(self.session.events))
             except Exception as e:
+                _dbg_exc(self.session, "restart.fail", e, ms=round((time.perf_counter()-_rt0)*1000, 1))
                 self._chat_error(f"/restart failed: {type(e).__name__}: {e}")
         elif cmd == "/new":
             if self.remote is not None:
@@ -1468,24 +1557,7 @@ class KernApp(App):
                     self._chat_error(f"undo failed: {e}")
             else:
                 n = self.session.undo_to_last_user()
-                if n:
-                    try:
-                        ckpts = sorted(self.session.ckpt.glob("c*"),
-                                       key=lambda p: int(p.name[1:]))
-                        for c in reversed(ckpts):
-                            man = json.loads((c / "manifest.json").read_text())
-                            if man.get("event_n", 1 << 30) <= len(self.session.events):
-                                restored = self.session.restore(int(c.name[1:]))
-                                self._chat_note(
-                                    f"↩ undo: dropped {n} events back to your last prompt"
-                                    + (f"; files restored from {c.name}" if restored else ""))
-                                break
-                        else:
-                            self._chat_note(f"↩ undo: dropped {n} events (journal only)")
-                    except Exception:
-                        self._chat_note(f"↩ undo: dropped {n} events (journal only)")
-                else:
-                    self._chat_note("nothing to undo")
+                self._chat_note(f"undo: {n} events; {len(getattr(self.session,'last_restored',[]))} file restorations")
                 self._render_journal()
         elif cmd == "/rewind" and arg.isdigit():
             if self.remote is not None:
@@ -1519,6 +1591,9 @@ class KernApp(App):
                 self._render_journal()
                 self._refresh_chrome()
                 self._chat_note(f"forked → {child.id}")
+        elif cmd == '/history':
+            from .context import history
+            self._chat_note(history(self.session, arg))
         elif cmd == "/tools":
             eng = self._engine()
             self._chat_note("\n".join(eng.index.lines()) or "(empty index)")
@@ -1579,7 +1654,7 @@ HELP = ("/model <name> · ctrl-p model picker · /probe re-handshake\n"
         "/new fresh session · /resume (ctrl+r) pick an old session\n"
         "/restart save + full restart (daemon included), same session\n"
         "/fork [n] branch · /rewind <n> checkpoint · /undo last turn\n"
-        "/context budget · /tools capability index · /clear screen\n"
+        "/context budget · /tools capability index · /history <query> · /clear screen\n"
         "in-chat mounts: [mount: name] · [list capabilities] · [unmount: name]")
 
 

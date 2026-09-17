@@ -1,82 +1,102 @@
-# kern
+# Kern
 
-An OS-kernel-style agentic harness for **one user-chosen model**, built for the
-vsllm-hub proxy at `http://127.0.0.1:8790` (72 models, openai + anthropic + gemini wire formats).
+> A kernel for LLM agents — the harness that makes the model finish its work, keep its plan, and get better the more it works with you.
 
-The model is the CPU. Kern is the kernel around it.
+**The problem.** Modern agents read the same file three times, retry a failing command in a loop, lose their plan when the conversation gets compacted, and confidently claim they fixed something they never touched. Each new session starts from zero. You are paying for every wasted call.
 
-| OS concept | kern piece | what it does |
-|---|---|---|
-| syscalls | `syscalls.py` | 8 permanent tools: `read` `write` `edit` `exec` `proc` `fetch` `todo` `spawn` |
-| kernel | `kernel.py` | static cache-stable system prompt + compact capability index |
-| dlopen | `linker.py` | JIT mounting of skills (`~/.agents/skills`) + MCP servers (`~/.kern/mcp.json`) via `[mount: name]` |
-| fork | `spawn()` | child agents in isolated contexts; only their report returns |
-| swap | `pager.py` | lossless context paging: bulky stale outputs → scratch files + pointer stubs |
-| journal | `journal.py` | append-only event log per session → crash-resume, /fork, /rewind |
-| snapshots | `checkpoint()` | file snapshots before mutations; /rewind restores files + conversation |
-| /proc | handshake | per-model probe: protocol, native tools, TTFT → `~/.kern/health.json` |
+**Kern is the missing harness.** Not more tools, not a bigger prompt — a set of harness-level mechanisms that keep the agent oriented, prevent the classic failure loops, and turn hard-won experience into reusable capability.
 
-## Three faces, one engine
+---
+
+## What it does
+
+- **Stops the loops.** A typed circuit breaker detects repeated identical actions (same file, same command, same target) and escalating harness hints push the model to act instead of re-reading. Per-target repeat tracking works across `read`, `py`, and `exec` — so an agent that reads everything through Python can't evade it.
+- **Knows your codebase before it reads a line.** A deterministic structural code graph (SQLite, built with zero LLM calls) plus a `map` tool answer "where is X / what depends on Y / outline of this file" from a precomputed index instead of re-grepping. A compact repo map is injected on first contact — bounded, so it orients without bloating context.
+- **Onboards itself.** On first contact with a repo, Kern writes a lean `KERN.md` — detected stack, entry points, the full dev workflow (test/build/lint/run), and conventions. No setup step, no `/init`. Your edits below the marker are preserved across regenerations.
+- **Keeps the plan.** A durable todo plan survives compaction; the agent always knows what it decided and what's next.
+- **Never freezes.** Compaction runs on the event loop with a hard budget and streams progress; tools execute off-loop. The spinner keeps moving even during a slow model call.
+- **Reliable edits.** An `edit` tool with retry, ambiguity detection, and verification — so a failed edit surfaces immediately instead of silently corrupting the file.
+- **Real memory.** After each turn, the agent reflects and writes its learnings to a persistent store (SQLite + FTS5). Long-horizon user constraints and decisions are consolidated into attributed memory on fold. Next session, relevant experience is recalled and injected — automatically.
+- **Isolated subagents.** Fork parallel subagents with their own session and context; opt-in `isolate` runs a mutating subagent in a fresh git worktree so it can't collide with your working tree.
+- **Skills that become tools.** A well-performing agent can crystallize its own methods into reusable *skills*, then *promote* them into compiled tools (the "midas" command). The agent literally expands its own toolbox.
+- **Updates itself.** A hot self-update fetches and fast-forwards in place with daemon re-exec and session resume — guarded against dirty trees, verified end-to-end against a real git remote.
+- **Lean by default.** 14 tools at rest, ~1,600 tokens of system prompt. Capabilities are *mounted* on demand (and unmounted when done) — you never pay prompt budget for what you aren't using.
+
+---
+
+## Why it's different
+
+Most agent frameworks answer "the model failed" with "add more instructions to the prompt." Kern does the opposite. The mounting system is built on a simple observation: **unused capability should cost nothing.**
+
+- Not using an MCP server? It's not connected. Not connected? Not in the index. Not in the index? Zero tokens.
+- A mounted skill injects its instructions **once**, then lives as a one-line pointer — not re-inflated into the system prompt every turn.
+- `mount-once` auto-unmounts after a single turn, so a one-off capability doesn't linger.
+
+The result is a prompt that stays small and stable (cache-friendly) while the reachable capability stays large.
+
+---
+
+## Interfaces, one engine
+
+The same `Engine` and session journal drive every front end. Switch between them mid-session; context is preserved.
+
+| Interface | Launch | Use it for |
+|-----------|--------|-----------|
+| **TUI** | `kern` | daily terminal work |
+| **Web** | `kern serve` | visual review, diffs, sharing |
+| **GUI** | `kern-gui` | desktop-native session |
+| **Daemon** | `kern-serve` | headless, multi-client, scripted runs |
+
+Sessions persist as an append-only JSONL journal (`~/.kern/sessions/<id>/events.jsonl`) — crash-safe, replayable, resumable.
+
+---
+
+## Observability
+
+Debugging an agent shouldn't mean reading its mind. Kern ships a dedicated debug sidecar that logs internal decision state (breaker counters, target extraction, retries, timing) **without touching the model's context or the UI**.
 
 ```bash
-cd ~/kern
-.venv/bin/python -m kern          # TUI: streaming, diff cards, plan panel,
-                                  # model picker (ctrl-m), approval modals with diffs
-.venv/bin/python -m kern gui      # native Qt6 app (Wayland, no Electron)
-.venv/bin/python -m kern serve    # WebSocket daemon on 127.0.0.1:8765
-.venv/bin/python -m kern --task "..."   # headless one-shot
-.venv/bin/python -m kern --probe gpt-5.5
+KERN_DEBUG=1 kern          # enable
+tail -f ~/.kern/sessions/<id>/debug.jsonl | jq .
 ```
 
-## Design rules
+---
 
-1. **One model, chosen by you.** `/model` or the picker switches engine + subagents
-   mid-session. No hidden routing.
-2. **Fresh sessions.** No cross-conversation memory. Ever.
-3. **The harness adapts to the model.** Handshake probes tool-calling; falls back to
-   fenced ```tool blocks on models without native tools. No silent dumbness.
-4. **Tools mount just-in-time.** Nothing preloaded beyond the 8 syscalls.
-   The model mounts capabilities itself.
-5. **Tool errors are model-facing UX.** Every failure says what broke and shows the
-   correct shape.
-6. **Diffs before writes.** write/edit approvals show the actual colored diff
-   *before* anything touches disk.
+## Installation
 
-## Verified live (2026-09-09)
+Requires Python 3.11+.
 
-- full agentic loops: write→run→verify, todo plans, diffs, exec
-- protocol handshake + fenced fallback on gemini-3.8-flash-api (0.8s TTFT)
-- spawn isolation, JIT MCP mount mid-conversation, pager offload, /rewind
-- TUI: streaming, model picker, approval modal with diff, interrupt
-- GUI: Qt6 offscreen end-to-end turn with plan card + diff cards
-- daemon: ws chat turn with approvals + usage accounting
+```bash
+git clone https://github.com/<you>/kern.git
+cd kern
+pip install -e .
+kern --probe        # verify your model endpoint
+kern                # start the TUI
+```
 
-## Roadmap
+Kern talks to any OpenAI-compatible endpoint. Configure your model via `kern/models.json` or the `KERN_MODEL` / `KERN_BASE_URL` environment variables.
 
-gemini-native adapter · bench/ scoreboard · bwrap sandbox for exec ·
-subagent parallel fan-out · session search tool · ACP adapter (Toad/Zed as clients)
+---
 
+## The toolbox (at rest)
 
-## v0.2 → v0.3 additions
+| Tool | Purpose |
+|------|---------|
+| `read` / `write` / `edit` | file ops; edit is retry-safe and verifies the result |
+| `exec` | shell, with auto-approval for read-only commands |
+| `py` | persistent Python interpreter (state survives between calls) |
+| `search` / `fetch` / `scrape` | web access |
+| `todo` | the durable plan |
+| `memory` | query/curate the persistent memory store |
+| `spawn` / `subagent` | delegate to isolated subagents |
+| `mount` / `list capabilities` | on-demand capabilities (MCP servers, skills) |
 
-- **True transparency**: `ansi_color=True` activates Textual's `:ansi` pseudo-class —
-  zero background SGR codes emitted; your terminal's own bg (blur, wallpaper) shows through.
-  Verified at the byte level (PTY capture: 0 background fills).
-- **Read-only auto-approval**: `ls`, `rg`, `git status`… flow without modals;
-  mutating commands still ask. `syscalls.is_safe_readonly()`.
-- **Secrets redaction**: API keys / tokens / private keys are redacted from tool
-  output before they reach the model or the journal.
-- **bwrap sandbox** for exec (default on when available; `KERN_SANDBOX=0` disables).
-  Project dir + /tmp + ~/.cache writable, rest read-only, network on.
-- **Session resume**: `ctrl+r` / `/resume` picker replays any past journal into the UI.
-- **Context %**: footer shows real fill against the model's catalog `context_length`.
-- **/usage**: live token + $ cost from proxy pricing.
-- **Multiline prompt**: enter sends, ctrl+j newline, up/down history.
-- **Quit**: ctrl-c interrupts a turn / clears a draft / quits when idle. ctrl-d/ctrl-q quit.
-  (ctrl-m is gone — it IS the Enter byte in terminals; model picker is ctrl-p.)
-- **Auto-probe**: unknown models get a capability handshake on first turn —
-  no more silent fenced-mode dumbness (this was gpt-5.4-mini's 0/5).
+Everything else is mounted on demand. That's the point.
 
-## bench scoreboard (see bench/RESULTS.md)
+---
 
-`cd ~/kern && .venv/bin/python -m bench.runner [models...]`
+## Status
+
+Kern is under active development and has been exercised against a range of models (GPT, Claude, Gemini, Kimi, MiniMax, and others) with explicit per-model quirks handling. The harness mechanisms — circuit breaker, escalation ladder, reliable edit, persistent memory — are tested and stable.
+
+Contributions, issues, and honest feedback are welcome.

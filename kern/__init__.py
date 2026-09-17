@@ -14,7 +14,7 @@ import os
 
 _dir = os.path.dirname(os.path.abspath(__file__))
 
-_STATIC = "0.2.0"
+_STATIC = "0.3.0"
 
 
 def _source_version() -> str:

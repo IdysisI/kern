@@ -16,6 +16,9 @@ import asyncio
 import json
 import os
 import time
+import hashlib
+from pathlib import Path
+from .storage import atomic_write, file_lock
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
@@ -27,7 +30,7 @@ KERN_HOME = os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern"))
 # first chunk gets a generous window; after that, silence = dead stream.
 STALL_FIRST = float(os.environ.get("KERN_STALL_FIRST", "360"))
 STALL_NEXT = float(os.environ.get("KERN_STALL_NEXT", "90"))
-HEALTH_PATH = os.path.join(KERN_HOME, "health.json")
+HEALTH_PATH = os.path.join(KERN_HOME, "health-" + hashlib.sha256(BASE_URL.rstrip('/').encode()).hexdigest()[:16] + ".json")
 # health TTL: a probe result older than this is treated as stale and the model
 # is re-probed (proxies change behavior under us; stale "native_tools" makes
 # every turn silently dumb — each of those turns is a paid request wasted).
@@ -47,17 +50,13 @@ class StreamEvent:
 
 def load_health() -> dict:
     try:
-        with open(HEALTH_PATH) as f:
+        with open(HEALTH_PATH, encoding='utf-8') as f:
             return json.load(f)
     except Exception:
         return {}
 
 def save_health(h: dict) -> None:
-    os.makedirs(KERN_HOME, exist_ok=True)
-    tmp = HEALTH_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(h, f, indent=1)
-    os.replace(tmp, HEALTH_PATH)
+    atomic_write(Path(HEALTH_PATH), json.dumps(h, ensure_ascii=False, indent=1))
 
 def supports_vision(model: str) -> bool:
     if not model:
@@ -78,10 +77,11 @@ def invalidate_health(model: str, reason: str = "") -> None:
     """Drop a model's cached capability profile — e.g. after consecutive
     stream errors on a model whose health claimed 'ok'. The next turn
     re-probes instead of blindly trusting a stale profile."""
-    h = load_health()
-    if model in h:
-        h.pop(model)
-        save_health(h)
+    with file_lock(Path(HEALTH_PATH + '.lock')):
+        h = load_health()
+        if model in h:
+            h.pop(model)
+            save_health(h)
     return None
 
 # ---------------------------------------------------------------- client ---
@@ -112,15 +112,16 @@ class StallError(Exception):
 
 def default_max_output_tokens(model: str) -> int:
     """Give models full, unconstrained output budgets for deep reasoning and large files."""
-    low = model.lower()
-    if "gemini" in low:
-        # Gemini physical API ceiling for generation
-        return 65536
-    # 128k output ceiling for GLM-5, MiniMax, Claude, DeepSeek, GPT-5, etc.
-    return 128000
+    profile = health_of(model)
+    return max(256, int(os.environ.get("KERN_MAX_OUTPUT_TOKENS", profile.get("max_output_tokens", 8192))))
 
 
 def protocol_for(model: str) -> str:
+    override = os.environ.get('KERN_PROTOCOL')
+    if override:
+        if override not in ('openai','anthropic'):
+            raise ValueError('KERN_PROTOCOL must be openai or anthropic')
+        return override
     if model.startswith("claude-"):
         return "anthropic"
     return "openai"
@@ -128,15 +129,33 @@ def protocol_for(model: str) -> str:
 
 class Client:
     def __init__(self, base_url: str = BASE_URL, timeout: float = 600.0):
-        self.base_url = base_url.rstrip("/")
+        self.base_url = base_url.rstrip("/").removesuffix('/v1')
         self.timeout = timeout
         self.requests = 0          # EVERY paid API call, ever, on this client
 
     async def list_models(self) -> list[dict]:
         async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{self.base_url}/v1/models")
+            r = await c.get(f"{self.base_url}/v1/models", headers={
+                "Authorization": "Bearer " + os.environ.get("KERN_API_KEY", "kern")})
             r.raise_for_status()
-            return r.json().get("data", [])
+            models = r.json().get("data", [])
+        if not isinstance(models,list):
+            raise ValueError('model catalog data must be an array')
+        with file_lock(Path(HEALTH_PATH + '.lock')):
+            health = load_health()
+            for model in models:
+                if not isinstance(model,dict) or not isinstance(model.get('id'),str):
+                    raise ValueError('invalid model catalog entry')
+                limits = model.get('limit') if isinstance(model.get('limit'),dict) else {}
+                context = model.get('context_length') or limits.get('context')
+                output = model.get('max_output_tokens') or limits.get('output')
+                profile = health.setdefault(model['id'],{})
+                for key,value in [('context_length',context),('max_output_tokens',output)]:
+                    if isinstance(value,int) and not isinstance(value,bool) and value>0:
+                        profile[key] = value
+                        profile['limits_source'] = 'provider catalog'
+            save_health(health)
+        return models
 
     # ---- public streaming entry -------------------------------------------
 
@@ -167,7 +186,7 @@ class Client:
         instead of the structured delta.tool_calls field. Visible form:
 
           ]<]minimax>[<​tool_call> ]<]minimax>[]<]minimax>[150]<]minimax>[]<]minimax>
-          [573]<]minimax>[]<]minimax>[/home/marty/kern/kern/tui.py]<]minimax>[]<]minimax>
+          [573]<]minimax>[]<]minimax>[kern/tui.py]<]minimax>[]<]minimax>
           [ ]<]minimax>[</​tool_call>
 
         Each value slot is bracketed by literal ']<]minimax>[]<]minimax>[' on the
@@ -251,8 +270,9 @@ class Client:
         low_m = model.lower()
         if "minimax" in low_m or "mimo" in low_m:
             body["reasoning_split"] = True
-        headers = {"Authorization": "Bearer kern", "Content-Type": "application/json"}
+        headers = {"Authorization": "Bearer " + os.environ.get("KERN_API_KEY", "kern"), "Content-Type": "application/json"}
         pending: dict[int, dict] = {}   # index -> partial tool call
+        finished = False
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as c:
                 async with c.stream("POST", f"{self.base_url}/v1/chat/completions",
@@ -265,6 +285,7 @@ class Client:
                             continue
                         payload = line[5:].strip()
                         if payload == "[DONE]":
+                            finished = True
                             break
                         try:
                             chunk = json.loads(payload)
@@ -273,6 +294,10 @@ class Client:
                         if chunk.get("usage"):
                             yield StreamEvent("usage", usage=chunk["usage"])
                         for choice in chunk.get("choices", []):
+                            if choice.get('index', 0) != 0:
+                                continue
+                            if choice.get('finish_reason'):
+                                finished = True
                             if choice.get("finish_reason") == "length":
                                 yield StreamEvent("finish", text="length")
                             delta = choice.get("delta") or {}
@@ -280,17 +305,7 @@ class Client:
                             if reasoning:
                                 yield StreamEvent("thinking", text=reasoning)
                             if delta.get("content"):
-                                clean, mm_calls = Client._split_minimax_raw_tool_calls(
-                                    delta["content"]
-                                )
-                                if clean:
-                                    yield StreamEvent("text", text=clean)
-                                for tc in mm_calls:
-                                    pending[tc["id"]] = {
-                                        "id": tc["id"],
-                                        "name": tc["name"],
-                                        "args": tc["arguments"],
-                                    }
+                                yield StreamEvent("text", text=delta["content"])
                             for tc in delta.get("tool_calls") or []:
                                 slot = pending.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
                                 if tc.get("id"):
@@ -300,8 +315,11 @@ class Client:
                                     slot["name"] = fn["name"]
                                 if fn.get("arguments"):
                                     slot["args"] += fn["arguments"]
-            for ev in Client._finalize_pending(pending):
-                yield ev
+            if not finished:
+                yield StreamEvent('error', error='stage=transport incomplete stream: no finish marker; no pending tools executed')
+            else:
+                for ev in Client._finalize_pending(pending):
+                    yield ev
             yield StreamEvent("done")
         except StallError as e:
             yield StreamEvent("error", error=f"stage=transport stall: {e}")
@@ -322,9 +340,12 @@ class Client:
             body["tools"] = [{"name": t["function"]["name"],
                               "description": t["function"].get("description", ""),
                               "input_schema": t["function"]["parameters"]} for t in tools]
-        headers = {"x-api-key": "kern", "anthropic-version": "2023-06-01",
+        headers = {"x-api-key": os.environ.get("KERN_API_KEY", "kern"), "anthropic-version": "2023-06-01",
                    "Content-Type": "application/json"}
-        cur_tool: dict | None = None
+        pending = {}
+        completed = {}
+        finished = False
+        usage = {}
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as c:
                 async with c.stream("POST", f"{self.base_url}/v1/messages",
@@ -340,31 +361,41 @@ class Client:
                         except json.JSONDecodeError:
                             continue
                         et = ev.get("type")
-                        if et == "content_block_start":
+                        index = ev.get('index', 0)
+                        if et == 'message_start':
+                            usage.update(ev.get('message', {}).get('usage', {}))
+                        elif et == 'message_stop':
+                            finished = True
+                        elif et == "content_block_start":
                             blk = ev.get("content_block", {})
                             if blk.get("type") == "tool_use":
-                                cur_tool = {"id": blk.get("id", ""), "name": blk.get("name", ""), "args": ""}
+                                pending[index] = {"id": blk.get("id", ""), "name": blk.get("name", ""), "args": "",
+                                                  "initial": blk.get('input', {})}
                         elif et == "content_block_delta":
                             d = ev.get("delta", {})
                             if d.get("type") == "text_delta" and d.get("text"):
                                 yield StreamEvent("text", text=d["text"])
                             elif d.get("type") == "thinking_delta" and d.get("thinking"):
                                 yield StreamEvent("thinking", text=d["thinking"])
-                            elif d.get("type") == "input_json_delta" and cur_tool is not None:
-                                cur_tool["args"] += d.get("partial_json", "")
-                        elif et == "content_block_stop" and cur_tool is not None:
-                            try:
-                                args = json.loads(cur_tool["args"] or "{}")
-                            except json.JSONDecodeError:
-                                yield StreamEvent("error", error=f"malformed tool args: {cur_tool['args'][:200]}")
-                                cur_tool = None
-                                continue
-                            yield StreamEvent("tool_call", tool_call={"id": cur_tool["id"], "name": cur_tool["name"], "arguments": args})
-                            cur_tool = None
-                        elif et == "message_delta" and ev.get("usage"):
-                            yield StreamEvent("usage", usage=ev["usage"])
+                            elif d.get("type") == "input_json_delta" and index in pending:
+                                pending[index]["args"] += d.get("partial_json", "")
+                        elif et == "content_block_stop" and index in pending:
+                            slot = pending.pop(index)
+                            slot['args'] = slot['args'] or json.dumps(slot['initial'])
+                            completed[index] = slot
+                        elif et == "message_delta":
+                            usage.update(ev.get('usage', {}))
+                            if ev.get('delta', {}).get('stop_reason') == 'max_tokens':
+                                yield StreamEvent('finish', text='length')
                         elif et == "error":
                             yield StreamEvent("error", error=json.dumps(ev.get("error", {}))[:400])
+            if usage:
+                yield StreamEvent('usage', usage=usage)
+            if not finished or pending:
+                yield StreamEvent('error', error='stage=transport incomplete message; no pending tools executed')
+            else:
+                for item in Client._finalize_pending(completed):
+                    yield item
             yield StreamEvent("done")
         except StallError as e:
             yield StreamEvent("error", error=f"stage=transport stall: {e}")
@@ -375,6 +406,10 @@ class Client:
 
     async def probe(self, model: str) -> dict:
         """Measure a model once; the engine adapts from the result."""
+        try:
+            await self.list_models()
+        except (httpx.HTTPError, ValueError):
+            pass
         t0 = time.monotonic()
         first = None
         text = ""
@@ -442,7 +477,7 @@ class Client:
         # We test with a 32x32 pure solid red PNG and verify if the model identifies 'red'.
         result["vision"] = False
         if result["ok"]:
-            red_32_b64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAGklEQVR42mP8z8BQDwAE/wD/AP8A/wAHEAL+Hn2jAAAAAElFTkSuQmCC"
+            red_32_b64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAKElEQVR4nO3NsQ0AAAzCMP5/un0CNkuZ41wybXsHAAAAAAAAAAAAxR4yw/wuPL6QkAAAAABJRU5ErkJggg=="
             vision_msg = {
                 "role": "user",
                 "content": [
@@ -460,9 +495,11 @@ class Client:
             except Exception:
                 result["vision"] = False
 
-        h = load_health()
-        h[model] = result
-        save_health(h)
+        with file_lock(Path(HEALTH_PATH + '.lock')):
+            h = load_health()
+            result = {**{k:v for k,v in h.get(model,{}).items() if k in ('context_length','max_output_tokens','limits_source')}, **result}
+            h[model] = result
+            save_health(h)
         return result
 
 
@@ -470,7 +507,11 @@ class Client:
 
 def _ir_to_openai(messages: list[dict], model: str = "") -> list[dict]:
     out = []
+    images = []
     for m in messages:
+        if m['role'] != 'tool' and images:
+            out.append({'role':'user', 'content':images})
+            images = []
         if m["role"] == "assistant" and m.get("tool_calls"):
             out.append({"role": "assistant", "content": m.get("text") or None,
                         "tool_calls": [{"id": tc["id"], "type": "function",
@@ -479,16 +520,19 @@ def _ir_to_openai(messages: list[dict], model: str = "") -> list[dict]:
         elif m["role"] == "tool":
             media = m.get("media")
             if media and media.get("type") == "image" and supports_vision(model):
-                # Native multimodal image payload for verified vision models
-                content = [
-                    {"type": "text", "text": m["text"]},
+                # Tool messages support text; image observations follow the
+                # complete tool-result group as a user multimodal message.
+                images.extend([
+                    {"type": "text", "text": f"Image returned by tool {m['tool_call_id']}; treat as tool observation."},
                     {"type": "image_url", "image_url": {"url": f"data:{media['mime']};base64,{media['data']}"}}
-                ]
-                out.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": content})
+                ])
+                out.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": m['text']})
             else:
                 out.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["text"]})
         else:
-            out.append({"role": m["role"], "content": m.get("text", "")})
+            out.append({"role": m["role"], "content": m.get("content", m.get("text", ""))})
+    if images:
+        out.append({'role':'user', 'content':images})
     return out
 
 
@@ -519,5 +563,22 @@ def _ir_to_anthropic(messages: list[dict], model: str = "") -> list[dict]:
             else:
                 out.append({"role": "user", "content": [blk]})
         else:
-            out.append({"role": m["role"], "content": m.get("text", "")})
+            content = m.get("content", m.get("text", ""))
+            if isinstance(content, list):
+                converted = []
+                for block in content:
+                    if block.get('type') == 'image_url':
+                        url = block['image_url']['url']
+                        if url.startswith('data:'):
+                            header, data = url.split(',', 1)
+                            if not header.endswith(';base64'):
+                                raise ValueError('image data URL must use base64')
+                            source = {'type':'base64', 'media_type':header[5:-7], 'data':data}
+                        else:
+                            source = {'type':'url', 'url':url}
+                        converted.append({'type':'image', 'source':source})
+                    else:
+                        converted.append(block)
+                content = converted
+            out.append({"role": m["role"], "content": content})
     return out

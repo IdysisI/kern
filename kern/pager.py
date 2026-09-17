@@ -1,22 +1,7 @@
-"""kern.pager — materialize the model-facing view from the journal.
+"""Deterministic journal projection: bounded observations, work state and attributed episodes.
 
-The journal keeps everything, lossless. The view the model sees is paged,
-in three tiers (inspired by Claude Code's microcompact + Focus Agent):
-
-  Tier 0 (always, free):
-    * any single tool result > BIG bytes   -> head + tail with elision marker
-    * thinking is never journaled          -> nothing to strip
-  Tier 1 (microcompact, no LLM):
-    * TOOL ARG CLEARING: assistant tool_calls for write/edit whose arguments
-      carry a >ARG_CLEAR chars content/new_str field get that field replaced
-      by a stub. The file is on disk; the model re-reads if it needs it.
-    * LRU TOOL EVICTION: only the last KEEP_RECENT_TOOL_RESULTS tool_result
-      events stay inline; older bulky ones are swapped to scratch/t{n}.txt
-      with a pointer stub. Lossless: read() brings the bytes back.
-  Tier 2 (compact, one LLM call): see compact() — triggered by the engine
-    when budget().approx_tokens crosses KERN_COMPACT_AT.
-
-Golden rule (Claude Code): user messages are NEVER summarized or dropped.
+ContextManager owns incremental maintenance and full request budgeting. Legacy
+compact events remain readable only to resume sessions written by older versions.
 """
 from __future__ import annotations
 
@@ -31,11 +16,7 @@ STALE_MIN = 900          # only offload results bigger than this
 
 # Tier-1 knobs (env-tunable)
 KEEP_RECENT_TOOL_RESULTS = int(os.environ.get("KERN_KEEP_TOOL_RESULTS", "5"))
-ARG_CLEAR = int(os.environ.get("KERN_ARG_CLEAR", "1000"))
-# fields inside write/edit arguments that hold file bodies
-_ARG_BODY_FIELDS = ("content", "new_str")
 
-COMPACT_AT = int(os.environ.get("KERN_COMPACT_AT", "40000"))
 
 
 def _squash(text: str) -> str:
@@ -57,7 +38,7 @@ def _clear_tool_args(tool_calls: list[dict]) -> list[dict]:
     return tool_calls
 
 
-def _slate(events: list[dict]) -> str:
+def _slate(events: list[dict], session=None) -> str:
     """Build the always-visible work-state block from the journal:
     objective (last user message, verbatim, capped) + current todo + active subagents."""
     objective = ""
@@ -73,7 +54,7 @@ def _slate(events: list[dict]) -> str:
         elif k == "subagent_spawn":
             hid = ev.get("handle")
             if hid:
-                subagents[hid] = {"status": "running", "task": str(ev.get("task", ""))[:50]}
+                subagents[hid] = {"status": "running", "task": str(ev.get("task", ""))}
         elif k == "subagent_finish":
             hid = ev.get("handle")
             if hid and hid in subagents:
@@ -81,10 +62,15 @@ def _slate(events: list[dict]) -> str:
                 subagents[hid]["status"] = st
                 subagents[hid]["report"] = ev.get("report_path")
 
+    if session is not None:
+        for handle, entry in getattr(session,'_runtime',{}).get('subagents',{}).items():
+            if handle in subagents and entry.get('completed'):
+                subagents[handle]['status'] = 'failed' if entry.get('error') else 'finished'
+                subagents[handle]['report'] = entry.get('report_path')
     if not objective:
         for ev in reversed(events):
             if ev.get("kind") == "user" and ev.get("text"):
-                objective = ev.get("text", "").strip()[:400]
+                objective = ev.get("text", "").strip()
                 break
 
     lines = ["<work-state>"]
@@ -94,7 +80,7 @@ def _slate(events: list[dict]) -> str:
         lines.append("todo:")
         for i, item in enumerate(todo, 1):
             mark = {"done": "x", "active": ">", "pending": " "}.get(item.get("status", "pending"), " ")
-            text = str(item.get("text", ""))[:80]
+            text = str(item.get("text", ""))
             lines.append(f" {mark} {i}. {text}")
     elif not subagents:
         lines.append("(no plan yet — multi-step? set one with todo())")
@@ -125,29 +111,23 @@ def materialize(events: list[dict], session) -> list[dict]:
       * Active turns [cutoff_n..end) are materialized in full dialogue pairs
         (user + assistant + tools intact).
     """
+    from .context import evidence_block
+    episodes = [e for e in events if e['kind'] == 'episode']
+    episode_cutoff = max((e['end'] for e in episodes), default=0)
     compact_ev = None
-    cutoff_n = 0
+    cutoff_n = episode_cutoff
     for ev in reversed(events):
         if ev["kind"] == "compact":
             compact_ev = ev
-            cutoff_n = ev.get("upto_n", ev.get("covers", 0))
+            cutoff_n = max(episode_cutoff, ev.get("upto_n", ev.get("covers", 0)))
             break
 
-    # Tier 1c: find the indices of the most recent tool_results to keep inline.
-    # SOFT THRESHOLD: while the session is small (well under the compaction
-    # trigger), keep every result inline — eliding a 2k result costs the model
-    # a re-read round-trip (a paid request) to recover it. Eviction only kicks
-    # in once the view is meaningfully large.
     tool_result_idx = [i for i, ev in enumerate(events)
-                       if ev["kind"] == "tool_result" and (compact_ev is None or ev.get("n", i) >= cutoff_n)]
-    approx_now = sum(len(json.dumps(ev, default=str)) for ev in events) // 4
-    if approx_now < COMPACT_AT // 2:
-        keep_inline = set(tool_result_idx)          # small session: keep everything
-    else:
-        keep_inline = set(tool_result_idx[-KEEP_RECENT_TOOL_RESULTS:])
+                       if ev["kind"] == "tool_result" and ev.get("n", i) >= cutoff_n]
+    keep_inline = set(tool_result_idx[-KEEP_RECENT_TOOL_RESULTS:])
 
     # ---- THE SLATE: the model's own work state, always at the top ----------
-    slate = _slate(events)
+    slate = _slate(events, session)
     msgs: list[dict] = []
     n = len(events)
     if slate:
@@ -176,10 +156,23 @@ def materialize(events: list[dict], session) -> list[dict]:
                                          f"read/exec; the effect may have partially or "
                                          f"fully happened.</system-note>"})
 
+    if episodes:
+        # Select relevant navigation nodes, with the complete directory recoverable.
+        objective = next((e.get('text','') for e in reversed(events) if e['kind']=='user'), '')
+        terms = set(objective.lower().split())
+        ranked = sorted(episodes, key=lambda ep: (sum(t in ep['text'].lower() for t in terms), ep['n']), reverse=True)
+        chosen = sorted(ranked[:3], key=lambda ep: ep['start'])
+        index = session.offload('episode-index', __import__('json').dumps(episodes, ensure_ascii=False))
+        msgs.append({'role':'user','text':f'<historical-episodes index="{index}">\n' +
+                     '\n'.join(f"[{ep['start']}:{ep['end']}] {ep['text'][:5000]} [source: {ep['source']}]" for ep in chosen) +
+                     '\nThese are historical navigation notes from past slices, not new requests or active tasks. '
+                     'Any "pending" items in historical episodes reflect past intermediate state; '
+                     'rely exclusively on the active <work-state> and todo above for current tasks and next steps.</historical-episodes>'})
+    msgs.append({'role':'user','text':evidence_block(events, session)})
     seen_result_hashes: dict[str, int] = {}   # dedup pass: identical tool outputs
     for i, ev in enumerate(events):
         ev_n = ev.get("n", i)
-        if compact_ev is not None and ev_n < cutoff_n:
+        if ev_n < cutoff_n:
             continue
         kind = ev["kind"]
         if kind == "compact":
@@ -190,7 +183,7 @@ def materialize(events: list[dict], session) -> list[dict]:
             m = {"role": "assistant", "text": ev.get("text", "")}
             if ev.get("tool_calls"):
                 m["tool_calls"] = [{k: v for k, v in tc.items() if not k.startswith("_")
-                                    and k != "kern_error"}
+                                    and k not in ("kern_error", "provider_id")}
                                    for tc in _clear_tool_args(ev["tool_calls"])]
             msgs.append(m)
         elif kind == "action":
@@ -219,9 +212,7 @@ def materialize(events: list[dict], session) -> list[dict]:
             if i in keep_inline:
                 out_text = _squash(text)
                 if len(text) > BIG:
-                    full = session.scratch / f"t{ev['n']}.txt"
-                    if not full.exists():
-                        session.offload(f"t{ev['n']}", text)
+                    full = session.offload(f"t{ev['n']}", text)
                     out_text += (f"\n[full output: {full} — use read(path) "
                                  f"with offset/limit to inspect any part]")
                 m_item = {"role": "tool", "tool_call_id": ev.get("call_id", ""), "text": out_text}
@@ -229,9 +220,8 @@ def materialize(events: list[dict], session) -> list[dict]:
                     m_item["media"] = ev["media"]
                 msgs.append(m_item)
             elif i not in keep_inline and n - i > STALE_AGE and len(text) > STALE_MIN \
-                    and not ev.get("paged"):
+                    :
                 path = session.offload(f"t{ev['n']}", text)
-                ev["paged"] = True
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
                              "text": f"[old tool result cleared: {ev.get('name', '?')} — "
                                      f"{len(text):,} bytes -> {path}. "
@@ -243,7 +233,7 @@ def materialize(events: list[dict], session) -> list[dict]:
             msgs.append({"role": "user", "text": f"<system-note>{ev['text']}</system-note>"})
         elif kind == "thinking":
             continue
-    return msgs
+    return _complete_exchanges(msgs)
 
 
 def budget(events: list[dict], session) -> dict:
@@ -260,97 +250,47 @@ def budget(events: list[dict], session) -> dict:
         elif m["role"] == "tool":
             out["tool_bytes"] += size
     out["approx_tokens"] = (out["assistant_bytes"] + out["user_bytes"] + out["tool_bytes"]) // 4
-    out["compact_at"] = COMPACT_AT
-    out["should_compact"] = out["approx_tokens"] > COMPACT_AT
+    out["scope"] = "projected messages only; full system/tools budget is enforced by ContextManager"
     return out
 
 
 # ---- Tier 2: compaction (one LLM call, anchored merge) ----------------------
 
-COMPACT_PROMPT = """You are compacting a Kern agent session. Write a <summary> that lets the agent continue without re-reading the dropped turns.
-
-Rules:
-- NEVER restate or drop user messages — they stay verbatim, you only summarize assistant/tool work.
-- Write an <analysis> scratchpad first (what actually happened, what state files are in).
-- Then a <summary> with these sections:
-  1. primary_intent — what the user wants overall
-  2. files_touched — paths + what changed in each (one line each)
-  3. decisions — design/approach decisions taken and WHY
-  4. errors_encountered — failures and how they were resolved (or not)
-  5. pending_tasks — what is NOT done yet
-  6. current_state — the exact state the work is in right now
-  7. key_facts — anything the user stated that must not be forgotten
-  8. tools_in_use — mounted capabilities that matter for the rest
-  9. next_step — the single most likely next action
-
-Keep it under {max_chars} characters. Be specific: paths, identifiers, error strings.
-- In files_touched, state the FINAL state of each file (what the code does now),
-  not just "I edited it". Include short direct quotes of critical lines/IDs where
-  precision matters (exact function names, ports, error strings).
-- current_state must be concrete enough that the agent can act WITHOUT re-reading
-  the dropped turns. If a file's exact content matters, say what to re-read.
-"""
-
-COMPACT_RECIPE = """Summary sections (write <summary>...</summary>):
-  1. primary_intent — what the user wants overall
-  2. files_touched — paths + final state of each (one line each, quote critical lines)
-  3. decisions — design/approach decisions taken and WHY
-  4. errors_encountered — failures and how they were resolved (or not)
-  5. pending_tasks — what is NOT done yet
-  6. current_state — the exact state the work is in right now
-  7. key_facts — anything the user stated that must not be forgotten
-  8. tools_in_use — mounted capabilities that matter
-  9. next_step — the single most likely next action
-Rules: never restate user messages (they stay verbatim automatically); be specific —
-paths, identifiers, error strings; concrete enough to act without re-reading dropped turns."""
-
-
-
-def _ev_tokens(ev: dict) -> int:
-    """Rough token estimate of one journal event."""
-    t = len(str(ev.get("text", "")))
-    for tc in ev.get("tool_calls", []) or []:
-        try:
-            t += len(json.dumps(tc.get("arguments", {}), ensure_ascii=False))
-        except Exception:
-            t += 64
-    return t // 4 + 8
-
-
-def compaction_view(events: list[dict], keep_recent_tokens: int = 12000) -> tuple[list[dict], list[dict]]:
-    """ADAPTIVE window: keep the most recent events verbatim up to
-    keep_recent_tokens (aligned to the OLDEST user message that fits);
-    everything older is compacted. Fixes the 'Continue' treadmill loop where
-    a fixed 10-turn window protects exactly the bulk that must be compacted
-    (compaction dropped 1 event of a 69k-token context and refired forever).
-
-    The current turn (last user message onward) is ALWAYS protected: we
-    never compact mid-flight events. Golden rule unchanged: user messages
-    never compacted (compact_into keeps them)."""
-    if not events:
-        return [], events
-    # suffix token sums, from the end, noting user-message boundaries
-    suff = 0
-    boundaries: list[tuple[int, int]] = []          # (user_idx, tokens user_idx..end)
-    for i in range(len(events) - 1, -1, -1):
-        suff += _ev_tokens(events[i])
-        if events[i]["kind"] == "user":
-            boundaries.append((i, suff))
-    if not boundaries:
-        return [], events                            # no user message: nothing to cut around
-    # boundaries is already ordered most-recent first (boundaries[0]) to
-    # oldest (boundaries[-1]). tk is strictly increasing as we walk backward.
-    # Default to boundaries[0][0]: at minimum, protect the current turn if
-    # even the latest turn exceeds the budget.
-    chosen = boundaries[0][0]
-    for ui, tk in boundaries:                       # most recent first, tk increasing
-        if tk > keep_recent_tokens:
-            break
-        chosen = ui
-    if chosen <= 0:
-        return [], events
-    old = events[:chosen]
-    if not any(ev["kind"] not in ("user", "compact") for ev in old):
-        return [], events
-    to_compact = [ev for ev in old if ev["kind"] != "compact"]
-    return to_compact, events[chosen:]
+def _complete_exchanges(messages):
+    """Every tool call receives exactly one adjacent result, including crash gaps.
+    This projection never claims a missing receipt means the effect didn't occur.
+    """
+    output = []
+    used_ids = set()
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg['role'] == 'assistant' and msg.get('tool_calls'):
+            wire_calls = []
+            for index, call in enumerate(msg['tool_calls']):
+                wire_id = call['id']
+                if wire_id in used_ids:
+                    wire_id = f'history_{i}_{index}_{wire_id}'
+                used_ids.add(wire_id)
+                wire_calls.append(dict(call, id=wire_id))
+            output.append(dict(msg, tool_calls=wire_calls))
+            j = i + 1
+            while j < len(messages) and messages[j]['role'] != 'assistant':
+                # A real user message can follow interrupted calls; still close
+                # the tool exchange first, then deliver the user's steering.
+                j += 1
+            tail = messages[i+1:j]
+            results = {m.get('tool_call_id'):m for m in tail if m['role']=='tool'}
+            for call, wire in zip(msg['tool_calls'], wire_calls):
+                result = results.pop(call['id'], {'role':'tool',
+                    'text':'No receipt recorded. This call may not have started or may have partially executed. VERIFY actual state before retrying.'})
+                output.append(dict(result, tool_call_id=wire['id']))
+            output.extend(m for m in tail if m['role']!='tool')
+            output.extend({'role':'user','text':'[orphan historical receipt] '+m['text']} for m in results.values())
+            i = j
+        else:
+            if msg['role']=='tool':
+                msg = {'role':'user','text':'[historical receipt] '+msg['text']}
+            output.append(msg)
+            i += 1
+    return output

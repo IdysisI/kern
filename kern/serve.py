@@ -74,6 +74,9 @@ class Conn:
 
     async def handle(self, msg: dict):
         m = msg.get("method")
+        if m in ('new_session','rewind','fork') and self.turn and not self.turn.done():
+            await self.send(event='error',error='interrupt the active turn before mutating session')
+            return
         if m == "chat":
             if self.turn and not self.turn.done():
                 await self.send(event="busy", text="turn already running; interrupt first")
@@ -149,11 +152,9 @@ async def handler(ws):
 
 
 def main():
-    async def _run():
-        async with websockets.serve(handler, HOST, PORT):
-            print(f"kern daemon on ws://{HOST}:{PORT}")
-            await asyncio.Future()
-    asyncio.run(_run())
+    # CLI serves the shared persistent runtime, including the browser frontend.
+    from .daemon import main as run
+    run()
 
 
 if __name__ == "__main__":
