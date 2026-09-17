@@ -166,23 +166,75 @@ class MemoryTree:
                 'These identifiers are not Markdown filenames.\n' +
                 '\n'.join(x[:1200] for x in lines))
 
+    def _norm_text(self, text: str) -> str:
+        """Normalize a note body for dedupe: lowercase, collapse whitespace."""
+        return ' '.join(text.casefold().split())
+
+    def _source_rank(self, source: str) -> int:
+        """Higher = more authoritative. Verified receipts outrank model claims."""
+        s = (source or '')
+        if s.startswith('receipt') or 'tool_result' in s or 'verified' in s:
+            return 3
+        if s.startswith('session:'):
+            return 2
+        if s.startswith('manual'):
+            return 1
+        return 0
+
     def reconcile(self, topic):
+        """Return the active claims for a topic, resolving contradictions.
+
+        M3 hygiene: notes sharing the same ``key`` are already superseded at
+        write time. For *unkeyed* notes that assert conflicting values about the
+        same subject, we surface only the newest / highest-source-rank claim as
+        'current' and list the rest as 'superseded candidates', so retrieval
+        never silently returns a stale or self-contradicting set. Raw rows are
+        untouched (nothing is deleted — decay lowers rank, never deletes).
+        """
         rows = [r for r in self._rows() if r['topic'] == topic]
-        return ('Active attributed claims; contradictory unkeyed notes coexist. Verify against current evidence.\n' +
-                '\n'.join(f"note:{r['id']}: {r['text']} [source:{r['source']}]" for r in rows))
+        if not rows:
+            return f'No attributed claims for topic "{topic}".'
+        # Rank: newest first, then source authority, then pinned.
+        ranked = sorted(rows, key=lambda r: (
+            r.get('pinned', 0), self._source_rank(r['source']), r['created']), reverse=True)
+        # Dedupe by normalized text, keeping the highest-ranked copy.
+        seen = set()
+        current, superseded = [], []
+        for r in ranked:
+            k = self._norm_text(r['text'])
+            if k in seen:
+                superseded.append(r)
+                continue
+            seen.add(k)
+            current.append(r)
+        lines = [f'Attributed claims for "{topic}" (current; {len(superseded)} duplicate/conflicting elided):']
+        for r in current:
+            lines.append(f"note:{r['id']}: {r['text']} [source:{r['source']}]")
+        if superseded:
+            lines.append('Elided as duplicate/lower-rank (recoverable via history):')
+            for r in superseded:
+                lines.append(f"  ~ note:{r['id']}: {r['text'][:80]} [source:{r['source']}]")
+        return '\n'.join(lines)
 
     def remember(self, text, topic='general', sid='', key='', source=''):
         from .syscalls import redact
         if not text.strip():
             raise ValueError('empty memory note')
-        nid = uuid.uuid4().hex
         source = source or (f'session:{sid}:model-note' if sid else 'manual:unverified')
+        norm = self._norm_text(text)
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             old = []
             if key:
                 old = [r['id'] for r in db.execute("SELECT id FROM notes WHERE topic=? AND key=? AND status='active'", (topic,key))]
                 db.execute("UPDATE notes SET status='superseded' WHERE topic=? AND key=? AND status='active'", (topic,key))
+            else:
+                # M3 dedupe: an identical active note in this topic already exists —
+                # return it instead of inserting a duplicate row (kills pollution).
+                for r in db.execute("SELECT id,text FROM notes WHERE topic=? AND status='active'", (topic,)):
+                    if self._norm_text(r['text']) == norm:
+                        return f'already remembered as note:{r["id"]} (deduped)'
+            nid = uuid.uuid4().hex
             db.execute('INSERT INTO notes(id,topic,key,text,source,created,supersedes) VALUES(?,?,?,?,?,?,?)',
                        (nid, topic, key or None, redact(text.strip()), source, time.time(), json.dumps(old)))
         return f'remembered note:{nid} [source:{source}]' + (f'; superseded {len(old)} explicitly keyed notes' if old else '')
