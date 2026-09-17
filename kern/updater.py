@@ -24,10 +24,11 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from kern.auth import git_env
+from .auth import git_env
 
 
 @dataclass
@@ -146,10 +147,34 @@ def apply_update(cwd: Path | None = None) -> UpdateStatus:
 def restart_argv() -> list[str]:
     """The argv to re-exec into. Preserves the original interpreter + entry.
 
-    Uses ``sys.argv`` verbatim so flags (e.g. --serve/--task/--port) survive the
-    restart exactly as the user launched them.
+    MUST stay module-shaped. When the daemon is launched as ``-m kern.daemon``,
+    Python rewrites ``sys.argv[0]`` to ``.../kern/daemon.py``; re-execing THAT as
+    a script dies instantly with "attempted relative import with no known parent
+    package" (daemon.py does ``from .client import ...``). So if argv[0] points
+    inside the kern package, we rebuild the launch as ``python -m kern.<mod>``
+    and keep any extra flags.
+
+    Detection is deliberately based on the package's own location rather than
+    ``__main__.__spec__`` — the latter is whatever the *runner* is (pytest under
+    tests, ipython in a shell), which would re-exec the wrong program.
     """
-    return [sys.executable, *sys.argv]
+    py = sys.executable or 'python'
+    pkg_dir = Path(__file__).resolve().parent
+    pkg_name = pkg_dir.name  # normally 'kern'
+
+    argv0 = Path(str(sys.argv[0])).resolve() if sys.argv else None
+    if argv0 is not None:
+        try:
+            rel = argv0.relative_to(pkg_dir)
+        except ValueError:
+            rel = None
+        if rel is not None and rel.suffix == '.py' and len(rel.parts) == 1:
+            module = f'{pkg_name}.{rel.stem}'
+            # keep real flags, drop the rewritten module path and any leading -m
+            extra = [a for a in sys.argv[1:] if not a.endswith(rel.name)]
+            return [py, '-m', module, *extra]
+
+    return [py, *sys.argv]
 
 
 def exec_restart() -> None:
@@ -157,15 +182,110 @@ def exec_restart() -> None:
 
     Called from run_server's finally-block *after* workers are interrupted and
     mounts unmounted, so the new process starts clean and replays journals.
+
+    cwd + env are pinned to the repo so the new process imports CURRENT repo
+    code rather than a frozen site-packages snapshot — otherwise the "restart"
+    would reload the very stale code we were trying to escape.
     """
     argv = restart_argv()
-    os.execv(argv[0], argv)
+    env = os.environ.copy()
+    try:
+        from .bootstrap import repo_path, child_env
+        root = repo_path(persist=False)
+        if root is not None:
+            # cwd + PYTHONPATH/KERN_REPO pinned to the repo so the new process
+            # imports CURRENT repo code, not a frozen site-packages snapshot.
+            os.chdir(str(root))
+            env = child_env(root, env)
+    except Exception:
+        pass
+    # Restart-loop breaker: carry a counter + timestamp so a new process can tell
+    # it was JUST restarted. If restarts cannot converge on the current code
+    # (e.g. the repo is unimportable), the watcher stops instead of bouncing the
+    # daemon forever — a restart loop is far worse than running slightly old code.
+    try:
+        env['KERN_RESTART_COUNT'] = str(_restart_count(env) + 1)
+        env['KERN_RESTART_TS'] = str(int(time.time()))
+    except Exception:
+        pass
+    os.execve(argv[0], argv, env)
+
+
+def _restart_count(env: dict | None = None) -> int:
+    env = os.environ if env is None else env
+    try:
+        return int(env.get('KERN_RESTART_COUNT', '0'))
+    except ValueError:
+        return 0
+
+
+#: Max auto-restarts allowed inside RESTART_WINDOW before the watcher stands down.
+RESTART_LOOP_LIMIT = int(os.environ.get('KERN_RESTART_LOOP_LIMIT', '4'))
+RESTART_WINDOW = float(os.environ.get('KERN_RESTART_WINDOW', '180'))
+
+
+def restart_loop_tripped() -> tuple[bool, str]:
+    """True when we restarted too many times too quickly to be converging.
+
+    Guards the local-change watcher against an infinite restart loop. The
+    counter is only meaningful when the previous restart was recent, so a daemon
+    that has been up for hours is never penalised for old restarts.
+    """
+    n = _restart_count()
+    try:
+        ts = int(os.environ.get('KERN_RESTART_TS', '0'))
+    except ValueError:
+        ts = 0
+    recent = ts and (time.time() - ts) < RESTART_WINDOW
+    if n >= RESTART_LOOP_LIMIT and recent:
+        return True, (f'{n} restarts in the last {RESTART_WINDOW:.0f}s — '
+                      'code is not converging; local hot-reload disabled for this process')
+    return False, ''
 
 
 def should_autoupdate() -> bool:
-    """Auto-update is opt-in via env; off by default so a surprise push can't
-    bounce a production agent mid-turn without the operator enabling it."""
+    """Remote auto-update is opt-in via env; off by default so a surprise push
+    can't bounce a production agent mid-turn without the operator enabling it."""
     return os.environ.get('KERN_AUTO_UPDATE', '').lower() in ('1', 'true', 'yes', 'on')
+
+
+def should_watch_local() -> bool:
+    """Local-change hot reload: ON by default.
+
+    This is the developer loop: edit a kern source file, and the running daemon
+    notices and re-execs into the new code at the next quiet moment. Opt out with
+    KERN_LOCAL_RELOAD=0 (e.g. for a deliberately frozen deployment).
+
+    Local watching is safe by default where remote pulling is not: it can only
+    ever pick up code that is ALREADY on this machine, so it cannot import a
+    surprise commit from the network.
+    """
+    return os.environ.get('KERN_LOCAL_RELOAD', '1').lower() not in ('0', 'false', 'no', 'off')
+
+
+def local_restart_needed(running_version: str | None = None) -> tuple[bool, str]:
+    """True when the repo on disk has changed since this process imported it.
+
+    `running_version` defaults to the version this process actually imported.
+    Returns (needed, detail). Never raises: a failed probe means "no restart".
+    """
+    try:
+        from .bootstrap import source_signature, repo_path
+    except Exception:
+        return False, 'bootstrap unavailable (stale install?)'
+    if running_version is None:
+        try:
+            from . import running_version as _rv
+            running_version = _rv
+        except Exception:
+            return False, 'running_version unavailable'
+    root = repo_path(persist=False)
+    if root is None:
+        return False, 'no repo checkout found'
+    on_disk = source_signature(root)
+    if on_disk != running_version:
+        return True, f'local source changed: running {running_version} -> on-disk {on_disk}'
+    return False, f'up to date ({on_disk})'
 
 
 def autoupdate_interval() -> float:

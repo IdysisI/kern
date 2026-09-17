@@ -27,7 +27,21 @@ from . import updater
 HOST = os.environ.get("KERN_SERVE_HOST", "127.0.0.1")
 PORT = int(os.environ.get("KERN_SERVE_PORT", "8766"))
 from . import __version__ as KERN_VERSION
+from . import running_version as KERN_RUNNING_VERSION
 DAEMON_VERSION = KERN_VERSION
+
+
+def _repo_version() -> str:
+    """Version of the source ON DISK in the repo (may differ from what we import).
+
+    Reporting both lets a client decide whether this daemon is stale without
+    caring which copy (repo vs frozen snapshot) either side was launched from.
+    """
+    try:
+        from .bootstrap import repo_version
+        return repo_version()
+    except Exception:
+        return KERN_RUNNING_VERSION
 
 
 class Worker:
@@ -303,6 +317,77 @@ async def auto_update_watcher(notify=None):
             continue
 
 
+async def local_change_watcher(notify=None, poll: float = 2.0, settle: float = 1.5):
+    """Hot-reload on LOCAL source edits — the developer loop.
+
+    This is what was missing: auto_update_watcher only ever looked at *remote*
+    commits (and is opt-in), so editing kern's own source had no effect on a
+    running daemon. The daemon kept serving whatever it imported at boot, which
+    is exactly how "I fixed it but nothing changed" happens.
+
+    Unnoticeable by construction:
+      * cheap probe — local_restart_needed hashes ~40 small files, and it runs in
+        a thread so the event loop never blocks
+      * DEBOUNCED — a multi-file save settles into ONE restart: we require the
+        same on-disk signature to persist for `settle` seconds
+      * IDLE-GATED — never restarts while a turn is running; it simply waits
+      * reuses the existing graceful-shutdown + re-exec path, so clients reconnect
+        and replay their journals (no lost work, no visible blip)
+
+    Opt out with KERN_LOCAL_RELOAD=0.
+    """
+    if not updater.should_watch_local():
+        return
+    notify = notify or (lambda m: None)
+    # Stand down if we already restarted repeatedly without converging: an
+    # infinite restart loop is far worse than running slightly old code.
+    tripped, why = updater.restart_loop_tripped()
+    if tripped:
+        notify(f'local hot-reload disabled: {why}')
+        return
+    try:
+        from .bootstrap import repo_path
+    except Exception:
+        return  # stale install without bootstrap: nothing we can watch
+    if repo_path(persist=False) is None:
+        return
+    try:
+        from . import running_version as base
+    except Exception:
+        base = None
+
+    last_sig = None
+    stable_since = 0.0
+    while True:
+        await asyncio.sleep(poll)
+        if SHUTDOWN is not None and SHUTDOWN.is_set():
+            return
+        try:
+            needed, detail = await asyncio.to_thread(updater.local_restart_needed, base)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            notify(f'local watcher probe error: {e}')
+            continue
+        if not needed:
+            last_sig = None
+            stable_since = 0.0
+            continue
+        # debounce: only act once the on-disk signature stops moving
+        if detail != last_sig:
+            last_sig = detail
+            stable_since = time.monotonic()
+            continue
+        if time.monotonic() - stable_since < settle:
+            continue
+        # idle gate: never bounce the daemon mid-turn
+        if any(w.running for w in REG.workers.values()):
+            continue
+        notify(f'local source changed — restarting into new code ({detail})')
+        await _request_restart()
+        return
+
+
 async def handler(ws):
     worker: Worker | None = None
     try:
@@ -332,7 +417,21 @@ async def handler(ws):
                     except Exception as e:
                         await ws.send(reply(str(e),is_result=False))
                 elif m == "version":
-                    await ws.send(reply({"version": DAEMON_VERSION, "pid": os.getpid(), "running": any(w.running for w in REG.workers.values())}))
+                    # Report three versions so a client can detect staleness
+                    # regardless of which copy (repo vs frozen snapshot) either
+                    # side was launched from:
+                    #   version         — repo-on-disk view at import time
+                    #   repo_version    — repo-on-disk view RIGHT NOW
+                    #   running_version — what this process actually imported
+                    rv = _repo_version()
+                    await ws.send(reply({
+                        "version": DAEMON_VERSION,
+                        "repo_version": rv,
+                        "running_version": KERN_RUNNING_VERSION,
+                        "stale": KERN_RUNNING_VERSION != rv,
+                        "pid": os.getpid(),
+                        "running": any(w.running for w in REG.workers.values()),
+                    }))
                 elif m == "shutdown":
                     await ws.send(reply({"shutdown": True}))
                     if SHUTDOWN is not None:

@@ -58,7 +58,7 @@ def main():
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description='Kern — personal agent, TUI and local web workspace')
-    parser.add_argument('interface', nargs='?', choices=('tui','web','serve','gui','update','restart','check-update','login','logout','whoami'), default='tui')
+    parser.add_argument('interface', nargs='?', choices=('tui','web','serve','gui','update','restart','check-update','login','logout','whoami','doctor'), default='tui')
     parser.add_argument('provider', nargs='?', default='github', help='auth provider for login/logout/whoami (currently: github)')
     parser.add_argument('--model', help='model identifier (defaults to KERN_MODEL)')
     modes = parser.add_mutually_exclusive_group()
@@ -83,6 +83,8 @@ def main():
         gui.main()
     elif args.interface in ("update", "restart", "check-update"):
         _daemon_ctl(args.interface)
+    elif args.interface == "doctor":
+        sys.exit(_doctor())
     elif args.interface in ("login", "logout", "whoami"):
         sys.exit(_auth_ctl(args.interface, args.provider))
     else:
@@ -116,6 +118,132 @@ def _auth_ctl(cmd, provider='github'):
         return 1
     print(f"signed in to GitHub as {me.get('login') or '(unknown)'}")
     return 0
+
+
+def _doctor():
+    """`kern doctor` — make "which code is actually running?" answerable.
+
+    The failure mode this exists for: a frozen site-packages snapshot shadows the
+    repo, so edits silently do nothing and a daemon serves stale code. Nothing in
+    the old design reported that. Doctor checks every layer and prints the exact
+    fix. Returns an exit code (0 healthy, 1 problem found).
+    """
+    from pathlib import Path
+
+    from . import bootstrap as B
+    from . import updater
+    from . import running_version, repo_root
+
+    problems = []
+    print('kern doctor')
+    print('─' * 62)
+
+    # 1. Which copy is imported right now?
+    running_from = B.running_pkg_dir()
+    frozen = B.is_frozen_snapshot()
+    print(f'running code   : {running_from}')
+    print(f'running version: {running_version}')
+    if frozen:
+        problems.append(
+            'this process imported a FROZEN snapshot, not your repo — your edits '
+            'cannot take effect until the launcher points at the repo')
+        print('  ⚠ FROZEN SNAPSHOT (not the repo)')
+    else:
+        print('  ✓ repo code')
+
+    # 2. Repo resolution
+    print(f'\nrepo           : {repo_root or "(none found)"}')
+    info = B.diagnose()
+    print(f'repo version   : {info["repo_version"]}')
+    print(f'anchor file    : {info["anchor"]} '
+          f'({"exists" if Path(info["anchor"]).exists() else "absent"})')
+    if repo_root is None:
+        problems.append('no repo checkout could be located; hot reload is inactive')
+    elif info['writable_repo'] is False:
+        problems.append(f'repo is not writable ({repo_root}) — edits cannot be saved')
+    elif info['writable_repo'] is True:
+        print(f'  ✓ writable')
+
+    # 3. Hot reload configuration
+    print(f'\nlocal hot reload: {"ON" if updater.should_watch_local() else "OFF"} '
+          f'(KERN_LOCAL_RELOAD)')
+    print(f'remote auto pull: {"ON" if updater.should_autoupdate() else "OFF"} '
+          f'(KERN_AUTO_UPDATE)')
+    need, detail = updater.local_restart_needed(running_version)
+    print(f'pending change  : {detail}')
+    if need:
+        problems.append(f'a running daemon is behind the source on disk ({detail})')
+
+    # 4. Restart-loop breaker state
+    tripped, why = updater.restart_loop_tripped()
+    if tripped:
+        problems.append(f'restart loop breaker is engaged: {why}')
+        print(f'\nrestart breaker : ⚠ ENGAGED — {why}')
+
+    # 5. The running daemon (if any)
+    print(f'\ndaemon         : ', end='')
+    ds = _probe_daemon()
+    if ds is None:
+        print('not running (start one with: kern web)')
+    else:
+        # An OLDER daemon predates the running_version/stale fields and answers
+        # with just `version`. Treating a missing field as "not stale" would make
+        # doctor report healthy while the daemon runs old code — the exact silent
+        # failure this command exists to expose. So for legacy daemons we compare
+        # the version it reports against the repo on disk.
+        if 'stale' in ds:
+            d_stale = bool(ds.get('stale'))
+            d_running = ds.get('running_version') or ds.get('version')
+        else:
+            d_running = ds.get('version')
+            d_stale = bool(info['repo_version']) and d_running != info['repo_version']
+        print(f'pid {ds.get("pid")} on {d_running}')
+        if d_stale:
+            problems.append(
+                f'the running daemon is STALE: it imported {d_running} '
+                f'but the repo is {info["repo_version"]} — restart it')
+            print(f'  ⚠ daemon running {d_running} '
+                  f'but repo is {info["repo_version"]}')
+        else:
+            print(f'  ✓ up to date with repo')
+
+    # 6. Verdict + the fix
+    print('\n' + '─' * 62)
+    if not problems:
+        print('✓ healthy: running repo code, in sync with disk, hot reload active')
+        return 0
+    print(f'✗ {len(problems)} problem(s) found:\n')
+    for i, p in enumerate(problems, 1):
+        print(f'  {i}. {p}')
+    print('\nFix (reinstall the launcher as an EDITABLE install of your repo):')
+    print(f'  {B.fix_hint().splitlines()[0]}')
+    print('\nThen restart the daemon so it picks up repo code:')
+    print('  kern restart')
+    print('\nVerify with: kern doctor')
+    return 1
+
+
+def _probe_daemon(timeout=4.0):
+    """Ask the running daemon what it imported. None if no daemon answers."""
+    try:
+        from . import daemon as d
+        import websockets
+
+        async def go():
+            async with websockets.connect(f'ws://{d.HOST}:{d.PORT}/ws',
+                                          open_timeout=timeout, max_size=1 << 25) as ws:
+                await ws.send(json.dumps({'id': 0, 'method': 'version'}))
+                deadline = asyncio.get_running_loop().time() + timeout
+                while True:
+                    left = deadline - asyncio.get_running_loop().time()
+                    if left <= 0:
+                        return None
+                    ev = json.loads(await asyncio.wait_for(ws.recv(), timeout=left))
+                    if ev.get('id') == 0 or ev.get('req_id') == 0:
+                        return ev.get('result', ev)
+        return asyncio.run(go())
+    except Exception:
+        return None
 
 
 async def _async_daemon_ctl(cmd):

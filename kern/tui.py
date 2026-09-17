@@ -504,6 +504,43 @@ class _ClearBlank(Blank):
         self._rich_style = RichStyle()
 
 
+def _stale_daemon_verdict(res, daemon_version):
+    """Decide what to do about a daemon's version report. PURE — unit-testable
+    without a Textual app or a websocket.
+
+    Returns (stale, can_converge, detail):
+      stale        — the daemon imported different code than the repo on disk
+      can_converge — respawning could actually produce repo code. If False we must
+                     NOT kill the daemon: a respawn would come back equally stale,
+                     so thrashing is worse than running old code.
+      detail       — human-readable reason for logs / doctor
+
+    A NEW daemon reports running_version/repo_version/stale explicitly. An OLDER
+    daemon predates those fields and answers with just `version`; treating the
+    missing field as "not stale" would hide drift, so for legacy daemons we
+    compare the reported version against what this process believes the repo is.
+    """
+    if not isinstance(res, dict) or not res:
+        return False, False, 'no version report'
+    if 'stale' in res:
+        stale = bool(res.get('stale'))
+        running = res.get('running_version') or res.get('version') or '?'
+        repo = res.get('repo_version') or daemon_version or '?'
+    else:
+        running = res.get('version') or '?'
+        repo = daemon_version or '?'
+        stale = running != repo
+    detail = f'running {running} vs repo {repo}'
+    if not stale:
+        return False, True, detail
+    try:
+        from . import bootstrap as _bs
+        can = _bs.repo_path(persist=False) is not None
+    except Exception:
+        can = False
+    return True, can, detail
+
+
 class KernApp(App):
     TITLE = "kern"
     CSS = CSS
@@ -691,7 +728,21 @@ class KernApp(App):
                     # until the next clean restart).
                     last = RuntimeError("daemon busy — version probe unanswered")
                     raise last
-                if ver != DAEMON_VERSION and not raw.get("result",{}).get("running"):
+                res = raw.get("result", {}) or {}
+                # Staleness = the code the daemon IMPORTED differs from the repo
+                # ON DISK. Comparing plain `version` is not enough any more: both
+                # a fresh and a frozen-snapshot daemon now report the repo hash,
+                # so only running_version vs repo_version exposes the drift.
+                stale, can_converge, detail = _stale_daemon_verdict(res, DAEMON_VERSION)
+                if stale and not res.get("running"):
+                    # Only kill a stale daemon if we can actually respawn one that
+                    # imports repo code. If no repo is resolvable, respawning would
+                    # produce the same stale daemon — so thrash nothing and use what
+                    # is running (stale code beats an unusable session). `kern doctor`
+                    # still tells the user exactly what is wrong.
+                    if not can_converge:
+                        _dbg(self.session, "daemon.connect.stale_unfixable", ver=ver)
+                        return ws
                     # CONFIRMED stale daemon: shut it down; the outer except
                     # respawns it with the CURRENT code on the next loop
                     # iteration (spawn runs when i == 0).
@@ -700,7 +751,7 @@ class KernApp(App):
                         await ws.close()
                     except Exception:
                         pass
-                    last = RuntimeError("stale daemon code — respawning")
+                    last = RuntimeError(f"stale daemon code ({detail}) — respawning")
                     raise last
                 return ws
             except Exception as e:
@@ -711,7 +762,21 @@ class KernApp(App):
                 logpath = __import__('pathlib').Path(os.environ.get('KERN_HOME','~/.kern')).expanduser() / 'daemon.log'
                 logpath.parent.mkdir(parents=True,exist_ok=True)
                 log = logpath.open('ab')
+                # Pin the daemon to the REPO copy: cwd=repo root + KERN_REPO/
+                # PYTHONPATH in the child env. Without this, `-m kern.daemon`
+                # resolves against whatever kern is first on sys.path — i.e. a
+                # frozen site-packages snapshot that can never see your edits.
+                _spawn_cwd, _spawn_env = None, None
+                try:
+                    from . import bootstrap as _bs
+                    _root = _bs.repo_path()
+                    if _root is not None:
+                        _spawn_cwd = str(_root)
+                        _spawn_env = _bs.child_env(_root)
+                except Exception:
+                    _spawn_cwd, _spawn_env = None, None
                 subprocess.Popen([_sys.executable, "-m", "kern.daemon"],
+                                 cwd=_spawn_cwd, env=_spawn_env,
                                  stdout=log, stderr=log, **({'start_new_session':True} if os.name!='nt' else
                                      {'creationflags':subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}))
                 log.close()

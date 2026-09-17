@@ -58,8 +58,12 @@ async def run_server():
     if daemon.HOST not in ('127.0.0.1','localhost','::1'):
         raise RuntimeError('Kern serves only loopback. Use an authenticated local tunnel for remote access.')
     daemon.SHUTDOWN = asyncio.Event()
-    watcher = asyncio.create_task(daemon.auto_update_watcher(
-        notify=lambda m: print(f'[kern] {m}', flush=True)))
+    notify = lambda m: print(f'[kern] {m}', flush=True)
+    watcher = asyncio.create_task(daemon.auto_update_watcher(notify=notify))
+    # Hot-reload on LOCAL edits. Separate task from the remote watcher because it
+    # is ON by default (it can only pick up code already on this machine, so it
+    # cannot import a surprise commit) while remote auto-pull stays opt-in.
+    local_watcher = asyncio.create_task(daemon.local_change_watcher(notify=notify))
     try:
         async with serve(safe_handler,daemon.HOST,daemon.PORT,process_request=process_request,
                          max_size=32*1024*1024, ping_interval=20):
@@ -67,6 +71,7 @@ async def run_server():
             await daemon.SHUTDOWN.wait()
     finally:
         watcher.cancel()
+        local_watcher.cancel()
         for worker in daemon.REG.workers.values():
             await worker.interrupt()
             runtime = getattr(worker.session,'_runtime',{})
