@@ -1090,6 +1090,13 @@ class KernApp(App):
         return v == "y"
 
     def _on_stream(self, kind: str, text: str):
+        if kind == "turn_start":
+            # A new assistant response is beginning (first reply, or a completion-
+            # review continuation). Close out any in-progress stream so the new text
+            # opens a fresh message instead of concatenating onto the previous one.
+            if self._stream_widget is not None:
+                self._flush_stream(final=True)
+            return
         if kind in ("thinking", "text", "tool"):
             self._dismiss_waiting()
         if kind == "thinking":
@@ -1141,6 +1148,7 @@ class KernApp(App):
                 self._tool_card = None
                 self.chat.scroll_end(animate=False)
         elif kind == "todo":
+            self._flush_stream()  # keep ordering: never mount a widget above buffered text
             import json as _json
             items = _json.loads(text)
             if self._todo_card is None:
@@ -1150,8 +1158,10 @@ class KernApp(App):
                 self._todo_card.render_items(items)
             self.chat.scroll_end(animate=False)
         elif kind == "note":
+            self._flush_stream()  # keep ordering: flush buffered text before a note
             self._chat_note("◈ " + text.splitlines()[0])
         elif kind == "summary":
+            self._flush_stream()  # keep ordering: flush buffered text before the summary
             # compaction summary — show what the model chose to keep, so the
             # user can audit the memory the next turns will be built on
             body = text if len(text) <= 1200 else text[:1200] + "…"

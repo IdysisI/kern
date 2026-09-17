@@ -935,6 +935,12 @@ class Engine:
         step = 0
         while max_steps is None or step < max_steps:
             step += 1
+            # Turn boundary: tell the UI a fresh assistant response is starting so it
+            # begins a NEW message widget instead of appending to the previous one.
+            # This fires on the first pass AND on every completion-review `continue`,
+            # which is what previously concatenated two replies into one bubble
+            # (e.g. "…>:3" + "Good catch—" rendered as one run-on block).
+            self.stream_cb("turn_start", "")
             tools = self._tools()
             system = self._system()
             if tools is None:

@@ -487,6 +487,13 @@ class KernWindow(QMainWindow):
              "todo": "planning…", "proc": "checking process…"}
 
     def _on_stream(self, kind, text):
+        if kind == "turn_start":
+            # New assistant response (first reply or a completion-review continuation):
+            # close out any in-progress message so the new text opens a fresh bubble
+            # instead of concatenating onto the previous one.
+            if self._assistant is not None:
+                self._flush_stream(final=True)
+            return
         if kind == "text":
             if self._assistant is None:
                 self._assistant = AssistantMsg()
@@ -520,6 +527,7 @@ class KernWindow(QMainWindow):
                 self._tool_card.set_result("", diff=text)
                 self._tool_card = None
         elif kind == "todo":
+            self._flush_stream()  # keep ordering: flush buffered text before a todo card
             import json as _json
             items = _json.loads(text)
             if self._todo_card is None:
@@ -528,6 +536,7 @@ class KernWindow(QMainWindow):
             else:
                 self._todo_card.render_items(items)
         elif kind == "note":
+            self._flush_stream()  # keep ordering: flush buffered text before a note
             self._note("◈ " + text.splitlines()[0])
 
     def _flush_stream(self, final=False):
