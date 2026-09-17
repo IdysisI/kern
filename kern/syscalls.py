@@ -349,6 +349,52 @@ def _numbered_lines(lines: list[str], start: int, end: int, cap: int = 30) -> st
     return "\n".join(f"{i:5d}\t{l}" for i, l in enumerate(zone, start=start))
 
 
+
+def _relocate_line_range(flines: list[str], expected: str, start_line: int, end_line: int) -> tuple[int, int, str] | None:
+    """Find relocated position of expected lines if file has drifted due to prior edits."""
+    exp_lines = expected.splitlines()
+    exp_len = len(exp_lines)
+    if exp_len == 0 or len(flines) < exp_len:
+        return None
+
+    # 1. Exact match search across all windows of length exp_len
+    exact_matches: list[int] = []
+    for i in range(len(flines) - exp_len + 1):
+        if flines[i : i + exp_len] == exp_lines:
+            exact_matches.append(i + 1)  # 1-based start line
+
+    if len(exact_matches) == 1:
+        s = exact_matches[0]
+        return (s, s + exp_len - 1, f"exact match (drifted {s - start_line:+d} lines)")
+    elif len(exact_matches) > 1:
+        exact_matches.sort(key=lambda x: abs(x - start_line))
+        d0 = abs(exact_matches[0] - start_line)
+        d1 = abs(exact_matches[1] - start_line)
+        if d0 < d1 and d0 <= 200:
+            s = exact_matches[0]
+            return (s, s + exp_len - 1, f"closest exact match (drifted {s - start_line:+d} lines)")
+
+    # 2. Whitespace-tolerant match (trailing whitespace / CRLF differences)
+    norm_exp = [l.rstrip() for l in exp_lines]
+    ws_matches: list[int] = []
+    for i in range(len(flines) - exp_len + 1):
+        if [l.rstrip() for l in flines[i : i + exp_len]] == norm_exp:
+            ws_matches.append(i + 1)
+
+    if len(ws_matches) == 1:
+        s = ws_matches[0]
+        return (s, s + exp_len - 1, f"whitespace-tolerant match (drifted {s - start_line:+d} lines)")
+    elif len(ws_matches) > 1:
+        ws_matches.sort(key=lambda x: abs(x - start_line))
+        d0 = abs(ws_matches[0] - start_line)
+        d1 = abs(ws_matches[1] - start_line)
+        if d0 < d1 and d0 <= 200:
+            s = ws_matches[0]
+            return (s, s + exp_len - 1, f"closest whitespace match (drifted {s - start_line:+d} lines)")
+
+    return None
+
+
 def tool_edit(fs: FS, session, path: str, old_str: str = "", new_str: str = "",
               start_line: int = 0, end_line: int = 0,
               expected: str = "", occurrence: int = 0) -> tuple[str, dict]:
@@ -371,54 +417,79 @@ def tool_edit(fs: FS, session, path: str, old_str: str = "", new_str: str = "",
     lines = src.splitlines()
 
     # Line-range mode: use when old_str is empty or fails.
-    # MANDATORY precondition: `expected` must be provided AND equal the CURRENT
-    # zone content. Without it the edit is REFUSED — this mode replaces lines
-    # by position, so a drifted file would be silently overwritten. Exact-match
-    # mode (old_str) needs no precondition: matching IS the verification.
+    # Replaces lines by position, with automatic line drift relocation if prior
+    # edits moved the lines, plus rich contextual feedback on failure.
     if start_line > 0 and end_line > 0:
-        if start_line < 1 or end_line > len(lines) or start_line > end_line:
-            return (f"error: invalid line range {start_line}-{end_line} "
-                    f"(file has {len(lines)} lines)"), {}
         if not expected:
             return ("error: line-range edits REQUIRE the `expected` parameter — the exact "
                     "current content of lines start_line..end_line as you last read it "
                     "(precondition against overwriting a file that changed since your read). "
                     "Re-read the file if unsure, then retry with expected=<those lines>. "
                     "Alternatively use old_str exact-match mode, which is self-verifying."), {}
-        # verify + compute under the lock: a concurrent kern edit between the
-        # model's read and this call cannot slip in (precondition re-checked
-        # on the FRESH content inside _locked_update)
+
+        # Track relocation results across lock
+        actual_range: list[int] = [start_line, end_line]
+        reloc_note: list[str] = []
         refused: list[str] = []
 
         def _apply(fresh: str) -> str | None:
             flines = fresh.splitlines()
-            if end_line > len(flines):
+            s, e = start_line, end_line
+
+            # Check if expected matches directly at requested position
+            if 1 <= s <= len(flines) and e <= len(flines) and s <= e:
+                fresh_zone = "\n".join(flines[s - 1:e])
+                if fresh_zone == expected:
+                    actual_range[0], actual_range[1] = s, e
+                    new_lines = flines[:s - 1] + new_str.splitlines() + flines[e:]
+                    return "\n".join(new_lines) + ("\n" if fresh.endswith("\n") else "")
+
+            # Position shifted or out of bounds! Attempt automatic relocation
+            reloc = _relocate_line_range(flines, expected, start_line, end_line)
+            if reloc is not None:
+                ns, ne, reason = reloc
+                actual_range[0], actual_range[1] = ns, ne
+                drift = ns - start_line
+                reloc_note.append(f"auto-relocated lines {start_line}-{end_line} -> {ns}-{ne} ({reason})")
+                new_lines = flines[:ns - 1] + new_str.splitlines() + flines[ne:]
+                return "\n".join(new_lines) + ("\n" if fresh.endswith("\n") else "")
+
+            # If relocation fails, record reason
+            if e > len(flines) or s > len(flines) or s < 1 or s > e:
                 refused.append("range")
-                return None
-            fresh_zone = "\n".join(flines[start_line - 1:end_line])
-            if fresh_zone != expected:
+            else:
                 refused.append("precondition")
-                return None
-            new_lines = flines[:start_line - 1] + new_str.splitlines() + flines[end_line:]
-            return "\n".join(new_lines) + ("\n" if fresh.endswith("\n") else "")
+            return None
 
         res = _locked_update(p, _apply, before_write=lambda: session.checkpoint([str(p)], cwd=str(fs.cwd)))
         if res is None:
             src = p.read_text(encoding='utf-8')
-            if refused and refused[0] == "precondition":
-                flines = src.splitlines()
-                return (f"error: precondition failed — lines {start_line}-{end_line} of {p} "
-                        f"no longer match what you read (file changed). File UNCHANGED.\n"
-                        f"Current zone:\n{_numbered_lines(flines, start_line, min(end_line, len(flines)))}\n"
-                        f"Re-read the file, then retry with updated expected/new_str."), {}
             flines = src.splitlines()
-            return (f"error: invalid line range {start_line}-{end_line} "
-                    f"(file now has {len(flines)} lines)"), {}
+            tot = len(flines)
+            # Provide rich contextual snippet around requested zone so the model
+            # has immediate visibility into the file WITHOUT wasting a read request
+            ctx_start = max(1, start_line - 4)
+            ctx_end = min(tot, end_line + 4)
+            ctx_view = _numbered_lines(flines, ctx_start, ctx_end)
+
+            if refused and refused[0] == "precondition":
+                return (f"error: precondition failed — lines {start_line}-{end_line} of {p} "
+                        f"do not match expected text and could not be auto-relocated (file changed). File UNCHANGED.\n"
+                        f"Current content around lines {ctx_start}-{ctx_end} (total {tot} lines):\n"
+                        f"{ctx_view}\n"
+                        f"You can immediately edit using the lines shown above without re-reading."), {}
+            return (f"error: invalid line range {start_line}-{end_line} (file now has {tot} lines).\n"
+                    f"Current content around end of file (lines {max(1, tot - 10)}-{tot}):\n"
+                    f"{_numbered_lines(flines, max(1, tot - 10), tot)}\n"
+                    f"Use the lines shown above or specify old_str to match directly."), {}
+
         src2, new_src = res
         diff = _unified_diff(p, src2, new_src)
         flines = src2.splitlines()
-        zone = _numbered_lines(flines, start_line, end_line)
-        msg = f"edited {p} (lines {start_line}-{end_line})\nreplaced:\n{zone}"
+        act_s, act_e = actual_range[0], actual_range[1]
+        zone = _numbered_lines(flines, act_s, act_e)
+        note_str = f" ({reloc_note[0]})" if reloc_note else ""
+        msg = f"edited {p} (lines {act_s}-{act_e}){note_str}\nreplaced:\n{zone}"
         if p.suffix == ".py":
             ok, err = _py_compile(p)
             if not ok:

@@ -121,3 +121,47 @@ def test_exact_edit_still_works(env):
     msg, meta = tool_edit(fs, sess, str(f), old_str="world", new_str="kern")
     assert f.read_text() == "hello kern\n"
     assert "edited" in msg
+
+
+# --- F-E: line drift auto-relocation & rich context delivery -------------------
+
+def test_line_range_edit_auto_relocates_on_drift(env):
+    fs, sess, tmp = env
+    f = tmp / "drift_test.py"
+    initial_lines = [f"item_{i} = {i}" for i in range(1, 51)]
+    f.write_text("\n".join(initial_lines) + "\n")
+
+    # We plan to replace items 20 to 24
+    target_lines = "\n".join(initial_lines[19:24])  # lines 20 to 24
+
+    # Prior change inserted 10 lines near the beginning, drifting everything by +10 lines
+    drifted_lines = initial_lines[:5] + ["# inserted extra line"] * 10 + initial_lines[5:]
+    f.write_text("\n".join(drifted_lines) + "\n")
+
+    # Issue edit with the original line numbers (20-24)
+    msg, meta = tool_edit(fs, sess, str(f), old_str="", new_str="item_20_replaced = True",
+                          start_line=20, end_line=24, expected=target_lines)
+
+    assert "auto-relocated" in msg
+    assert "lines 30-34" in msg
+    content = f.read_text()
+    assert "item_20_replaced = True" in content
+    assert "item_20 = 20" not in content
+    assert "item_24 = 24" not in content
+    assert "item_25 = 25" in content
+
+
+def test_line_range_edit_delivers_rich_context_on_unrelocatable_precondition_failure(env):
+    fs, sess, tmp = env
+    f = tmp / "mismatch.txt"
+    f.write_text("apple\nbanana\ncherry\ndate\nelderberry\nfig\ngrape\n")
+
+    # Attempt edit where expected content does not match and cannot be found
+    msg, meta = tool_edit(fs, sess, str(f), old_str="", new_str="orange",
+                          start_line=2, end_line=4, expected="completely_different_text")
+
+    assert "precondition failed" in msg
+    assert "Current content around lines" in msg
+    assert "banana" in msg
+    assert "cherry" in msg
+    assert "without re-reading" in msg
