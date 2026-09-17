@@ -75,7 +75,7 @@ Legend: ✅ done+tested · 🔶 partial · ⬜ not started.
 - **Validates:** P3 (background work is parallel + interruptible), P4 (graceful
   degradation), P6 (all-or-nothing eliminated).
 
-### M1 — Structured L2 episode ledger (kill free-text summary loss) ⬜
+### M1 — Structured L2 episode ledger (kill free-text summary loss) ✅
 - **Pain:** M1 (lossy consolidation drops facts/numbers/dates).
 - **Change:** extend `fold()` output from the current 5 free-text fields to a
   structured record `{goal, decisions[], artifacts[], open_threads[],
@@ -86,7 +86,7 @@ Legend: ✅ done+tested · 🔶 partial · ⬜ not started.
 - **Tests:** seed an episode with a known date/number/path → compact → assert the
   structured ledger retains them verbatim (from PART 6 "Recall fidelity").
 
-### M2 — Zero-cost deterministic retrieval into context (kill lost-in-the-middle) ⬜
+### M2 — Zero-cost deterministic retrieval into context (kill lost-in-the-middle) ✅
 - **Pain:** M3 (retrieval misses), M5 (context rot), C1 (per-turn LLM cost).
 - **Change:** on `prepare()`, score L3 facts by BM25 + recency + pin against the
   current task text; inject top-k within a token budget as a compact block.
@@ -95,7 +95,7 @@ Legend: ✅ done+tested · 🔶 partial · ⬜ not started.
   `kern/context.py` (`prepare` injection, capped per prompt_audit's H1/M3 findings).
 - **Tests:** assert memory ops add **0 LLM calls** (PART 6 "Request counting").
 
-### M3 — Memory hygiene: dedupe + contradiction handling (kill pollution) ⬜
+### M3 — Memory hygiene: dedupe + contradiction handling (kill pollution) ✅
 - **Pain:** M2 (stale/contradictory facts accumulate and get retrieved).
 - **Change:** L3 dedupe on write (normalize + key); `reconcile()` resolves
   conflicts by recency/source-rank; explicit `forget` tombstones; decay lowers
@@ -105,7 +105,7 @@ Legend: ✅ done+tested · 🔶 partial · ⬜ not started.
 - **Tests:** write conflicting facts → assert only the newer/ranked one is
   injected; `history()` still returns the tombstoned one.
 
-### M4 — Off-loop batched consolidation into L3 (kill unbounded growth) ⬜
+### M4 — Off-loop batched consolidation into L3 (kill unbounded growth) ✅
 - **Pain:** M4 (archival store grows unbounded and degrades).
 - **Change:** when an episode closes *and* exceeds threshold, run **one** budgeted
   LLM pass to merge the L2 ledger into L3 facts; otherwise consolidate
@@ -114,7 +114,7 @@ Legend: ✅ done+tested · 🔶 partial · ⬜ not started.
 - **Tests:** N closed episodes → ≤N but ideally 1 LLM call per qualifying episode;
   L3 stays bounded.
 
-### M5 — Anti-loop guard on injected memory (kill circular behavior) ⬜
+### M5 — Anti-loop guard on injected memory (kill circular behavior) ✅
 - **Pain:** O1 (injected-memory repetition makes the model loop on its own notes);
   R2 (breaker can't tell research from a stuck loop — killed good sub_2).
 - **Change:** (a) cap + dedupe the injected memory block so it can't feed back
@@ -125,7 +125,7 @@ Legend: ✅ done+tested · 🔶 partial · ⬜ not started.
 - **Tests:** long synthetic session → assert injected-memory repetition is capped
   and no self-note loop (PART 6 "No circular behavior").
 
-### M6 — Result verification before acceptance (kill R1/R4) ⬜
+### M6 — Result verification before acceptance (kill R1/R4) ✅
 - **Pain:** R1 (result persisted only at end → transport error destroys
   deliverable), R4 (no check a "result" is real).
 - **Change:** verify a result is non-empty, not an error string, and that claimed
@@ -134,7 +134,7 @@ Legend: ✅ done+tested · 🔶 partial · ⬜ not started.
 - **Tests:** simulate 502 mid-run + breaker trip → assert deliverable is the best
   checkpoint, not an error string (PART 6 "Subagent salvage").
 
-### M7 — Cost-visible API resilience (kill C2/R5) ⬜
+### M7 — Cost-visible API resilience (kill C2/R5) ✅
 - **Pain:** C2 (blind retries burn billed requests), R5 (telemetry lies "0 requests").
 - **Change:** classify errors (429/5xx/transport/content); exponential backoff with
   jitter and a per-turn **retry budget counted in billed requests**; keep partial
