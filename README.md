@@ -52,6 +52,16 @@ Kern is that bit of guardrails. It's a small Python harness that runs the agent,
 
 ## 📦 Install
 
+One command (Linux / macOS):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/IdysisI/kern/main/install.sh | bash
+```
+
+It clones the repo into `~/.local/share/kern`, installs the `kern` command with pipx if you have it (otherwise into its own little venv), and puts `kern` on your PATH. No sudo, doesn't touch your system Python. Re-run it anytime to update.
+
+Prefer to do it by hand, or want to hack on the source?
+
 ```bash
 git clone https://github.com/IdysisI/kern
 cd kern
