@@ -2162,12 +2162,19 @@ class KernWindow(QMainWindow):
           - Large (1300-1700px): 85% of available width
           - Ultra-wide (>1700px): 80% of available width (up to 1600px max)
         """
+        sidebar_visible = not self.sidebar.isHidden() if hasattr(self, "sidebar") else False
+        sidebar_w = SIDEBAR_W if sidebar_visible else 0
+        right_pane_w = max(340, self.width() - sidebar_w)
         viewport_w = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
-        if viewport_w <= 0:
-            viewport_w = self.width() - (SIDEBAR_W if self.sidebar.isVisible() else 0)
+
+        # When the window first opens, the QScrollArea viewport is not yet laid out
+        # by Qt's window manager and reports an uninitialized default (640px).
+        # Use the actual right pane width if viewport is unlaid out.
+        if viewport_w <= 640 or viewport_w < right_pane_w - 60:
+            viewport_w = right_pane_w
 
         if viewport_w < 900:
-            target = max(340, viewport_w - 32)
+            target = max(340, int(viewport_w * 0.90))
         elif viewport_w < 1300:
             target = int(viewport_w * 0.90)
         elif viewport_w < 1700:
@@ -2183,6 +2190,11 @@ class KernWindow(QMainWindow):
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         self._sync_chat_width()
+
+    def showEvent(self, ev):
+        super().showEvent(ev)
+        QTimer.singleShot(0, self._sync_chat_width)
+        QTimer.singleShot(50, self._sync_chat_width)
 
     def closeEvent(self, ev):
         if self._busy():
