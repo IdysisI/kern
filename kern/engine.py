@@ -874,6 +874,12 @@ class Engine:
 
     async def _review_completion(self, final_text):
         from .context import receipts, evidence_block, estimate
+        # Opt-out for users who find the review noisy. Default ON: the review is a
+        # safety feature — it drives missing verification (e.g. "said it wrote the
+        # file but never read it back") even on write/edit turns. See test_core
+        # test_completion_review_drives_missing_check.
+        if os.environ.get("KERN_SKIP_REVIEW", "0") == "1":
+            return None
         rows = [r for r in receipts(self.session.events) if r['event'] >= self._turn_start_n]
         effects = [r for r in rows if r['name'] in ('write','edit','exec','py') or '__' in r['name']]
         if not effects:

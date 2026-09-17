@@ -889,17 +889,24 @@ class KernApp(App):
                     reply = msg.get("reply")
                     if reply:
                         if w is not None:
-                            # turn_end.reply is the AUTHORITATIVE full text:
-                            # replacing in place both dedupes the normal case
-                            # (buf == reply) and heals the mid-turn-attach
-                            # case where only the tail streamed live.
-                            w.update(RichMarkdown(reply, justify="left"))
+                            # turn_end.reply is the AUTHORITATIVE full text.
+                            # Only repaint if it differs from what's already shown —
+                            # when buf == reply (the normal case) the stream widget
+                            # already displays exactly this, and repainting is a no-op
+                            # that, on the completion-review continuation, produced a
+                            # visible duplicate. Compare the plain text to skip it.
+                            current = getattr(w, "_rendered_text", None)
+                            if current != reply:
+                                w.update(RichMarkdown(reply, justify="left"))
+                                w._rendered_text = reply
                             w.set_classes("assistant")
                             w.display = True
                         else:
                             # nothing streamed live (pure attach/view case)
-                            self.chat.mount(Static(RichMarkdown(reply, justify="left"),
-                                                   classes="assistant"))
+                            widget = Static(RichMarkdown(reply, justify="left"),
+                                            classes="assistant")
+                            widget._rendered_text = reply
+                            self.chat.mount(widget)
                     if self._queue:
                         nxt = self._queue.pop(0)
                         self.chat.scroll_end(animate=False)
@@ -1219,6 +1226,7 @@ class KernApp(App):
         self._stream_dirty = False
         if text:
             w.update(RichMarkdown(text, justify="left"))
+            w._rendered_text = text      # so turn_end can skip an identical repaint
             w.set_classes("assistant")
         else:
             w.display = False
