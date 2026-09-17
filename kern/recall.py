@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import time
 from collections import Counter
@@ -249,22 +250,58 @@ def filter_against_context(candidates: list[tuple[Doc, float]],
             ctx_keys.add(k)
             ctx_norm.append(k)
     ctx_blob = " ".join(ctx_norm)
+    # O1 containment threshold (env-tunable). A candidate is an "echo" only when
+    # most of its *distinctive* content is already visible in the context.
+    try:
+        o1_threshold = float(os.environ.get('KERN_O1_THRESHOLD', '0.6'))
+    except ValueError:
+        o1_threshold = 0.6
+    # IDF over the candidate set + context lines: rare tokens weigh more, so a doc
+    # sharing only common words with the context is NOT treated as an echo, while a
+    # doc whose distinctive tokens are all already visible IS dropped.
+    df: Counter = Counter()
+    for line in ctx_norm:
+        for t in set(line.split()):
+            df[t] += 1
+    cand_tok_sets = []
+    for doc, _s in candidates:
+        ts = set(doc.tokens or tokenize(doc.text))
+        cand_tok_sets.append(ts)
+        for t in ts:
+            df[t] += 1
+    n_docs = max(1, len(ctx_norm) + len(cand_tok_sets))
+    idf = {t: math.log(1 + n_docs / df[t]) for t in df}
     seen: set[str] = set()
     per_source: Counter = Counter()
     chosen: list[Doc] = []
     budget = token_budget
-    for doc, _score in candidates:
+    for (doc, _score), tok_set in zip(candidates, cand_tok_sets):
         k = _norm_key(doc.text)
         toks = doc.tokens or tokenize(doc.text)
         if not k:
             continue
+        # O1: drop if (a) exact/substring match, OR (b) a highly distinctive token
+        # (a rare compound identifier like a codename, version, or path — the thing
+        # that makes the fact worth recalling) is already visible in the context.
         if k in ctx_keys or (len(k) >= 12 and k in ctx_blob):
             continue                          # already in context -> circular feedback
-        # O1 containment: if most of this doc's content tokens are already present
-        # in the context blob, re-injecting it would just echo visible text.
-        if toks and ctx_blob:
-            present = sum(1 for t in set(toks) if t in ctx_blob)
-            if present / max(1, len(set(toks))) >= 0.5:
+        if ctx_blob:
+            # distinctive = long, or compound (hyphenated/slashed/dotted) tokens.
+            distinctive = [t for t in set(toks)
+                           if len(t) >= 8 or ('-' in t or '/' in t or '.' in t)]
+            # Echo only when the distinctive identifier is visible AND most of the
+            # doc's content tokens are too — so a NEW fact that merely references a
+            # known artifact survives, while a re-statement of it is dropped.
+            if distinctive and all(t in ctx_blob for t in distinctive):
+                present = sum(1 for t in set(toks) if t in ctx_blob)
+                if present / max(1, len(set(toks))) >= 0.5:
+                    continue                      # its identifying token(s) are visible
+        # IDF-weighted containment: also drop when the visible context already covers
+        # most of this doc's distinctive content weight (env-tunable).
+        if tok_set and ctx_blob:
+            total_w = sum(idf.get(t, 0.0) for t in tok_set)
+            present_w = sum(idf.get(t, 0.0) for t in tok_set if t in ctx_blob)
+            if total_w > 0 and present_w / total_w >= o1_threshold:
                 continue
         if k in seen:
             continue                          # duplicate within this retrieval batch

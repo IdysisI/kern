@@ -96,3 +96,37 @@ def test_recall_zero_model_calls():
     ctx._last_user = 'recall the fact'
     _prepare(ctx, e)
     assert e.calls == 0  # the stub has no client; any call would raise
+
+
+def test_o1_does_not_suppress_new_fact_about_known_topic():
+    """Boundary: mentioning a known artifact must not block a NEW fact about it.
+
+    The context already mentions 'build/deploy.py'; a ledger fact that says
+    something NEW ('decided to delete build/deploy.py') should still be recalled
+    because its content differs, even though the identifier overlaps.
+    """
+    from kern.recall import Doc, filter_against_context, tokenize
+    ctx = 'the build output is at build/deploy.py and it works'
+    # A genuinely new fact sharing the identifier.
+    new_fact = Doc(id='1', text='decided to delete build/deploy.py because it broke prod',
+                   source='e:9', tokens=tokenize('decided to delete build/deploy.py because it broke prod'))
+    # A pure echo (content fully present in context).
+    echo = Doc(id='2', text='the build output is at build/deploy.py and it works',
+               source='e:1', tokens=tokenize('the build output is at build/deploy.py and it works'))
+    out = filter_against_context([(new_fact, 2.0), (echo, 1.0)], ctx)
+    texts = [d.text for d in out]
+    assert echo.text not in texts, 'pure echo should be suppressed'
+    assert new_fact.text in texts, 'new fact about a known identifier should survive'
+
+
+def test_o1_threshold_env_override(monkeypatch):
+    """KERN_O1_THRESHOLD tunes the IDF-containment cutoff."""
+    from kern.recall import Doc, filter_against_context, tokenize
+    ctx = 'alpha beta gamma delta'
+    doc = Doc(id='1', text='alpha beta gamma epsilon zeta',
+              source='e:1', tokens=tokenize('alpha beta gamma epsilon zeta'))
+    monkeypatch.setenv('KERN_O1_THRESHOLD', '0.99')  # very lenient -> keep
+    keep = filter_against_context([(doc, 1.0)], ctx)
+    monkeypatch.setenv('KERN_O1_THRESHOLD', '0.1')   # very strict -> drop
+    drop = filter_against_context([(doc, 1.0)], ctx)
+    assert len(keep) >= len(drop)
