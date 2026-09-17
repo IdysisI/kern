@@ -123,6 +123,28 @@ class ContextManager:
     def __init__(self, engine):
         self.engine = engine
 
+    def _last_user_text(self, e) -> str:
+        """Most recent genuine user turn text from the journal (query source)."""
+        try:
+            for ev in reversed(getattr(e.session, 'events', [])):
+                if ev.get('kind') == 'user' and ev.get('text'):
+                    return str(ev['text'])
+        except Exception:
+            pass
+        return ''
+
+    def _recall_query(self, e) -> str:
+        """The text to rank memory against: current user intent + objective."""
+        last = getattr(self, '_last_user', '') or self._last_user_text(e)
+        parts = [last]
+        try:
+            obj = e.session.objective_text()
+            if obj and obj != last:
+                parts.append(obj)
+        except Exception:
+            pass
+        return '\n'.join(p for p in parts if p).strip()
+
     async def prepare(self, system, tools):
         from . import pager
         from .client import health_of, default_max_output_tokens
@@ -170,7 +192,64 @@ class ContextManager:
             raise RuntimeError(f'context needs approximately {size} tokens; input allowance {available}. '
                                'Use memory history/artifact slices or configure the verified model context window.')
         e.output_budget = min(default_max_output_tokens(e.model), max(256, window-size-1024))
-        return view
+        return self._with_recall(view, e)
+
+    # ---- M2 + M5: zero-cost deterministic recall injection -----------------
+    def _with_recall(self, view, e):
+        """Prepend a BM25-ranked memory block to the view. 0 LLM calls (P1).
+
+        Sources: this session's journal ledger (structured, verbatim-anchored)
+        + the project's attributed atoms. Ranked by BM25+recency+pin against the
+        current task text, then filtered against the live context so a recalled
+        fact can never feed back into itself (O1 anti-circularity) and capped to
+        a token budget so it can never crowd out working memory (M3).
+        Fails open: any error -> the unmodified view.
+        """
+        try:
+            from .recall import recall, render_block, extract_ledger
+            query = self._recall_query(e)
+            if not query:
+                return view
+            ledger = extract_ledger(list(getattr(e.session, 'events', [])))
+            atoms = self._atom_entries()
+            # O1 must compare against *prior context*, not the current query —
+            # a fact that matches the query is exactly what we want to recall;
+            # a fact already present in the conversation body is the echo to drop.
+            context_text = "\n".join(
+                str(m.get('text', '')) for m in view
+                if str(m.get('text', '')).strip() and str(m.get('text', '')).strip() not in query)
+            budget_tokens = max(150, min(450, e.char_budget // 48))
+            items = recall(query, atoms=atoms, ledger=ledger,
+                           context_text=context_text, max_items=6,
+                           token_budget=budget_tokens)
+            if not items:
+                return view
+            block = render_block(items)
+            if not block.strip():
+                return view
+            return [{'role': 'system', 'text': block}] + view
+        except Exception:
+            return view
+
+    def _atom_entries(self):
+        """Project attributed atoms as recall candidates (best effort, 0 calls)."""
+        try:
+            from .memory import MemoryTree
+            cwd = getattr(self.engine, 'cwd', None)
+            if not cwd:
+                return []
+            tree = MemoryTree(cwd)
+            out = []
+            for r in tree._rows():
+                text = (r.get('text') or '').strip()
+                if not text:
+                    continue
+                out.append({'id': r.get('id', ''), 'text': text, 'pinned': True,
+                            'ts': float(r.get('ts') or r.get('created') or 0.0),
+                            'source': r.get('source') or f"note:{r.get('id','')}"})
+            return out
+        except Exception:
+            return []
 
     def _schedule_fold(self, span, start, end):
         """Run compaction as a background task so it never stalls the agent.

@@ -242,24 +242,34 @@ def filter_against_context(candidates: list[tuple[Doc, float]],
     present in context (near-dup on normalized tokens) and cap per-source + total, so
     the agent's own recycled notes cannot feed back and cause loops (O1)."""
     ctx_keys = set()
+    ctx_norm = []
     for line in context_text.splitlines():
         k = _norm_key(line)
         if k:
             ctx_keys.add(k)
+            ctx_norm.append(k)
+    ctx_blob = " ".join(ctx_norm)
     seen: set[str] = set()
     per_source: Counter = Counter()
     chosen: list[Doc] = []
     budget = token_budget
     for doc, _score in candidates:
         k = _norm_key(doc.text)
-        if not k or k in ctx_keys:
+        toks = doc.tokens or tokenize(doc.text)
+        if not k:
+            continue
+        if k in ctx_keys or (len(k) >= 12 and k in ctx_blob):
             continue                          # already in context -> circular feedback
+        # O1 containment: if most of this doc's content tokens are already present
+        # in the context blob, re-injecting it would just echo visible text.
+        if toks and ctx_blob:
+            present = sum(1 for t in set(toks) if t in ctx_blob)
+            if present / max(1, len(set(toks))) >= 0.5:
+                continue
         if k in seen:
             continue                          # duplicate within this retrieval batch
         if per_source[doc.source] >= max_per_source:
             continue                          # one source may not dominate
-        # tokenize lazily: docs built outside an index carry tokens=[] (M-budget fix)
-        toks = doc.tokens or tokenize(doc.text)
         cost = len(toks) + 8
         if cost > budget:
             continue                          # token budget guard
