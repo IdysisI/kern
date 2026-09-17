@@ -1,40 +1,56 @@
-# Kern
+<p align="center">
+  <a href="https://github.com/IdysisI/kern#gh-light-mode-only">
+    <img src="docs/assets/banner-light.svg" alt="kern — your agent's second brain" width="820">
+  </a>
+  <a href="https://github.com/IdysisI/kern#gh-dark-mode-only">
+    <img src="docs/assets/banner-dark.svg" alt="kern — your agent's second brain" width="820">
+  </a>
+</p>
 
-Kern is a Python harness that runs an LLM as a coding agent in your terminal. It exists because the model is not the problem; the loop around the model is. Left alone, an agent reads the same file five times, forgets what it decided an hour ago, and loses its plan when the context gets compacted. Kern wraps the model in a small set of guards so that stops happening.
+<p align="center">
+  <a href="https://github.com/IdysisI/kern/releases"><img src="https://img.shields.io/github/v/release/IdysisI/kern?color=3fae5a&label=release" alt="release"></a>
+  <a href="https://github.com/IdysisI/kern/actions/workflows/tests.yml"><img src="https://img.shields.io/github/actions/workflow/status/IdysisI/kern/tests.yml?branch=main&label=tests" alt="tests"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/python-%E2%89%A53.11-3fae5a" alt="python ≥ 3.11">
+</p>
 
-It runs a persistent session in the background, keeps your history and memory across restarts, and watches the agent for the failure modes that make coding assistants frustrating. There is a terminal UI, a local web UI, and a desktop GUI, all talking to the same daemon.
+<h1 align="center">kern 🌱</h1>
 
-## What it actually does
+<p align="center">
+  <b>your coding agent's second brain.</b><br>
+  a kernel is a seed — kern grows one into a little sprout that keeps your agent on track.
+</p>
 
-- A typed circuit breaker notices when the agent repeats the same action (the same file, the same command) and pushes it to do something different instead.
-- A structural code graph, built with an AST pass and no LLM calls, answers "where is X" and "what depends on Y" without re-grepping. A compact repo map is injected on first contact.
-- On first contact with a repo, Kern writes a `KERN.md` (stack, entry points, test/build/lint commands) and keeps it current. Your edits below the marker are preserved.
-- A todo plan survives compaction, so the agent remembers what it was doing.
-- When a turn ends, the agent writes what it learned to a local SQLite store; relevant notes are recalled next session. Long-term preferences are consolidated out of episode summaries.
-- Subagents fork with their own session for parallel work. `spawn(isolate=true)` runs one in a separate git worktree so it cannot touch your working tree.
-- `kern login github` signs in with the OAuth device flow. No SSH keys, no token pasting.
+<p align="center">
+  <a href="#-why">why</a> ·
+  <a href="#-what-it-grows-into">what it does</a> ·
+  <a href="#-install">install</a> ·
+  <a href="#-using-it">usage</a> ·
+  <a href="#-whats-inside">layout</a> ·
+  <a href="docs/">docs</a>
+</p>
 
-## See it
+---
 
-The terminal UI, mid-task:
+## 🌱 Why
 
-```
-  $ kern
+The model usually isn't the problem. The loop around the model is.
 
-  You: refactor the auth module to use the new token store
+Left on its own, a coding agent reads the same file five times, forgets what it decided an hour ago, and loses its whole plan when the context window gets compacted. You've watched this happen. It's not a smarter model you need; it's a little bit of guardrails around the one you have.
 
-  ◈ thinking…
-  ⠿ read kern/auth.py
-  ⠿ map callers of get_token
-  ▶ plan
-     ⠿ refactor auth.py to use token store
-     ·  run the auth tests
-  ◈ working…
-```
+Kern is that bit of guardrails. It's a small Python harness that runs the agent, watches for those exact failure modes, and gently keeps it on track. There's a terminal UI, a local web UI, and a desktop GUI, all talking to the same little daemon.
 
-(Swap this block for a real screenshot once you have one. A real terminal capture beats any diagram.)
+## 🌿 What it grows into
 
-## Install
+- **It notices loops.** A circuit breaker spots when the agent repeats the same action — same file, same command — and nudges it to try something else instead.
+- **It knows your codebase.** A structural code graph (a plain AST pass, no LLM calls) answers "where is X?" and "what depends on Y?" without re-grepping everything.
+- **It onboards itself.** First time in a repo, Kern writes a `KERN.md` with the stack, entry points, and test/build/lint commands. Your edits survive.
+- **It keeps the plan.** A todo list survives compaction, so "what was I doing?" never gets lost.
+- **It remembers.** After a turn, it writes what it learned to a local SQLite store and recalls the relevant bits next session.
+- **It can clone itself.** Subagents fork off with their own session for parallel work; `isolate=true` runs one in its own git worktree so it can't step on your tree.
+- **One-click sign-in.** `kern login github` uses the OAuth device flow. No SSH keys, no token pasting.
+
+## 📦 Install
 
 ```bash
 git clone https://github.com/IdysisI/kern
@@ -43,7 +59,7 @@ pip install -e .
 kern
 ```
 
-Kern talks to any OpenAI-compatible endpoint. Point it at one:
+Kern talks to any OpenAI-compatible endpoint. Point it at yours:
 
 ```bash
 export KERN_BASE_URL="http://localhost:8080/v1"   # ollama, vllm, llama.cpp, ...
@@ -51,43 +67,46 @@ export KERN_API_KEY="..."                          # whatever the endpoint expec
 export KERN_MODEL="qwen3:8b"
 ```
 
-By default it assumes a local server on `http://localhost:8080/v1` and starts in the terminal UI.
+It defaults to a local server on `http://localhost:8080/v1`.
 
-## Use it
+## 🎮 Using it
 
 ```bash
 kern            # terminal UI
 kern web        # browser UI
 kern gui        # desktop window
-kern --task "refactor the auth module"   # headless, auto-approves actions
+kern --task "refactor the auth module"   # headless; auto-approves actions
 ```
 
-Slash commands inside the UI: `/cost` (session usage), `/mount`, `/unmount` (skills), `/pause`, `/resume`, `/new` (fresh session), `/quit`.
+Handy slash commands once you're in: `/cost`, `/mount` and `/unmount` (skills), `/pause`, `/resume`, `/new`, `/quit`.
 
-## Layout
+## 🗺️ What's inside
 
 ```
 kern/
   engine.py     the agent loop
   context.py    compaction / folding
   memory.py     persistent memory (SQLite + FTS5)
-  recall.py     memory retrieval and ranking
-  journal.py    append-only session journal
-  codegraph.py  structural code index
-  syscalls.py   tool definitions and dispatch
-  tui.py        terminal UI (Textual)
-  web.py        browser UI
-  gui.py        desktop UI
-  auth.py       GitHub OAuth device flow
+  recall.py     memory retrieval
+  codegraph.py  the structural code index
+  syscalls.py   tools
+  auth.py       github sign-in
   updater.py    hot self-update
-tests/          the suite
-docs/           design notes and audits
+  tui.py / web.py / gui.py    the three faces
 ```
 
-## Status
+## ⭐ Star history
 
-It works and the test suite is green, but it is still young software. Expect rough edges.
+<a href="https://star-history.com/#IdysisI/kern&Date">
+  <img src="https://api.star-history.com/svg?repos=IdysisI/kern&type=Date" alt="Star history chart" width="720">
+</a>
 
-## License
+## 🌱 Status
 
-MIT
+It works and the tests are green, but it's still a sprout. Expect rough edges — and if you try it, tell me what breaks. Issues and PRs are very welcome.
+
+If kern helps you, a star means a lot. 🌱
+
+## 📜 License
+
+[MIT](LICENSE)
