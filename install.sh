@@ -48,18 +48,23 @@ else
 fi
 
 # --- install the command ------------------------------------------------------
+# Include the [gui] extra so `kern-gui` works out of the box (pulls mistune,
+# PySide6, qasync, pygments). Set KERN_NO_GUI=1 for a headless CLI-only install.
+GUI_EXTRA="[gui]"
+if [ "${KERN_NO_GUI:-0}" = "1" ]; then GUI_EXTRA=""; fi
 mkdir -p "$BIN_DIR"
 if need pipx; then
   say "installing with pipx (isolated)…"
-  pipx install --force "$INSTALL_DIR" >/dev/null 2>&1 || pipx install --force "$INSTALL_DIR"
+  pipx install --force "${INSTALL_DIR}${GUI_EXTRA}" >/dev/null 2>&1 || pipx install --force "${INSTALL_DIR}${GUI_EXTRA}"
   ok "installed with pipx"
 else
   say "no pipx — using a private venv (pipx is nicer; install it anytime and re-run this)"
   VENV="$INSTALL_DIR/.venv"
   "$PYBIN" -m venv "$VENV" || die "could not create venv (python3-venv missing?)"
   "$VENV/bin/pip" -q install --upgrade pip >/dev/null 2>&1 || true
-  "$VENV/bin/pip" -q install "$INSTALL_DIR" || die "pip install failed"
+  "$VENV/bin/pip" -q install "${INSTALL_DIR}${GUI_EXTRA}" || die "pip install failed"
   ln -sf "$VENV/bin/kern" "$BIN_DIR/kern"
+  [ -x "$VENV/bin/kern-gui" ] && ln -sf "$VENV/bin/kern-gui" "$BIN_DIR/kern-gui" || true
   ok "installed into $VENV"
 fi
 
