@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="200" height="200">
+  <!-- Kern mascot: a little sprout growing out of a kernel.
+       A kernel is a seed, so Kern grows one. Green, friendly, readable at 64px. -->
+  <defs>
+    <radialGradient id="leaf" cx="35%" cy="30%" r="90%">
+      <stop offset="0%" stop-color="#8ee08a"/>
+      <stop offset="100%" stop-color="#3fae5a"/>
+    </radialGradient>
+    <radialGradient id="seed" cx="40%" cy="35%" r="85%">
+      <stop offset="0%" stop-color="#f2e2c4"/>
+      <stop offset="100%" stop-color="#d3a76c"/>
+    </radialGradient>
+  </defs>
+
+  <!-- stem -->
+  <path d="M100 118 C 96 100 96 88 100 72" fill="none" stroke="#3fae5a" stroke-width="9" stroke-linecap="round"/>
+
+  <!-- left leaf -->
+  <path d="M100 84 C 74 82 58 66 56 44 C 80 46 96 60 100 84 Z" fill="url(#leaf)"/>
+  <!-- right leaf -->
+  <path d="M100 74 C 116 52 138 44 160 50 C 152 74 128 84 100 74 Z" fill="url(#leaf)"/>
+
+  <!-- seed / kernel body -->
+  <ellipse cx="100" cy="140" rx="46" ry="40" fill="url(#seed)"/>
+  <ellipse cx="100" cy="140" rx="46" ry="40" fill="none" stroke="#b98748" stroke-width="4"/>
+
+  <!-- face -->
+  <circle cx="86" cy="138" r="5" fill="#3a2c18"/>
+  <circle cx="114" cy="138" r="5" fill="#3a2c18"/>
+  <circle cx="87.5" cy="136.5" r="1.6" fill="#fff"/>
+  <circle cx="115.5" cy="136.5" r="1.6" fill="#fff"/>
+  <path d="M91 151 Q 100 158 109 151" fill="none" stroke="#3a2c18" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- blush -->
+  <ellipse cx="76" cy="148" rx="6" ry="3.6" fill="#f0a58a" opacity="0.75"/>
+  <ellipse cx="124" cy="148" rx="6" ry="3.6" fill="#f0a58a" opacity="0.75"/>
+</svg>

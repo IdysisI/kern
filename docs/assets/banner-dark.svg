@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <!-- Kern banner: dark background, big friendly wordmark, the sprout mascot, one tagline. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#151b28"/>
+      <stop offset="100%" stop-color="#0b0e14"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="42%" r="65%">
+      <stop offset="0%" stop-color="#3fae5a" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#3fae5a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="leafB" cx="35%" cy="30%" r="90%">
+      <stop offset="0%" stop-color="#8ee08a"/>
+      <stop offset="100%" stop-color="#3fae5a"/>
+    </radialGradient>
+    <radialGradient id="seedB" cx="40%" cy="35%" r="85%">
+      <stop offset="0%" stop-color="#f2e2c4"/>
+      <stop offset="100%" stop-color="#d3a76c"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+
+  <!-- sprout mascot, scaled up, left of the wordmark -->
+  <g transform="translate(180,150) scale(1.5)">
+    <path d="M100 118 C 96 100 96 88 100 72" fill="none" stroke="#3fae5a" stroke-width="9" stroke-linecap="round"/>
+    <path d="M100 84 C 74 82 58 66 56 44 C 80 46 96 60 100 84 Z" fill="url(#leafB)"/>
+    <path d="M100 74 C 116 52 138 44 160 50 C 152 74 128 84 100 74 Z" fill="url(#leafB)"/>
+    <ellipse cx="100" cy="140" rx="46" ry="40" fill="url(#seedB)"/>
+    <ellipse cx="100" cy="140" rx="46" ry="40" fill="none" stroke="#b98748" stroke-width="4"/>
+    <circle cx="86" cy="138" r="5" fill="#3a2c18"/>
+    <circle cx="114" cy="138" r="5" fill="#3a2c18"/>
+    <circle cx="87.5" cy="136.5" r="1.6" fill="#fff"/>
+    <circle cx="115.5" cy="136.5" r="1.6" fill="#fff"/>
+    <path d="M91 151 Q 100 158 109 151" fill="none" stroke="#3a2c18" stroke-width="4" stroke-linecap="round"/>
+    <ellipse cx="76" cy="148" rx="6" ry="3.6" fill="#f0a58a" opacity="0.75"/>
+    <ellipse cx="124" cy="148" rx="6" ry="3.6" fill="#f0a58a" opacity="0.75"/>
+  </g>
+
+  <!-- wordmark + tagline -->
+  <text x="470" y="300" font-family="ui-rounded, 'SF Pro Rounded', 'Segoe UI', system-ui, sans-serif"
+        font-size="150" font-weight="700" fill="#f5f7fa" letter-spacing="2">kern</text>
+  <text x="475" y="378" font-family="ui-rounded, 'SF Pro Rounded', 'Segoe UI', system-ui, sans-serif"
+        font-size="40" font-weight="500" fill="#9aa7bd">your agent's second brain</text>
+  <text x="475" y="430" font-family="ui-monospace, 'Cascadia Code', monospace"
+        font-size="26" fill="#3fae5a">memory · code graph · anti-loop</text>
+</svg>

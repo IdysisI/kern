@@ -7,6 +7,9 @@ __pycache__/
 *.raw
 *.svg
 *.png
+# but README/repo images live in docs/assets — always track those
+!docs/assets/*.svg
+!docs/assets/*.png
 /tmp/
 
 *.kern-lock
