@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import kernel, pager, syscalls, resilience
+from . import kernel, pager, syscalls, resilience, auth
 from .storage import turn_lease
 from .client import Client, health_of, invalidate_health
 from .journal import Session, create_session
@@ -266,7 +266,8 @@ class Engine:
     def _system(self) -> str:
         try:
             git = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                                 capture_output=True, text=True, cwd=self.cwd, timeout=5).stdout.strip() or "-"
+                                 capture_output=True, text=True, cwd=self.cwd, timeout=5,
+                                 env=auth.git_env()).stdout.strip() or "-"
         except (OSError, subprocess.TimeoutExpired):
             git = "-"
         lines = self.index.lines()
@@ -538,19 +539,20 @@ class Engine:
         """
         import subprocess, tempfile
         try:
+            genv = auth.git_env()
             probe = subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'],
-                                   cwd=self.cwd, capture_output=True, text=True, timeout=10)
+                                   cwd=self.cwd, capture_output=True, text=True, timeout=10, env=genv)
             if probe.returncode != 0 or probe.stdout.strip() != 'true':
                 return self.cwd, None
             dirty = subprocess.run(['git', 'status', '--porcelain'],
-                                   cwd=self.cwd, capture_output=True, text=True, timeout=10)
+                                   cwd=self.cwd, capture_output=True, text=True, timeout=10, env=genv)
             if dirty.stdout.strip():
                 return self.cwd, None  # uncommitted parent state: isolating would hide it
             base = Path(tempfile.gettempdir()) / 'kern-worktrees'
             base.mkdir(parents=True, exist_ok=True)
             wt = base / f'{hid}-{int(time.time())}'
             add = subprocess.run(['git', 'worktree', 'add', '--detach', str(wt), 'HEAD'],
-                                 cwd=self.cwd, capture_output=True, text=True, timeout=30)
+                                 cwd=self.cwd, capture_output=True, text=True, timeout=30, env=genv)
             if add.returncode != 0:
                 return self.cwd, None
             return str(wt), str(wt)

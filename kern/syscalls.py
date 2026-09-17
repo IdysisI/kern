@@ -29,6 +29,7 @@ import threading
 import weakref
 import time
 from pathlib import Path
+from .auth import git_env
 from .storage import atomic_write, file_lock, path_key
 
 KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))
@@ -627,6 +628,7 @@ def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False, *, 
     timeout = max(1, min(int(timeout), 3600))
     env = dict(os.environ, PAGER="cat", PIP_PROGRESS_BAR="off", TQDM_DISABLE="1",
                PYTHONIOENCODING="utf-8")
+    env = git_env(env)
     argv = _sandbox_wrap(fs, cmd) if _BWRAP else shell_argv(cmd)
     hid = "h" + uuid.uuid4().hex[:12]
     logdir = KERN_HOME / "processes"

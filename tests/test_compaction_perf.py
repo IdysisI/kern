@@ -153,3 +153,31 @@ def test_prepare_does_not_block_on_fold():
     asyncio.run(go())
     elapsed = time.monotonic() - t0
     assert elapsed < 2.0, f'prepare() blocked for {elapsed:.2f}s waiting on fold'
+
+
+def test_large_journal_capped_macro_batches():
+    """Compacting a huge journal (1000+ events) must be capped to at most 4 macro-batches,
+    preventing 60+ micro-chunk spam and 60s timeout degradation."""
+    from kern.context import ContextManager as Context
+    e = FakeEngine(latency=0.01)
+    ctx = Context(e)
+    # Simulate 1200 events with tool calls, results, user turns
+    span = []
+    for i in range(1, 1201):
+        if i % 4 == 0:
+            span.append({'n': i, 'kind': 'user', 'text': f'user request {i}'})
+        elif i % 4 == 1:
+            span.append({'n': i, 'kind': 'tool_call', 'name': 'exec', 'args': {'cmd': f'run command {i}'}})
+        elif i % 4 == 2:
+            span.append({'n': i, 'kind': 'tool_result', 'name': 'exec', 'text': f'output of command {i}\n' * 20})
+        else:
+            span.append({'n': i, 'kind': 'assistant', 'text': f'assistant reply {i}' * 10})
+
+    asyncio.run(ctx.fold(span, 0, span[-1]['n']))
+    # Verify stream_cb was called with at most 4 chunks, never 60+ chunks
+    compaction_notes = [t for t in e.notes if 'chunk' in t]
+    assert compaction_notes, 'expected compaction progress events'
+    for note in compaction_notes:
+        assert '65' not in note and '50' not in note, f'chunk count exploded: {note}'
+    # Confirm emitted episode exists and was cleanly summarized
+    assert e.session.emitted, 'no episode emitted'

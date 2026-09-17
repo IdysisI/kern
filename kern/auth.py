@@ -239,6 +239,42 @@ def login(scopes: str = DEFAULT_SCOPES, open_browser: bool = True, out=None) -> 
 
 # ---- git integration ---------------------------------------------------------
 
+def git_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Return an environment dict configured for safe, non-interactive git operations.
+
+    - Suppresses terminal/GUI prompts: GIT_TERMINAL_PROMPT=0, GIT_ASKPASS="true", SSH_ASKPASS="true".
+      Setting ASKPASS to "true" prevents KDE/GNOME askpass dialogs (e.g. ksshaskpass)
+      from ever popping up or blocking execution.
+    - If a GitHub token is configured in Kern, injects Git's native in-memory configuration
+      via GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_* scoped strictly to
+      https://github.com. This requires zero disk writes, leaves ~/.gitconfig untouched,
+      and works seamlessly even on read-only filesystems (e.g. btrfs ro).
+    """
+    env = dict(os.environ if base_env is None else base_env)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "true"
+    env["SSH_ASKPASS"] = "true"
+
+    token = get_token()
+    if token:
+        try:
+            count = int(env.get("GIT_CONFIG_COUNT", "0"))
+        except ValueError:
+            count = 0
+
+        # Inject URL-scoped credential helper and useHttpPath
+        helper_val = f"!f() {{ echo username=oauth2; echo password={token}; }}; f"
+        env[f"GIT_CONFIG_KEY_{count}"] = "credential.https://github.com.helper"
+        env[f"GIT_CONFIG_VALUE_{count}"] = helper_val
+        env[f"GIT_CONFIG_KEY_{count + 1}"] = "credential.https://github.com.useHttpPath"
+        env[f"GIT_CONFIG_VALUE_{count + 1}"] = "true"
+        env[f"GIT_CONFIG_KEY_{count + 2}"] = "core.askPass"
+        env[f"GIT_CONFIG_VALUE_{count + 2}"] = ""
+        env["GIT_CONFIG_COUNT"] = str(count + 3)
+
+    return env
+
+
 def git_credential_helper_command() -> str:
     """A git credential.helper command that serves the stored token for github.com.
 
@@ -270,8 +306,10 @@ def ensure_git_credentials(repo: str | None = None, out=None) -> tuple[bool, str
             pass
     helper = git_credential_helper_command()
     try:
-        subprocess.run(['git', *scope, 'config', 'credential.https://github.com.helper', helper],
-                       capture_output=True, text=True, timeout=10)
-        return True, f'git credential helper set ({scope[-1]}) for https://github.com'
+        r = subprocess.run(['git', *scope, 'config', 'credential.https://github.com.helper', helper],
+                           capture_output=True, text=True, timeout=10, env=git_env())
+        if r.returncode == 0:
+            return True, f'git credential helper set ({scope[-1]}) for https://github.com'
+        return True, f'git credentials active in-memory (disk config {scope[-1]} skipped: {r.stderr.strip()[:60]})'
     except Exception as e:
-        return False, f'could not set git credential helper: {e}'
+        return True, f'git credentials active in-memory ({e})'

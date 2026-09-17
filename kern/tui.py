@@ -549,6 +549,7 @@ class KernApp(App):
         self._last_flushed_assistant: Static | None = None
         self._stream_dirty = False
         self._waiting_widget: Static | None = None
+        self._compaction_widget: Static | None = None
         self._thinking_widget: ThinkingBlock | None = None
         self._tool_card: ToolCard | None = None
         self._todo_card: TodoCard | None = None
@@ -1175,8 +1176,30 @@ class KernApp(App):
             self._chat_note("◈ " + text.splitlines()[0])
         elif kind == "summary":
             self._flush_stream()  # keep ordering: flush buffered text before the summary
-            # compaction summary — show what the model chose to keep, so the
-            # user can audit the memory the next turns will be built on
+            # Compaction progress vs final summary:
+            # Intermediate progress messages start with '⟳ compacting' — update a single
+            # live progress widget in-place so we never spam the chat history with 50+ lines.
+            if text.startswith("⟳ compacting"):
+                w = getattr(self, "_compaction_widget", None)
+                if w is None:
+                    self._compaction_widget = Static(safe(text), classes="note")
+                    self.chat.mount(self._compaction_widget)
+                else:
+                    w.update(safe(text))
+                self.chat.scroll_end(animate=False)
+                return
+
+            # Final summary arrived: dismiss any intermediate progress widget
+            w = getattr(self, "_compaction_widget", None)
+            if w is not None:
+                try:
+                    w.remove()
+                except Exception:
+                    pass
+                self._compaction_widget = None
+
+            # Show what the model chose to keep, so the user can audit
+            # the memory the next turns will be built on.
             body = text if len(text) <= 1200 else text[:1200] + "…"
             self.chat.mount(Static(
                 safe("▤ context compacted — kept:\n" + body),

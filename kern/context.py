@@ -345,21 +345,45 @@ class ContextManager:
         atomic_write(source, raw)
         compact_input = []
         for ev in span:
-            item = dict(ev)
-            if ev['kind'] in ('user','objective') and len(str(ev.get('text',''))) > fragment_size:
-                text = ev['text']
-                pieces = [text[i:i+fragment_size] for i in range(0,len(text),fragment_size)]
-                compact_input.extend({'n':ev['n'],'kind':ev['kind'],'part':i+1,
-                                      'parts':len(pieces),'text':piece}
-                                     for i,piece in enumerate(pieces))
+            kind = ev.get('kind')
+            if kind in ('system', 'thought', 'turn_end', 'review'):
                 continue
-            if len(json.dumps(item)) > fragment_size:
-                path = e.session.offload(f'event-{ev["n"]}', json.dumps(ev, ensure_ascii=False))
-                item = {'n': ev['n'], 'kind': ev['kind'], 'text': str(ev.get('text',''))[:1800], 'full_event': path}
+            if kind in ('user', 'objective'):
+                text = str(ev.get('text', ''))
+                if len(text) > fragment_size:
+                    pieces = [text[i:i+fragment_size] for i in range(0, len(text), fragment_size)]
+                    compact_input.extend({'n': ev['n'], 'kind': kind, 'part': i+1,
+                                          'parts': len(pieces), 'text': piece}
+                                         for i, piece in enumerate(pieces))
+                else:
+                    compact_input.append({'n': ev['n'], 'kind': kind, 'text': text})
+                continue
+            if kind == 'assistant':
+                text = str(ev.get('text', ''))
+                short_text = text[:1500] + ('…' if len(text) > 1500 else '')
+                item = {'n': ev['n'], 'kind': 'assistant', 'text': short_text}
                 if ev.get('tool_calls'):
-                    item['tools'] = [{'name': c['name'], 'arguments': {k:str(v)[:512] for k,v in c.get('arguments',{}).items() if k not in ('content','new_str','code')}} for c in ev['tool_calls'][:10]]
-            compact_input.append(item)
-        # Split summaries into bounded batches rather than dropping the tail.
+                    item['tool_calls'] = [{'name': c.get('name'),
+                                           'args': {k: str(v)[:150] for k, v in (c.get('arguments') or {}).items()
+                                                    if k not in ('content', 'new_str', 'code')}}
+                                          for c in ev['tool_calls'][:6]]
+                compact_input.append(item)
+                continue
+            if kind == 'tool_result':
+                tname = ev.get('name') or ''
+                ttext = str(ev.get('text', ''))
+                first_line = ttext.splitlines()[0] if ttext else ''
+                snippet = ttext[:300] if len(ttext) <= 300 else (ttext[:200] + '…' + ttext[-100:])
+                compact_input.append({
+                    'n': ev['n'], 'kind': 'tool_result', 'tool': tname,
+                    'summary': first_line[:120], 'excerpt': snippet,
+                })
+                continue
+            compact_input.append({'n': ev.get('n'), 'kind': kind, 'text': str(ev.get('text', ''))[:500]})
+
+        # Split summaries into bounded macro-batches (capped at 4) so all batches
+        # run in parallel in a single wave, completing in 2-5s without 60s timeout degradation.
+        MAX_FOLD_BATCHES = int(os.environ.get('KERN_MAX_FOLD_BATCHES', '4'))
         batches, batch, length = [], [], 0
         for item in compact_input:
             n = len(json.dumps(item, ensure_ascii=False))
@@ -370,6 +394,11 @@ class ContextManager:
             length += n
         if batch:
             batches.append(batch)
+
+        if len(batches) > MAX_FOLD_BATCHES:
+            chunk_size = (len(compact_input) + MAX_FOLD_BATCHES - 1) // MAX_FOLD_BATCHES
+            batches = [compact_input[i:i + chunk_size] for i in range(0, len(compact_input), chunk_size)]
+
         summaries = [None] * len(batches)
         total = len(batches)
         # Hard wall-clock budget: compaction must be seconds, not minutes.
@@ -414,7 +443,8 @@ class ContextManager:
                 # Safe fallback is an explicit source index, not a fabricated summary.
                 summaries[bi] = {'unverified_index': [f"{x['n']} {x['kind']}: {str(x.get('text',''))[:240]}" for x in batch],
                                   'summary_error': str(err)[:200]}
-            e.stream_cb('summary', f'⟳ compacting… {min(llm_done, total)}/{total} chunks')
+            if total > 1:
+                e.stream_cb('summary', f'⟳ compacting… {min(llm_done, total)}/{total} chunks')
 
         sem = asyncio.Semaphore(fold_concurrency)
         async def _guarded(bi, batch):

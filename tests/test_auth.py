@@ -157,3 +157,25 @@ def test_git_credential_helper_string(home):
 def test_ensure_git_credentials_requires_login(home):
     ok, msg = auth.ensure_git_credentials()
     assert ok is False and 'not logged in' in msg
+
+
+def test_git_env_suppresses_prompts_and_injects_credentials(home):
+    # Without token: prompts are suppressed, no git config injected
+    env_no_tok = auth.git_env()
+    assert env_no_tok['GIT_TERMINAL_PROMPT'] == '0'
+    assert env_no_tok['GIT_ASKPASS'] == 'true'
+    assert env_no_tok['SSH_ASKPASS'] == 'true'
+    assert 'GIT_CONFIG_COUNT' not in env_no_tok
+
+    # With token stored: injects in-memory ephemeral git helper
+    auth.store_token('gho_secret123', login='octocat')
+    env = auth.git_env()
+    assert env['GIT_TERMINAL_PROMPT'] == '0'
+    assert env['GIT_ASKPASS'] == 'true'
+    assert env['SSH_ASKPASS'] == 'true'
+    assert env['GIT_CONFIG_COUNT'] == '3'
+    assert env['GIT_CONFIG_KEY_0'] == 'credential.https://github.com.helper'
+    assert 'gho_secret123' in env['GIT_CONFIG_VALUE_0']
+    assert env['GIT_CONFIG_KEY_1'] == 'credential.https://github.com.useHttpPath'
+    assert env['GIT_CONFIG_KEY_2'] == 'core.askPass'
+    assert env['GIT_CONFIG_VALUE_2'] == ''

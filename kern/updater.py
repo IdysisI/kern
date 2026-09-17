@@ -27,6 +27,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from kern.auth import git_env
+
 
 @dataclass
 class UpdateStatus:
@@ -50,9 +52,11 @@ class UpdateStatus:
 
 
 def _run(argv: list[str], cwd: Path, timeout: int = 60) -> subprocess.CompletedProcess:
-    """Isolated subprocess call (fakeable in tests)."""
+    """Isolated subprocess call (fakeable in tests). Suppresses interactive prompts
+    and supplies ephemeral GitHub credentials via git_env()."""
     return subprocess.run(
         argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout,
+        env=git_env(),
     )
 
 
