@@ -20,6 +20,7 @@
 - **Isolated subagents.** Fork parallel subagents with their own session and context; opt-in `isolate` runs a mutating subagent in a fresh git worktree so it can't collide with your working tree.
 - **Skills that become tools.** A well-performing agent can crystallize its own methods into reusable *skills*, then *promote* them into compiled tools (the "midas" command). The agent literally expands its own toolbox.
 - **Updates itself.** A hot self-update fetches and fast-forwards in place with daemon re-exec and session resume — guarded against dirty trees, verified end-to-end against a real git remote.
+- **Signs in with one click.** `kern login github` uses the GitHub OAuth device flow — open a URL, approve, done. No SSH keys, no token pasting. The token is stored locally (0600) and wired into git's credential helper, so pushes just work. `KERN_GITHUB_TOKEN` overrides for CI.
 - **Lean by default.** 14 tools at rest, ~1,600 tokens of system prompt. Capabilities are *mounted* on demand (and unmounted when done) — you never pay prompt budget for what you aren't using.
 
 ---

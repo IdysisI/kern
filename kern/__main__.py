@@ -58,7 +58,8 @@ def main():
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(encoding='utf-8')
     parser = argparse.ArgumentParser(description='Kern — personal agent, TUI and local web workspace')
-    parser.add_argument('interface', nargs='?', choices=('tui','web','serve','gui','update','restart','check-update'), default='tui')
+    parser.add_argument('interface', nargs='?', choices=('tui','web','serve','gui','update','restart','check-update','login','logout','whoami'), default='tui')
+    parser.add_argument('provider', nargs='?', default='github', help='auth provider for login/logout/whoami (currently: github)')
     parser.add_argument('--model', help='model identifier (defaults to KERN_MODEL)')
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument('--task', nargs='+', help='headless task; actions are automatically approved')
@@ -82,9 +83,39 @@ def main():
         gui.main()
     elif args.interface in ("update", "restart", "check-update"):
         _daemon_ctl(args.interface)
+    elif args.interface in ("login", "logout", "whoami"):
+        sys.exit(_auth_ctl(args.interface, args.provider))
     else:
         from .tui import entry
         entry()
+
+
+def _auth_ctl(cmd, provider='github'):
+    """Handle `kern login|logout|whoami github`. Returns a process exit code."""
+    if provider != 'github':
+        print(f"error: unknown auth provider '{provider}' (currently only 'github')", file=sys.stderr)
+        return 2
+    from . import auth
+    if cmd == 'login':
+        result = auth.login()
+        if 'error' in result:
+            print(f"\n✗ sign-in failed: {result.get('error_description') or result['error']}", file=sys.stderr)
+            return 1
+        ok, msg = auth.ensure_git_credentials(out=print)
+        print(('  ' + msg) if ok else f"  (note: {msg})")
+        return 0
+    if cmd == 'logout':
+        removed = auth.forget()
+        print('✓ signed out (stored GitHub token removed)' if removed
+              else 'nothing to sign out of (no stored token)')
+        return 0
+    # whoami
+    me = auth.whoami()
+    if 'error' in me:
+        print(f"not signed in ({me.get('error_description') or me['error']}). Run: kern login github")
+        return 1
+    print(f"signed in to GitHub as {me.get('login') or '(unknown)'}")
+    return 0
 
 
 async def _async_daemon_ctl(cmd):
