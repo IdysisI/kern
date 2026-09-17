@@ -104,7 +104,7 @@ S1, S2, S3, S4, S6, S8 = 4, 8, 12, 16, 24, 32
 
 R_SM, R_MD, R_LG = 6, 8, 12
 
-CHAT_MAX_W = 780
+CHAT_MAX_W = 1180
 SIDEBAR_W = 264
 
 UI_FONT = "Noto Sans"
@@ -1458,7 +1458,6 @@ class KernWindow(QMainWindow):
         cl.addStretch(1)
 
         self.col = QWidget()
-        self.col.setMaximumWidth(CHAT_MAX_W)
         self.col.setStyleSheet(f"background: {BG_0};")
         self.flow = QVBoxLayout(self.col)
         self.flow.setContentsMargins(0, S6, 0, S6)
@@ -1479,7 +1478,6 @@ class KernWindow(QMainWindow):
         inner.setContentsMargins(0, 0, 0, 0)
         inner.addStretch(1)
         self.composer = Composer()
-        self.composer.setMaximumWidth(CHAT_MAX_W)
         inner.addWidget(self.composer, 0)
         inner.addStretch(1)
         cwl.addLayout(inner)
@@ -1959,6 +1957,7 @@ class KernWindow(QMainWindow):
 
     def _toggle_sidebar(self):
         self.sidebar.setVisible(not self.sidebar.isVisible())
+        self._sync_chat_width()
 
     # ── model plumbing ──────────────────────────────────────────────────────
     def _load_models(self):
@@ -2152,6 +2151,38 @@ class KernWindow(QMainWindow):
             )
         else:
             self._note(f"Unknown command {cmd} — try /help", "error")
+
+    def _sync_chat_width(self):
+        """Dynamic responsive width for messages and composer.
+
+        Adapts smoothly to the available viewport so widescreen displays
+        aren't constrained to a narrow strip while compact displays stay comfortable:
+          - Small (<900px): 95% of available width
+          - Medium (900-1300px): 90% of available width
+          - Large (1300-1700px): 85% of available width
+          - Ultra-wide (>1700px): 80% of available width (up to 1600px max)
+        """
+        viewport_w = self.scroll.viewport().width() if hasattr(self, "scroll") else 0
+        if viewport_w <= 0:
+            viewport_w = self.width() - (SIDEBAR_W if self.sidebar.isVisible() else 0)
+
+        if viewport_w < 900:
+            target = max(340, viewport_w - 32)
+        elif viewport_w < 1300:
+            target = int(viewport_w * 0.90)
+        elif viewport_w < 1700:
+            target = int(viewport_w * 0.85)
+        else:
+            target = min(1600, int(viewport_w * 0.80))
+
+        if hasattr(self, "col"):
+            self.col.setFixedWidth(target)
+        if hasattr(self, "composer"):
+            self.composer.setFixedWidth(target)
+
+    def resizeEvent(self, ev):
+        super().resizeEvent(ev)
+        self._sync_chat_width()
 
     def closeEvent(self, ev):
         if self._busy():
