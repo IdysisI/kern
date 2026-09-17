@@ -137,6 +137,7 @@ SCHEMAS = [
             "task": {"type": "string", "description": "clear instructions and goal for the subagent"},
             "context": {"type": "string", "description": "file paths, constraints, or background knowledge"},
             "background": {"type": "boolean", "description": "true (default): run asynchronously and return handle immediately; false: wait for final report"},
+            "isolate": {"type": "boolean", "description": "default false. true: run the child in a fresh git worktree (clean repos only) so a mutating child can't collide with your working tree — the report returns the worktree path; merge or drop it when done."},
             "max_steps": {"type": "integer", "description": "maximum tool execution iterations for the subagent (default 50, max 120)"}},
             "required": ["task"]}}},
     {"type": "function", "function": {

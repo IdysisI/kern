@@ -507,18 +507,61 @@ class Engine:
         return (f"error: unknown tool '{name}'. "
                 f"Core: read, write, edit, exec, proc, fetch, memory, todo, spawn, subagent."), {}
 
-    async def _spawn(self, task: str, context: str = "", background: bool = False, max_steps: int = 50) -> str:
+    async def _spawn(self, task: str, context: str = "", background: bool = False, max_steps: int = 50, isolate: bool = False) -> str:
         """Backwards-compatible wrapper around _tool_spawn."""
-        report, _ = await self._tool_spawn(task=task, context=context, background=background, max_steps=max_steps)
+        report, _ = await self._tool_spawn(task=task, context=context, background=background, max_steps=max_steps, isolate=isolate)
         return report
 
-    async def _tool_spawn(self, task: str, context: str = "", background: bool = True, max_steps: int = 50) -> tuple[str, dict]:
+    def _setup_worktree(self, hid: str) -> tuple[str, str | None]:
+        """Create an isolated git worktree for a mutating subagent. Opt-in (isolate=True).
+
+        Returns (cwd_for_child, worktree_path_or_None). Only activates when the repo
+        is a clean git work tree; otherwise returns (self.cwd, None) so the caller
+        degrades to a normal in-place spawn with a clear note. The worktree is created
+        in the system tempdir (outside the repo, so it never pollutes the parent's
+        git status) on a detached HEAD at the current commit, and left in place on
+        completion so the parent can inspect/merge the result; the parent merges or
+        drops it when done.
+        """
+        import subprocess, tempfile
+        try:
+            probe = subprocess.run(['git', 'rev-parse', '--is-inside-work-tree'],
+                                   cwd=self.cwd, capture_output=True, text=True, timeout=10)
+            if probe.returncode != 0 or probe.stdout.strip() != 'true':
+                return self.cwd, None
+            dirty = subprocess.run(['git', 'status', '--porcelain'],
+                                   cwd=self.cwd, capture_output=True, text=True, timeout=10)
+            if dirty.stdout.strip():
+                return self.cwd, None  # uncommitted parent state: isolating would hide it
+            base = Path(tempfile.gettempdir()) / 'kern-worktrees'
+            base.mkdir(parents=True, exist_ok=True)
+            wt = base / f'{hid}-{int(time.time())}'
+            add = subprocess.run(['git', 'worktree', 'add', '--detach', str(wt), 'HEAD'],
+                                 cwd=self.cwd, capture_output=True, text=True, timeout=30)
+            if add.returncode != 0:
+                return self.cwd, None
+            return str(wt), str(wt)
+        except Exception:
+            return self.cwd, None
+
+    async def _tool_spawn(self, task: str, context: str = "", background: bool = True, max_steps: int = 50, isolate: bool = False) -> tuple[str, dict]:
         if self.depth >= 2:
             return "error: max subagent depth reached (level 2). Execute the task directly.", {}
 
         steps_cap = max(5, min(int(max_steps or 50), 120))
-        child_session = create_session(cwd=self.cwd, parent=self.session.id)
         hid = f"sub_{len(self.subagents) + 1}"
+
+        # Opt-in git-worktree isolation for mutating subagents. Default off: the common
+        # (research/exploration) path is unchanged. Degrades gracefully outside git.
+        child_cwd, worktree = (self.cwd, None)
+        if isolate:
+            child_cwd, worktree = self._setup_worktree(hid)
+            if worktree is None:
+                context = (context + "\n[note: worktree isolation requested but unavailable "
+                           "(not a clean git repo) — running in place; do not leave uncommitted "
+                           "changes that could collide with the parent.]").strip()
+
+        child_session = create_session(cwd=child_cwd, parent=self.session.id)
 
         # Stream isolation: child events are announced with clean prefix
         def child_stream(kind: str, text: str):
@@ -560,7 +603,7 @@ class Engine:
                 return await result if inspect.isawaitable(result) else result
 
         child_engine = Engine(
-            self.client, self.model, child_session, self.cwd,
+            self.client, self.model, child_session, child_cwd,
             approve=child_approve, stream_cb=child_stream,
             subagent_depth=self.depth + 1
         )
@@ -581,6 +624,7 @@ class Engine:
             "result": None,
             "error": None,
             "report_path": None,
+            "worktree": worktree,  # isolated git worktree path when isolate=True, else None
         }
         self.subagents[hid] = entry
 
@@ -689,14 +733,16 @@ class Engine:
         if background:
             task_obj = asyncio.create_task(run_subagent())
             entry["async_task"] = task_obj
+            wt_note = f"\nIsolated worktree: {worktree} (child edits land there; merge or drop it when done)." if worktree else ""
             msg = (f"started background subagent {hid} (session: {child_session.id}, model: {self.model}, max_steps: {steps_cap}): {task[:90]}\n"
                    f"The subagent is running asynchronously in the background — you can continue working.\n"
-                   f"Use subagent(handle=\"{hid}\", action=\"status\"|\"logs\"|\"wait\"|\"cancel\") to check progress or retrieve the report.")
-            return msg, {"handle": hid, "session_id": child_session.id}
+                   f"Use subagent(handle=\"{hid}\", action=\"status\"|\"logs\"|\"wait\"|\"cancel\") to check progress or retrieve the report.{wt_note}")
+            return msg, {"handle": hid, "session_id": child_session.id, **({"worktree": worktree} if worktree else {})}
         else:
             reply = await run_subagent()
             cost = f" [child cost: {child_engine.requests} requests]" if child_engine.requests > 1 else ""
-            return f"subagent {hid} completed:{cost}\n{str(reply)[:4000]}", {"handle": hid, "session_id": child_session.id}
+            wt_note = f"\n[worktree: {worktree}]" if worktree else ""
+            return f"subagent {hid} completed:{cost}{wt_note}\n{str(reply)[:4000]}", {"handle": hid, "session_id": child_session.id, **({"worktree": worktree} if worktree else {})}
 
     async def _tool_subagent(self, handle: str, action: str, timeout: int = 120) -> tuple[str, dict]:
         entry = self.subagents.get(handle)
