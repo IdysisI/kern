@@ -75,6 +75,18 @@ _PY_MUTATING_RE = re.compile(
     r"(?:pip|apt|npm|\bcp\b|\bmv\b|\brm\b|mkdir|git\s+(?:add|commit|push)|7z\s+[ex])"
 )
 
+# py()/exec payloads that only READ files (no mutation). Gemini prefers reading
+# whole files with python instead of the read() tool; this detects that habit so
+# the engine can nudge it toward read()/grep and keep context bounded. Matches
+# open(...).read(), Path(...).read_text(), a file handle's .read(), and shell
+# cat/head/tail/sed -n file-dumps.
+_PY_READS_FILE_RE = re.compile(
+    r"open\([^)]*\)\.read\("
+    r"|\.read_text\("
+    r"|\bopen\([^)]*\)[\s\S]{0,120}\.read\("   # with open(..) as f: ... f.read()
+    r"|\b(?:cat|head|tail|sed\s+-n|awk)\b"
+)
+
 
 # Ops that never cause side effects. Replay warnings must NOT fire for these (F3):
 # re-reading a status/log/file is not a repeated dangerous action. Research, by
@@ -234,6 +246,7 @@ class Engine:
         self._consecutive_inspections: int = 0
         self._run_targets: set = set()   # distinct targets seen in current read-run (typed breaker)
         self._last_inspection_target: str | None = None  # most recent inspection target (breaker diagnostics)
+        self._read_limit_hinted: set = set()  # files already nudged once toward offset/limit reads
         # In-turn read-only dedup cache: (tool, canonical args) -> (result, meta).
         # An identical successful read-only call returns the cached result instead of
         # re-executing, so a model that re-reads a file it already has pays ~zero for it.
@@ -1250,6 +1263,20 @@ class Engine:
                                            "This is a loop. STOP re-reading. Apply your planned change NOW via edit()/write(), "
                                            "or if you are blocked, say so and ask the user.]")
 
+                # Line-limit enforcement: an unlimited read() of a large file dumps
+                # up to 200 numbered lines into context even when the model only needs
+                # a symbol. After the FIRST unlimited read of a given file (which surfaces
+                # the "N lines, showing lo-hi" header), nudge once toward targeted reads.
+                if name == "read" and tgt and not (args or {}).get("full"):
+                    if not (args or {}).get("limit") and tgt not in self._read_limit_hinted:
+                        # only nudge when the file is actually bigger than one page
+                        hdr = re.search(r"\((\d+) lines,", str(text))
+                        if hdr and int(hdr.group(1)) > 200:
+                            self._read_limit_hinted.add(tgt)
+                            text = (str(text) + "\n\n[harness hint: this file has more lines than shown. "
+                                               "Next time pass offset/limit (or grep first) to read only the part you "
+                                               "need — pulling whole files floods your context and triggers loops.]")
+
                 # Escalating ladder on consecutive inspection-without-progress.
                 # Each rung is MORE directive than the last and names a concrete next
                 # action, so a weak model is pushed toward acting instead of just being
@@ -1275,6 +1302,16 @@ class Engine:
                      consecutive=self._consecutive_inspections,
                      consecutive_errors=self._consecutive_errors,
                      distinct_targets=len(self._run_targets))
+
+                # Gemini habitually reads files via py()/exec instead of read(),
+                # which bypasses truncation/line limits and floods context. Nudge
+                # it toward the right tool the moment the pattern appears.
+                if name in ("py", "exec"):
+                    code = str((args or {}).get("code") or (args or {}).get("cmd") or "")
+                    if _PY_READS_FILE_RE.search(code):
+                        text = (str(text) + "\n\n[harness hint: reading files via py()/exec wastes context and "
+                                           "bypasses the read() tool's line-limit/truncation. Use read() for files, "
+                                           "grep (or `exec rg`) to locate text, and py() only for computation.]")
 
                 self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
                                    status=meta.get("status") or ("failed" if str(text).startswith(("error", "denied")) else "succeeded"),

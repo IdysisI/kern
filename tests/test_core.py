@@ -572,3 +572,96 @@ async def test_identical_readonly_call_is_deduped(tmp_path, monkeypatch):
     assert reads[1].get('status') == 'cached', "2nd identical read must be served from cache"
     assert 'cached result' in reads[1]['text']
     assert 'new content' in reads[2]['text'], "read after write must see the new content"
+
+
+# ---------------------------------------------------------------------------
+# Gemini bad-behavior fixes: (a) py()-for-reading nudge, (b) read limit nudge,
+# (c) TUI double-render fallback (_last_flushed_assistant).
+# ---------------------------------------------------------------------------
+
+def test_py_reads_file_re_matches_read_habit():
+    """The nudge regex must catch Gemini's habit of reading files via py()/exec,
+    and must NOT fire on computation or writes."""
+    from kern.engine import _PY_READS_FILE_RE as R
+    # read habits -> match
+    assert R.search("print(open('kern/tui.py').read())")
+    assert R.search("with open('x.py') as f:\n    text = f.read()\nprint(text)")
+    assert R.search("print(open('kern/tui.py').read())\nidx = text.find('def entry')")
+    assert R.search("data = Path('a/b.py').read_text()")
+    assert R.search("cat kern/engine.py | head")
+    assert R.search("sed -n '100,120p' kern/engine.py")
+    # computation / writes -> no match
+    assert not R.search("open('out.txt','w').write('x')")
+    assert not R.search("print(2 + 2)")
+    assert not R.search("import re; re.findall(r'\\d+', s)")
+
+
+@pytest.mark.asyncio
+async def test_py_file_read_triggers_nudge(tmp_path):
+    """When the model reads a file via py() instead of read(), the tool result
+    must carry the harness hint steering it to read()/grep."""
+    class PyReader:
+        n = 0
+        async def probe(self, model):
+            pass
+        async def stream_chat(self, model, messages, **kwargs):
+            self.n += 1
+            if self.n == 1:
+                yield StreamEvent('tool_call', tool_call={'id': 'c1', 'name': 'py',
+                                                          'arguments': {'code': "print(open('kern/engine.py').read())"}})
+            else:
+                yield StreamEvent('text', text='done')
+    s = create_session(str(tmp_path))
+    e = Engine(PyReader(), 'test', s, str(tmp_path))
+    await e.chat('look at engine', max_steps=4)
+    results = [ev for ev in s.events if ev['kind'] == 'tool_result']
+    assert results, 'expected at least one tool_result'
+    assert any('bypasses the read() tool' in ev.get('text', '') for ev in results), \
+        'py() file read must append the read()/grep nudge'
+
+
+@pytest.mark.asyncio
+async def test_unlimited_read_of_large_file_nudges_once(tmp_path):
+    """An unlimited read() of a >200-line file must append a one-time nudge toward
+    offset/limit reads; a limited read must not."""
+    big = tmp_path / 'big.py'
+    big.write_text('\n'.join(f'# line {i}' for i in range(400)))
+    calls = iter([
+        {'path': str(big)},                 # unlimited, big -> nudge
+        {'path': str(big)},                 # unlimited again -> already hinted, no 2nd nudge
+        {'path': str(big), 'offset': 1, 'limit': 10},  # limited -> no nudge
+    ])
+    class ReadModel:
+        n = 0
+        async def probe(self, model):
+            pass
+        async def stream_chat(self, model, messages, **kwargs):
+            self.n += 1
+            if self.n <= 3:
+                yield StreamEvent('tool_call', tool_call={'id': f'c{self.n}', 'name': 'read',
+                                                          'arguments': next(calls)})
+            else:
+                yield StreamEvent('text', text='done')
+    s = create_session(str(tmp_path))
+    e = Engine(ReadModel(), 'test', s, str(tmp_path))
+    await e.chat('inspect big file', max_steps=8)
+    results = [ev for ev in s.events if ev['kind'] == 'tool_result']
+    nudged = [ev for ev in results if 'pass offset/limit' in ev.get('text', '')]
+    assert len(nudged) == 1, f'expected exactly one limit nudge, got {len(nudged)}'
+
+
+def test_tui_flush_records_last_flushed_and_turn_end_fallback():
+    """TUI double-render fix: _flush_stream must stash the flushed widget in
+    _last_flushed_assistant, and the turn_end handler must fall back to it when
+    the live _stream_widget is already gone (so it updates in place instead of
+    mounting a duplicate bubble)."""
+    import inspect as _inspect
+    from kern import tui as _tui
+    src = _inspect.getsource(_tui.KernApp._flush_stream)
+    assert '_last_flushed_assistant' in src, '_flush_stream must record the last flushed widget'
+    # __init__ initialises the handle
+    init_src = _inspect.getsource(_tui.KernApp.__init__)
+    assert '_last_flushed_assistant' in init_src
+    # turn_end handler (inside _remote_reader) falls back to the last flushed widget
+    onmsg_src = _inspect.getsource(_tui.KernApp._remote_reader)
+    assert '_last_flushed_assistant' in onmsg_src, 'turn_end must fall back to _last_flushed_assistant'

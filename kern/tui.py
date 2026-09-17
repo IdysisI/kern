@@ -546,6 +546,7 @@ class KernApp(App):
         self.turn_worker = None
         self._stream_widget: Static | None = None
         self._stream_buf: list[str] = []
+        self._last_flushed_assistant: Static | None = None
         self._stream_dirty = False
         self._waiting_widget: Static | None = None
         self._thinking_widget: ThinkingBlock | None = None
@@ -832,6 +833,7 @@ class KernApp(App):
         self._thinking_widget = None
         self._stream_widget = None
         self._stream_buf = []
+        self._last_flushed_assistant = None
         self._dismiss_waiting()
         self._remote_running = False
         self._refresh_chrome()
@@ -877,9 +879,13 @@ class KernApp(App):
                 elif ev == "turn_end":
                     self._remote_running = False
                     # The live stream widget becomes the final assistant
-                    # bubble: keep a handle across the flush.
+                    # bubble: keep a handle across the flush. Fall back to
+                    # the last flushed widget if the live handle is already
+                    # gone (empty-stream or pre-flushed edge cases).
                     w = self._stream_widget
                     self._flush_stream()
+                    if w is None:
+                        w = self._last_flushed_assistant
                     self._dismiss_waiting()
                     if msg.get("usage"):
                         u = msg["usage"]
@@ -1230,6 +1236,7 @@ class KernApp(App):
             w.set_classes("assistant")
         else:
             w.display = False
+        self._last_flushed_assistant = w
 
     # ---- turn lifecycle ------------------------------------------------------
 
