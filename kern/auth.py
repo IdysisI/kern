@@ -32,10 +32,10 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# The GitHub CLI's public OAuth client id — used so device-flow login works with no
-# configuration. This is intentionally public (device flow is for installed apps).
-# Override with KERN_GITHUB_CLIENT_ID to use your own OAuth App.
-_GH_CLI_CLIENT_ID = '178c6fc778ccc68e1d6a'
+# Kern's own registered OAuth App client id. Device flow is designed for installed
+# apps, so the client id is public and ships in source (the client *secret* is never
+# used by the device flow). Override with KERN_GITHUB_CLIENT_ID to use a different app.
+_KERN_CLIENT_ID = 'Ov23lin0Ze1RmUJ0wZXn'
 
 DEVICE_CODE_URL = 'https://github.com/login/device/code'
 ACCESS_TOKEN_URL = 'https://github.com/login/oauth/access_token'
@@ -52,7 +52,7 @@ def _credentials_path() -> Path:
 
 
 def _client_id() -> str:
-    return os.environ.get('KERN_GITHUB_CLIENT_ID', _GH_CLI_CLIENT_ID)
+    return os.environ.get('KERN_GITHUB_CLIENT_ID', _KERN_CLIENT_ID)
 
 
 def _post_form(url: str, fields: dict, timeout: int = 30) -> tuple[int, dict]:
