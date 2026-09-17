@@ -155,18 +155,59 @@ def _hash_dir(pkg: Path) -> str:
     return f"{_STATIC}+{h.hexdigest()[:10]}"
 
 
-def source_signature(root: Path | str | None = None) -> str:
+_sig_cache: dict[str, tuple[float, int, str]] = {}
+
+
+def _dir_fingerprint(pkg: Path) -> tuple[float, int]:
+    """Cheap (max_mtime, total_size) fingerprint of a package dir.
+
+    Hashing ~26 source files on every 2s poll is wasteful; mtimes let us skip
+    the hash entirely when nothing was touched. Only used as a cache key — the
+    authoritative value is still the content hash.
+    """
+    newest = 0.0
+    total = 0
+    try:
+        for n in os.listdir(pkg):
+            if not n.endswith(".py") or n == "__init__.py":
+                continue
+            try:
+                st = os.stat(pkg / n)
+            except OSError:
+                continue
+            newest = max(newest, st.st_mtime)
+            total += st.st_size
+    except OSError:
+        return 0.0, 0
+    return newest, total
+
+
+def source_signature(root: Path | str | None = None, *, use_cache: bool = True) -> str:
     """Version string for the source ON DISK at `root` (default: the repo).
 
     Measuring against the repo — not the importing module — is what makes
     staleness detectable even when the running code is a frozen snapshot.
+
+    Results are memoised against a (mtime, size) fingerprint so a watcher can
+    poll every couple of seconds without re-reading the whole tree. Pass
+    use_cache=False to force a fresh hash.
     """
     if root is None:
         root = repo_path(persist=False)
         if root is None:
             return _hash_dir(running_pkg_dir())
     root = Path(root)
-    return _hash_dir(root / "kern" if (root / "kern").exists() else root)
+    pkg = root / "kern" if (root / "kern").exists() else root
+    if not use_cache:
+        return _hash_dir(pkg)
+    fp = _dir_fingerprint(pkg)
+    key = str(pkg)
+    hit = _sig_cache.get(key)
+    if hit is not None and hit[0] == fp[0] and hit[1] == fp[1]:
+        return hit[2]
+    sig = _hash_dir(pkg)
+    _sig_cache[key] = (fp[0], fp[1], sig)
+    return sig
 
 
 def repo_version() -> str:

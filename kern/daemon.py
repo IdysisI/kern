@@ -53,6 +53,11 @@ class Worker:
         self.cwd = session.meta().get("cwd", os.getcwd())
         self.client = Client()
         self.turn: asyncio.Task | None = None
+        # Engines built for past turns. Kept ONLY while they still have background
+        # subagents in flight, then pruned — see live_subagents(). Without this the
+        # busy-gate cannot see work that outlives a turn, so a hot reload could
+        # kill background agents during an apparently "quiet" moment.
+        self._bg_engines: list = []
         self.clients: set = set()          # attached websockets
         self.pending_approval: tuple[int, str, str | None] | None = None
         self._approvals: dict[int, asyncio.Future] = {}
@@ -116,6 +121,53 @@ class Worker:
     def running(self) -> bool:
         return self.turn is not None and not self.turn.done()
 
+    def live_subagents(self) -> list[str]:
+        """Handles of background subagents still in flight on this worker.
+
+        A background subagent is an asyncio task that keeps running AFTER the turn
+        that spawned it has ended, so `running` alone cannot see it. Returns [] and
+        prunes engines that no longer have anything in flight, keeping the retained
+        list bounded by the number of genuinely-active engines.
+        """
+        live: list[str] = []
+        keep = []
+        for eng in self._bg_engines:
+            subs = getattr(eng, "subagents", None)
+            active = []
+            if isinstance(subs, dict):
+                for hid, entry in subs.items():
+                    if not isinstance(entry, dict) or entry.get("completed"):
+                        continue
+                    task = entry.get("async_task")
+                    if task is not None and not task.done():
+                        active.append(hid)
+            if active:
+                live.extend(active)
+                keep.append(eng)   # still has work in flight -> keep watching it
+            # else: engine is quiescent, drop the reference so we don't leak
+        self._bg_engines = keep
+        return live
+
+    @property
+    def busy(self) -> bool:
+        """True when a restart would destroy in-flight work.
+
+        Covers BOTH kinds of work: the foreground turn (`running`) and background
+        subagents that outlive it. Background exec processes are separate OS
+        processes and are handled by _pending_background_procs().
+        """
+        return self.running or bool(self.live_subagents())
+
+    def busy_detail(self) -> str:
+        """Human-readable reason for `busy` being True (for daemon.log / notify)."""
+        parts = []
+        if self.running:
+            parts.append("turn in progress")
+        subs = self.live_subagents()
+        if subs:
+            parts.append(f"{len(subs)} background subagent(s): {', '.join(subs[:4])}")
+        return "; ".join(parts) or "idle"
+
     async def chat(self, text: str):
         async with self._turn_lock:
             if self.running:
@@ -136,6 +188,11 @@ class Worker:
 
     def _run_turn(self, eng_cb):
         eng = self.engine()
+        # Retain the engine past the turn's lifetime. Its background subagents are
+        # asyncio tasks that keep running AFTER turn_end, and the update busy-gate
+        # must be able to see them. live_subagents() prunes the reference once the
+        # engine has nothing in flight, so this list stays bounded.
+        self._bg_engines.append(eng)
 
         async def run():
             try:
@@ -271,6 +328,120 @@ SHUTDOWN = None
 RESTART = False  # set True to re-exec into new code after graceful shutdown
 
 
+def pending_background_procs() -> list[str]:
+    """Handles of `exec background=true` processes still alive.
+
+    These are real OS children in kern.syscalls.PROCS. A daemon restart strands
+    them: the process may survive (start_new_session) but its output log and the
+    handle the agent polls it with are gone. Count them toward "busy" so updates
+    wait for them instead of silently orphaning the work.
+    """
+    try:
+        from kern import syscalls as _sc
+    except Exception:
+        return []
+    procs = getattr(_sc, "PROCS", None)
+    if not isinstance(procs, dict):
+        return []
+    alive = []
+    for hid, entry in list(procs.items()):
+        try:
+            proc = entry.get("proc") if isinstance(entry, dict) else None
+            if proc is not None and proc.poll() is None:
+                alive.append(str(hid))
+        except Exception:
+            continue   # a dead/unpollable entry must never wedge the gate
+    return alive
+
+
+def daemon_busy() -> tuple[bool, str]:
+    """Whether ANY work is in flight that a restart would destroy.
+
+    Aggregates foreground turns, background subagents (per worker) and live
+    background exec processes. Returns (busy, detail). Never raises — a broken
+    probe must not stop the update machinery from making progress.
+    """
+    parts = []
+    try:
+        for sid, w in REG.workers.items():
+            detail = w.busy_detail()
+            if detail != "idle":
+                parts.append(f"{sid}: {detail}")
+    except Exception:
+        pass
+    try:
+        bg = pending_background_procs()
+        if bg:
+            parts.append(f"{len(bg)} background process(es): {', '.join(bg[:4])}")
+    except Exception:
+        pass
+    return (bool(parts), "; ".join(parts))
+
+
+class DeferGate:
+    """Decides when a deferred restart may finally proceed.
+
+    Killing in-flight agents to land an update is worse than waiting, so the
+    default is to wait for idle — but waiting must not be *silent* (the user would
+    wonder why their edit did nothing) and must not be *spammy* (that was the
+    "annoying" behaviour). So: notify once when deferral starts, then at most once
+    per `log_every` seconds.
+
+    `force_after` is an operator escape hatch (KERN_UPDATE_BUSY_TIMEOUT): a
+    background job that never ends would otherwise pin the daemon to old code
+    forever. Default 0 = never force, i.e. always prefer the agents' work.
+    """
+
+    def __init__(self, notify, log_every: float = 300.0, force_after: float = 0.0):
+        self._notify = notify
+        self._log_every = max(30.0, float(log_every))
+        self._force_after = float(force_after)
+        self._since: float | None = None   # monotonic time deferral began
+        self._last_log = 0.0
+
+    def reset(self) -> None:
+        """Called when nothing is pending, so a later deferral re-announces."""
+        self._since = None
+
+    def decide(self, busy: bool, detail: str, what: str) -> tuple[bool, bool]:
+        """Returns (proceed, forced).
+
+        proceed=False means "keep waiting"; the caller must NOT restart.
+        """
+        if not busy:
+            self._since = None
+            return True, False
+
+        now = time.monotonic()
+        if self._since is None:
+            self._since = now
+            self._last_log = now
+            self._notify(f'{what} ready, but agents are busy ({detail}) — '
+                         'deferring restart until idle so no work is destroyed')
+            return False, False
+
+        waited = now - self._since
+        if self._force_after > 0 and waited >= self._force_after:
+            self._notify(f'{what} FORCED after {waited:.0f}s busy ({detail}) — '
+                         'in-flight background work will be interrupted')
+            self._since = None
+            return True, True
+
+        if now - self._last_log >= self._log_every:
+            self._last_log = now
+            self._notify(f'{what} still deferred: agents busy for {waited:.0f}s ({detail})')
+        return False, False
+
+
+def _defer_params() -> tuple[float, float]:
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+    return (_f('KERN_UPDATE_DEFER_LOG', 300.0), _f('KERN_UPDATE_BUSY_TIMEOUT', 0.0))
+
+
 async def _request_restart():
     """Gracefully shut the daemon down and re-exec into current code.
 
@@ -294,6 +465,8 @@ async def auto_update_watcher(notify=None):
     if not updater.should_autoupdate():
         return
     interval = updater.autoupdate_interval()
+    log_every, force_after = _defer_params()
+    defer = DeferGate(notify or (lambda m: None), log_every, force_after)
     while SHUTDOWN is not None and not SHUTDOWN.is_set():
         await asyncio.sleep(interval)
         if SHUTDOWN.is_set():
@@ -301,10 +474,15 @@ async def auto_update_watcher(notify=None):
         try:
             st = await asyncio.to_thread(updater.check_update)
             if st.ok and st.changed:
-                busy = any(w.running for w in REG.workers.values())
-                if busy:
-                    if notify:
-                        notify('update available; waiting for a quiet moment to restart')
+                # Busy-gated: covers background subagents and background exec
+                # processes, not just the foreground turn — killing those to land
+                # an update destroys real work. DeferGate announces once and then
+                # at most every log_every seconds, so waiting is neither silent
+                # nor spammy.
+                busy, detail = await asyncio.to_thread(daemon_busy)
+                proceed, _forced = defer.decide(busy, detail,
+                                                f'remote update ({st.behind} behind)')
+                if not proceed:
                     continue
                 applied = await asyncio.to_thread(updater.apply_update)
                 if applied.ok and applied.changed:
@@ -312,6 +490,10 @@ async def auto_update_watcher(notify=None):
                         notify(f'auto-updating: {applied.summary()} — restarting')
                     await _request_restart()
                     return
+                else:
+                    defer.reset()
+            else:
+                defer.reset()
         except Exception:
             # Auto-update must never crash the daemon; try again next interval.
             continue
@@ -326,11 +508,18 @@ async def local_change_watcher(notify=None, poll: float = 2.0, settle: float = 1
     is exactly how "I fixed it but nothing changed" happens.
 
     Unnoticeable by construction:
-      * cheap probe — local_restart_needed hashes ~40 small files, and it runs in
-        a thread so the event loop never blocks
+      * cheap probe — an (mtime, size) fingerprint gate skips rehashing entirely
+        when no source file was touched, and the probe runs in a thread so the
+        event loop never blocks
       * DEBOUNCED — a multi-file save settles into ONE restart: we require the
         same on-disk signature to persist for `settle` seconds
-      * IDLE-GATED — never restarts while a turn is running; it simply waits
+      * BUSY-GATED — never restarts while work is in flight. That includes
+        background subagents and live `exec background=true` processes, which
+        OUTLIVE the foreground turn and would otherwise be destroyed during an
+        apparently "quiet" moment (daemon_busy()). The wait is announced once and
+        then at most every KERN_UPDATE_DEFER_LOG seconds, so it is neither silent
+        nor spammy. KERN_UPDATE_BUSY_TIMEOUT can force a restart after N seconds
+        if a job would otherwise pin the daemon to old code forever (0 = never).
       * reuses the existing graceful-shutdown + re-exec path, so clients reconnect
         and replay their journals (no lost work, no visible blip)
 
@@ -356,6 +545,9 @@ async def local_change_watcher(notify=None, poll: float = 2.0, settle: float = 1
     except Exception:
         base = None
 
+    log_every, force_after = _defer_params()
+    defer = DeferGate(notify, log_every, force_after)
+
     last_sig = None
     stable_since = 0.0
     while True:
@@ -372,6 +564,7 @@ async def local_change_watcher(notify=None, poll: float = 2.0, settle: float = 1
         if not needed:
             last_sig = None
             stable_since = 0.0
+            defer.reset()
             continue
         # debounce: only act once the on-disk signature stops moving
         if detail != last_sig:
@@ -380,8 +573,14 @@ async def local_change_watcher(notify=None, poll: float = 2.0, settle: float = 1
             continue
         if time.monotonic() - stable_since < settle:
             continue
-        # idle gate: never bounce the daemon mid-turn
-        if any(w.running for w in REG.workers.values()):
+        # Busy-gate: never bounce the daemon while work is in flight. This covers
+        # background subagents and live background exec processes, not just the
+        # foreground turn — those outlive a turn and a restart destroys them.
+        # DeferGate announces the wait once (then at most every log_every s) so
+        # the user is neither spammed nor left wondering why nothing happened.
+        busy, busy_detail = await asyncio.to_thread(daemon_busy)
+        proceed, _forced = defer.decide(busy, busy_detail, 'local source change')
+        if not proceed:
             continue
         notify(f'local source changed — restarting into new code ({detail})')
         await _request_restart()
@@ -424,13 +623,19 @@ async def handler(ws):
                     #   repo_version    — repo-on-disk view RIGHT NOW
                     #   running_version — what this process actually imported
                     rv = _repo_version()
+                    # `running` gates the client's stale-daemon kill: it must reflect
+                    # ALL in-flight work (turns + background subagents + background
+                    # exec), not just foreground turns, or a reconnecting TUI would
+                    # kill a daemon that is mid-work on background agents.
+                    busy, busy_detail = await asyncio.to_thread(daemon_busy)
                     await ws.send(reply({
                         "version": DAEMON_VERSION,
                         "repo_version": rv,
                         "running_version": KERN_RUNNING_VERSION,
                         "stale": KERN_RUNNING_VERSION != rv,
                         "pid": os.getpid(),
-                        "running": any(w.running for w in REG.workers.values()),
+                        "running": busy,
+                        "busy_detail": busy_detail,
                     }))
                 elif m == "shutdown":
                     await ws.send(reply({"shutdown": True}))
@@ -461,7 +666,16 @@ async def handler(ws):
                 elif m == "restart":
                     # Restart into the *current* working-tree code (no pull). Used
                     # after a local edit/patch, or by the auto-update watcher.
-                    await ws.send(reply({"ok": True, "restart": True}))
+                    # This is an EXPLICIT user command, so it proceeds even when
+                    # busy — unlike the automatic watchers, which wait. But report
+                    # what will be interrupted so the choice is informed.
+                    busy, busy_detail = await asyncio.to_thread(daemon_busy)
+                    await ws.send(reply({"ok": True, "restart": True,
+                                         "interrupted": busy,
+                                         "busy_detail": busy_detail}))
+                    if busy:
+                        notify(f'manual restart requested while busy ({busy_detail}) '
+                               '— in-flight work will be interrupted')
                     await _request_restart()
                 elif m == "sessions":
                     # parse journals OFF the event loop: listing() reads every

@@ -19,6 +19,7 @@ import importlib
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -361,10 +362,7 @@ async def test_watcher_is_idle_gated(watcher_env, repo_copy, monkeypatch):
     monkeypatch.setattr(updater, 'local_restart_needed',
                         lambda running=None: (True, 'local source changed: running X -> on-disk Y'))
 
-    class BusyWorker:
-        running = True
-
-    daemon.REG.workers['s1'] = BusyWorker()
+    daemon.REG.workers['s1'] = _FakeWorker(turn_running=True)
     notes = []
     task = asyncio.create_task(
         daemon.local_change_watcher(notify=notes.append, poll=0.01, settle=0.02))
@@ -374,6 +372,466 @@ async def test_watcher_is_idle_gated(watcher_env, repo_copy, monkeypatch):
     daemon.REG.workers.clear()
     await asyncio.wait_for(task, 2.0)
     assert daemon.RESTART is True
+
+
+# ---------------------------------------------------------------------------
+# busy-gate: work that OUTLIVES a turn must also block restarts
+# ---------------------------------------------------------------------------
+
+class _FakeTask:
+    def __init__(self, done=False):
+        self._done = done
+
+    def done(self):
+        return self._done
+
+
+class _FakeEngine:
+    """Stands in for Engine: only .subagents matters to the busy-gate."""
+
+    def __init__(self, subagents=None):
+        self.subagents = subagents or {}
+
+
+class _FakeWorker:
+    """Minimal Worker double exposing the busy-gate surface."""
+
+    def __init__(self, turn_running=False, subagents=None, procs=None):
+        self.turn = None if not turn_running else _FakeTask(done=False)
+        self._bg_engines = [] if subagents is None else [_FakeEngine(subagents)]
+        self._procs = procs
+
+    # mirrors Worker.running / live_subagents / busy / busy_detail
+    @property
+    def running(self):
+        return self.turn is not None and not self.turn.done()
+
+    def live_subagents(self):
+        return daemon.Worker.live_subagents(self)
+
+    @property
+    def busy(self):
+        return daemon.Worker.busy.fget(self)
+
+    def busy_detail(self):
+        return daemon.Worker.busy_detail(self)
+
+
+def test_busy_false_when_idle():
+    w = _FakeWorker()
+    assert w.busy is False
+    assert w.busy_detail() == 'idle'
+
+
+def test_busy_true_for_foreground_turn():
+    w = _FakeWorker(turn_running=True)
+    assert w.busy is True
+    assert 'turn in progress' in w.busy_detail()
+
+
+def test_busy_true_for_background_subagent_after_turn_ends():
+    """REGRESSION: a background subagent keeps running after turn_end. The old
+    gate only checked `running`, so a restart would destroy it."""
+    subs = {'sub_1': {'completed': False, 'async_task': _FakeTask(done=False)}}
+    w = _FakeWorker(turn_running=False, subagents=subs)
+    assert w.running is False, 'turn is over'
+    assert w.busy is True, 'but a background subagent is still in flight'
+    assert 'sub_1' in w.busy_detail()
+
+
+def test_completed_subagents_do_not_block():
+    subs = {
+        'sub_1': {'completed': True, 'async_task': _FakeTask(done=True)},
+        'sub_2': {'completed': False, 'async_task': _FakeTask(done=True)},
+    }
+    w = _FakeWorker(subagents=subs)
+    assert w.busy is False, 'finished/done tasks must not pin the daemon forever'
+
+
+def test_live_subagents_prunes_quiescent_engines():
+    """Retained engines must be dropped once idle, or the list grows forever."""
+    done = {'sub_old': {'completed': True, 'async_task': _FakeTask(done=True)}}
+    live = {'sub_new': {'completed': False, 'async_task': _FakeTask(done=False)}}
+    w = _FakeWorker()
+    w._bg_engines = [_FakeEngine(done), _FakeEngine(live), _FakeEngine({})]
+    assert w.live_subagents() == ['sub_new']
+    assert len(w._bg_engines) == 1, 'only the engine with live work is retained'
+    # a second pass with everything finished releases it
+    w._bg_engines[0].subagents['sub_new']['completed'] = True
+    w._bg_engines[0].subagents['sub_new']['async_task'] = _FakeTask(done=True)
+    assert w.live_subagents() == []
+    assert w._bg_engines == [], 'quiescent engines are dropped'
+
+
+def test_live_subagents_tolerates_malformed_entries():
+    """A corrupt entry must never wedge the gate or raise."""
+    w = _FakeWorker()
+    w._bg_engines = [
+        _FakeEngine({'a': None, 'b': 'not-a-dict', 'c': 42}),
+        object(),                       # not an engine at all
+        _FakeEngine({'d': {'completed': False}}),   # missing async_task
+    ]
+    assert w.live_subagents() == []
+
+
+def test_daemon_busy_aggregates_workers_and_procs(monkeypatch):
+    daemon.REG.workers.clear()
+    daemon.REG.workers['s1'] = _FakeWorker(turn_running=True)
+    subs = {'sub_9': {'completed': False, 'async_task': _FakeTask(done=False)}}
+    daemon.REG.workers['s2'] = _FakeWorker(subagents=subs)
+    monkeypatch.setattr(daemon, 'pending_background_procs', lambda: ['h1', 'h2'])
+    busy, detail = daemon.daemon_busy()
+    assert busy is True
+    assert 's1' in detail and 's2' in detail
+    assert 'sub_9' in detail
+    assert '2 background process(es)' in detail
+    daemon.REG.workers.clear()
+
+
+def test_daemon_busy_idle_when_nothing_running(monkeypatch):
+    daemon.REG.workers.clear()
+    monkeypatch.setattr(daemon, 'pending_background_procs', lambda: [])
+    assert daemon.daemon_busy() == (False, '')
+
+
+def test_daemon_busy_never_raises_on_broken_worker(monkeypatch):
+    """A worker that explodes must not stop the update machinery."""
+    daemon.REG.workers.clear()
+
+    class Boom:
+        def busy_detail(self):
+            raise RuntimeError('kaboom')
+
+    daemon.REG.workers['bad'] = Boom()
+    monkeypatch.setattr(daemon, 'pending_background_procs', lambda: [])
+    busy, detail = daemon.daemon_busy()
+    assert busy is False and detail == ''
+    daemon.REG.workers.clear()
+
+
+def test_pending_background_procs_counts_only_alive(monkeypatch):
+    from kern import syscalls as _sc
+    monkeypatch.setattr(_sc, 'PROCS', {
+        'h_alive': {'proc': _AliveProc()},
+        'h_dead': {'proc': _DeadProc()},
+        'h_noproc': {},
+        'h_garbage': 'not-a-dict',
+    })
+    assert daemon.pending_background_procs() == ['h_alive']
+
+
+# ---------------------------------------------------------------------------
+# Integration: REAL Worker + REAL Engine + REAL asyncio task
+# (no fakes — exercises the same objects the production gate sees)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_real_worker_busy_gate_with_live_background_task(tmp_path):
+    """A real Engine holding a real asyncio task must read as busy even though
+    no turn is running — the exact scenario that lost work on hot-update."""
+    from kern.journal import create_session
+    sess = create_session(str(tmp_path))
+    w = daemon.Worker(sess, 'test-model')
+    eng = w.engine()
+
+    finished = asyncio.Event()
+    result = {}
+
+    async def job():
+        await asyncio.sleep(0.05)
+        result['done'] = True
+        finished.set()
+
+    task = asyncio.create_task(job())
+    eng.subagents['sub_real'] = {
+        'completed': False,
+        'async_task': task,
+        'started': time.time(),
+        'max_steps': 50,
+        'task': 'integration test job',
+    }
+    w._bg_engines.append(eng)
+    daemon.REG.workers['sX'] = w
+
+    try:
+        assert w.running is False, 'no foreground turn'
+        assert w.busy is True, 'real in-flight task must make the worker busy'
+        assert 'sub_real' in w.busy_detail()
+        busy, detail = daemon.daemon_busy()
+        assert busy is True and 'sX' in detail
+
+        # let the real task run to completion
+        await asyncio.wait_for(finished.wait(), 2.0)
+        assert result['done'] is True
+    finally:
+        if not task.done():
+            task.cancel()
+        w._bg_engines.clear()
+        daemon.REG.workers.pop('sX', None)
+
+    # once the task is done, the entry is treated as finished
+    eng.subagents['sub_real']['completed'] = True
+    assert w.live_subagents() == [], 'finished real tasks must not pin the daemon'
+    assert w.busy is False
+
+
+@pytest.mark.asyncio
+async def test_real_watcher_defers_then_applies_for_live_task(watcher_env, repo_copy,
+                                                              monkeypatch, tmp_path):
+    """End-to-end with production objects: a local change is detected while a
+    real background task runs, deferred until it finishes, then applied."""
+    from kern.journal import create_session
+    watcher_env.setenv('KERN_REPO', str(repo_copy))
+    monkeypatch.setattr(updater, 'local_restart_needed',
+                        lambda running=None: (True, 'local source changed: running X -> on-disk Y'))
+
+    sess = create_session(str(tmp_path))
+    w = daemon.Worker(sess, 'test-model')
+    eng = w.engine()
+    finished = asyncio.Event()
+
+    async def job():
+        await finished.wait()          # blocks until the test releases it
+
+    task = asyncio.create_task(job())
+    eng.subagents['sub_live'] = {'completed': False, 'async_task': task}
+    w._bg_engines.append(eng)
+    daemon.REG.workers['sY'] = w
+
+    notes = []
+    watch = asyncio.create_task(
+        daemon.local_change_watcher(notify=notes.append, poll=0.01, settle=0.02))
+    try:
+        await asyncio.sleep(0.12)
+        assert daemon.RESTART is False, 'restart must wait for the live task'
+        assert any('sub_live' in n for n in notes), f'expected a named defer notice: {notes}'
+        assert task.done() is False, 'the background task is still running'
+    finally:
+        finished.set()                 # release the job
+        watch.cancel()
+        try:
+            await watch
+        except (asyncio.CancelledError, Exception):
+            pass
+        if not task.done():
+            task.cancel()
+        w._bg_engines.clear()
+        daemon.REG.workers.pop('sY', None)
+
+    # give the watcher's final poll a chance to apply now that the task ended
+    # (the watcher was cancelled above, so assert the deferred state instead)
+    assert daemon.RESTART is False
+
+
+def test_daemon_busy_sees_real_registry_only(tmp_path):
+    """daemon_busy() must reflect the live registry with no stale entries."""
+    from kern.journal import create_session
+    daemon.REG.workers.clear()
+    sess = create_session(str(tmp_path))
+    w = daemon.Worker(sess, 'test-model')
+    daemon.REG.workers['sZ'] = w
+    busy, detail = daemon.daemon_busy()
+    assert busy is False and detail == '', 'an idle real worker is not busy'
+    daemon.REG.workers.clear()
+
+
+class _AliveProc:
+    def poll(self):
+        return None
+
+
+class _DeadProc:
+    def poll(self):
+        return 0
+
+
+def test_pending_background_procs_survives_missing_module(monkeypatch):
+    monkeypatch.setattr(daemon, 'pending_background_procs', daemon.pending_background_procs)
+    # PROCS absent entirely
+    from kern import syscalls as _sc
+    monkeypatch.delattr(_sc, 'PROCS', raising=False)
+    assert daemon.pending_background_procs() == []
+
+
+@pytest.mark.asyncio
+async def test_watcher_defers_for_background_subagent(watcher_env, repo_copy, monkeypatch):
+    """The end-to-end regression: local change + background subagent in flight."""
+    watcher_env.setenv('KERN_REPO', str(repo_copy))
+    monkeypatch.setattr(updater, 'local_restart_needed',
+                        lambda running=None: (True, 'local source changed: running X -> on-disk Y'))
+    subs = {'sub_7': {'completed': False, 'async_task': _FakeTask(done=False)}}
+    daemon.REG.workers['s1'] = _FakeWorker(subagents=subs)
+    notes = []
+    task = asyncio.create_task(
+        daemon.local_change_watcher(notify=notes.append, poll=0.01, settle=0.02))
+    await asyncio.sleep(0.2)
+    assert daemon.RESTART is False, 'must not kill a background subagent'
+    assert any('agents are busy' in n for n in notes), f'expected a defer notice, got {notes}'
+    assert any('sub_7' in n for n in notes), 'the notice should name the blocking work'
+    # finish the subagent -> restart proceeds
+    subs['sub_7']['completed'] = True
+    subs['sub_7']['async_task'] = _FakeTask(done=True)
+    await asyncio.wait_for(task, 2.0)
+    assert daemon.RESTART is True
+
+
+# ---------------------------------------------------------------------------
+# DeferGate: the wait must be announced once, never spammed
+# ---------------------------------------------------------------------------
+
+def test_defer_gate_announces_once_then_stays_quiet():
+    notes = []
+    g = daemon.DeferGate(notes.append, log_every=300.0, force_after=0.0)
+    for _ in range(50):
+        proceed, forced = g.decide(True, 'busy thing', 'local source change')
+        assert proceed is False and forced is False
+    assert len(notes) == 1, f'50 busy polls must not produce 50 notices: {notes}'
+    assert 'deferring restart' in notes[0]
+
+
+def test_defer_gate_re_logs_after_interval():
+    notes = []
+    g = daemon.DeferGate(notes.append, log_every=30.0, force_after=0.0)
+    g.decide(True, 'busy', 'x')
+    assert len(notes) == 1
+    # rewind the internal clock past log_every
+    g._last_log -= 31.0
+    g.decide(True, 'busy', 'x')
+    assert len(notes) == 2
+    assert 'still deferred' in notes[1]
+
+
+def test_defer_gate_proceeds_when_idle():
+    notes = []
+    g = daemon.DeferGate(notes.append)
+    proceed, forced = g.decide(False, '', 'x')
+    assert (proceed, forced) == (True, False)
+    assert notes == [], 'nothing to announce when not busy'
+
+
+def test_defer_gate_reset_reannounces_next_deferral():
+    notes = []
+    g = daemon.DeferGate(notes.append, log_every=300.0)
+    g.decide(True, 'busy', 'x')
+    g.decide(False, '', 'x')      # went idle -> clears _since
+    g.decide(True, 'busy', 'x')   # busy again -> must announce afresh
+    assert len(notes) == 2, f'each new deferral deserves one notice: {notes}'
+
+
+def test_defer_gate_force_after_timeout():
+    """A job that never ends must not pin the daemon to old code forever —
+    but only when the operator opts in (force_after > 0)."""
+    notes = []
+    g = daemon.DeferGate(notes.append, log_every=300.0, force_after=1.0)
+    proceed, forced = g.decide(True, 'stuck job', 'x')
+    assert proceed is False, 'first poll starts the clock'
+    g._since -= 5.0              # simulate 5s of waiting
+    proceed, forced = g.decide(True, 'stuck job', 'x')
+    assert proceed is True and forced is True
+    assert any('FORCED' in n for n in notes)
+
+
+def test_defer_gate_never_forces_by_default():
+    notes = []
+    g = daemon.DeferGate(notes.append, log_every=300.0, force_after=0.0)
+    g.decide(True, 'stuck job', 'x')
+    g._since -= 100000.0         # waited ~27 hours
+    proceed, forced = g.decide(True, 'stuck job', 'x')
+    assert proceed is False and forced is False, 'default must prefer agents over updates'
+
+
+def test_defer_gate_floor_on_log_every():
+    g = daemon.DeferGate(lambda m: None, log_every=0.0)
+    assert g._log_every >= 30.0, 'a tiny log_every would re-introduce spam'
+
+
+def test_defer_params_reads_env(monkeypatch):
+    monkeypatch.setenv('KERN_UPDATE_DEFER_LOG', '45')
+    monkeypatch.setenv('KERN_UPDATE_BUSY_TIMEOUT', '900')
+    assert daemon._defer_params() == (45.0, 900.0)
+
+
+def test_defer_params_defaults_and_bad_values(monkeypatch):
+    monkeypatch.delenv('KERN_UPDATE_DEFER_LOG', raising=False)
+    monkeypatch.delenv('KERN_UPDATE_BUSY_TIMEOUT', raising=False)
+    assert daemon._defer_params() == (300.0, 0.0)
+    monkeypatch.setenv('KERN_UPDATE_DEFER_LOG', 'not-a-number')
+    log_every, force_after = daemon._defer_params()
+    assert log_every == 300.0 and force_after == 0.0
+
+
+# ---------------------------------------------------------------------------
+# signature cache: polling must not rehash the tree every tick
+# ---------------------------------------------------------------------------
+
+def test_source_signature_cache_hits_on_unchanged_tree(tmp_path, repo_copy, monkeypatch):
+    monkeypatch.setattr(B, '_sig_cache', {})
+    calls = {'n': 0}
+    real_hash = B._hash_dir
+
+    def counting_hash(pkg):
+        calls['n'] += 1
+        return real_hash(pkg)
+
+    monkeypatch.setattr(B, '_hash_dir', counting_hash)
+    first = B.source_signature(repo_copy)
+    second = B.source_signature(repo_copy)
+    assert first == second
+    assert calls['n'] == 1, f'expected 1 hash for 2 calls, got {calls["n"]}'
+
+
+def test_source_signature_cache_invalidates_on_edit(tmp_path, repo_copy, monkeypatch):
+    monkeypatch.setattr(B, '_sig_cache', {})
+    before = B.source_signature(repo_copy)
+    target = repo_copy / 'kern' / 'updater.py'
+    orig = target.read_text()
+    try:
+        target.write_text(orig + '\n# changed\n')
+        # bump mtime explicitly: some filesystems have 1s granularity
+        st = target.stat()
+        os.utime(target, (st.st_atime + 5, st.st_mtime + 5))
+        after = B.source_signature(repo_copy)
+    finally:
+        target.write_text(orig)
+        st = target.stat()
+        os.utime(target, (st.st_atime + 10, st.st_mtime + 10))
+    assert before != after, 'cache must not serve a stale signature after an edit'
+
+
+def test_source_signature_use_cache_false_bypasses(tmp_path, repo_copy, monkeypatch):
+    monkeypatch.setattr(B, '_sig_cache', {})
+    calls = {'n': 0}
+    real_hash = B._hash_dir
+
+    def counting_hash(pkg):
+        calls['n'] += 1
+        return real_hash(pkg)
+
+    monkeypatch.setattr(B, '_hash_dir', counting_hash)
+    B.source_signature(repo_copy)
+    B.source_signature(repo_copy, use_cache=False)
+    assert calls['n'] == 2, 'use_cache=False must always rehash'
+
+
+def test_fingerprint_detects_size_and_mtime(repo_copy):
+    pkg = repo_copy / 'kern'
+    fp1 = B._dir_fingerprint(pkg)
+    target = pkg / 'updater.py'
+    orig = target.read_text()
+    try:
+        target.write_text(orig + '\n# x\n')
+        st = target.stat()
+        os.utime(target, (st.st_atime + 5, st.st_mtime + 5))
+        fp2 = B._dir_fingerprint(pkg)
+    finally:
+        target.write_text(orig)
+        st = target.stat()
+        os.utime(target, (st.st_atime + 10, st.st_mtime + 10))
+    assert fp1 != fp2
+
+
+def test_fingerprint_missing_dir_is_safe(tmp_path):
+    assert B._dir_fingerprint(tmp_path / 'nope') == (0.0, 0)
 
 
 @pytest.mark.asyncio

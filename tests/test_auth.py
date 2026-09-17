@@ -160,8 +160,11 @@ def test_ensure_git_credentials_requires_login(home):
 
 
 def test_git_env_suppresses_prompts_and_injects_credentials(home):
+    # NOTE: base_env={} keeps this hermetic. Kern injects GIT_CONFIG_* into tool
+    # environments for authenticated git ops, and git_env(None) copies os.environ
+    # — so asserting on ambient env would make the test depend on the runner.
     # Without token: prompts are suppressed, no git config injected
-    env_no_tok = auth.git_env()
+    env_no_tok = auth.git_env(base_env={})
     assert env_no_tok['GIT_TERMINAL_PROMPT'] == '0'
     assert env_no_tok['GIT_ASKPASS'] == 'true'
     assert env_no_tok['SSH_ASKPASS'] == 'true'
@@ -169,7 +172,7 @@ def test_git_env_suppresses_prompts_and_injects_credentials(home):
 
     # With token stored: injects in-memory ephemeral git helper
     auth.store_token('gho_secret123', login='octocat')
-    env = auth.git_env()
+    env = auth.git_env(base_env={})
     assert env['GIT_TERMINAL_PROMPT'] == '0'
     assert env['GIT_ASKPASS'] == 'true'
     assert env['SSH_ASKPASS'] == 'true'
@@ -179,3 +182,46 @@ def test_git_env_suppresses_prompts_and_injects_credentials(home):
     assert env['GIT_CONFIG_KEY_1'] == 'credential.https://github.com.useHttpPath'
     assert env['GIT_CONFIG_KEY_2'] == 'core.askPass'
     assert env['GIT_CONFIG_VALUE_2'] == ''
+
+
+def test_git_env_appends_to_existing_config_count(home):
+    """When the caller's env already carries GIT_CONFIG_* (Kern does this for
+    authenticated pushes), the injection must append, not clobber."""
+    auth.store_token('gho_secret123', login='octocat')
+    ambient = {
+        'GIT_CONFIG_COUNT': '2',
+        'GIT_CONFIG_KEY_0': 'url.https://github.com/.insteadOf',
+        'GIT_CONFIG_VALUE_0': 'git@github.com:',
+        'GIT_CONFIG_KEY_1': 'user.name',
+        'GIT_CONFIG_VALUE_1': 'marty',
+    }
+    env = auth.git_env(base_env=dict(ambient))
+    # ambient KEY/VALUE entries survive untouched (COUNT is legitimately updated)
+    for k, v in ambient.items():
+        if k == 'GIT_CONFIG_COUNT':
+            continue
+        assert env[k] == v, f'ambient {k} was clobbered'
+    # Kern's entries are appended at indices 2..4 and the count updated
+    assert env['GIT_CONFIG_COUNT'] == '5'
+    assert env['GIT_CONFIG_KEY_2'] == 'credential.https://github.com.helper'
+    assert 'gho_secret123' in env['GIT_CONFIG_VALUE_2']
+    assert env['GIT_CONFIG_KEY_3'] == 'credential.https://github.com.useHttpPath'
+    assert env['GIT_CONFIG_KEY_4'] == 'core.askPass'
+
+
+def test_git_env_survives_garbage_config_count(home):
+    """A non-integer GIT_CONFIG_COUNT must fall back to 0, not raise."""
+    auth.store_token('gho_secret123', login='octocat')
+    env = auth.git_env(base_env={'GIT_CONFIG_COUNT': 'not-a-number'})
+    assert env['GIT_CONFIG_COUNT'] == '3'
+    assert env['GIT_CONFIG_KEY_0'] == 'credential.https://github.com.helper'
+
+
+def test_git_env_does_not_mutate_caller_dict(home):
+    """base_env is copied — callers must not see Kern's injections leak back."""
+    auth.store_token('gho_secret123', login='octocat')
+    ambient = {'PATH': '/usr/bin'}
+    snapshot = dict(ambient)
+    env = auth.git_env(base_env=ambient)
+    assert ambient == snapshot, 'git_env mutated the caller-supplied dict'
+    assert env is not ambient
