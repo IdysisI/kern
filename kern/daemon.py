@@ -113,9 +113,19 @@ class Worker:
 
     # ---- engine -------------------------------------------------------------
 
+    def set_model(self, model: str):
+        """Change the model and journal it so a hot-reload resume can recover
+        the right model instead of falling back to the default."""
+        self.model = model
+        self.session.emit("meta", model=model)
+
     def engine(self) -> Engine:
-        return Engine(self.client, self.model, self.session, self.cwd,
-                      approve=self.approve, stream_cb=self.stream_cb)
+        eng = getattr(self, "_eng", None)
+        if eng is None or eng.session is not self.session:
+            eng = Engine(self.client, self.model, self.session, self.cwd,
+                         approve=self.approve, stream_cb=self.stream_cb)
+            self._eng = eng
+        return eng
 
     @property
     def running(self) -> bool:
@@ -216,6 +226,27 @@ class Worker:
             except asyncio.CancelledError:
                 pass
 
+    async def abort(self):
+        """Restart-time cancellation: stop the turn but do NOT journal
+        `turn_end`, on purpose. The turn stays open in the session journal so
+        the freshly exec'd daemon's boot_resume() picks it straight back up
+        ("reload mid-turn, resume like nothing happened").
+
+        Contrast with interrupt(): that one closes the turn
+        (`turn_end interrupted`) because the USER asked to stop; redo/undo
+        semantics rely on that marker staying put.
+        """
+        if not self.running:
+            return
+        eng = getattr(self, '_eng', None)
+        if eng is not None:
+            eng.aborting = True
+        self.turn.cancel()
+        try:
+            await self.turn
+        except asyncio.CancelledError:
+            pass
+
     # ---- journal mutations (the daemon owns the session; clients ask) -------
 
     async def undo(self) -> dict:
@@ -253,19 +284,23 @@ class Registry:
     def ensure(self, sid: str, model: str | None = None) -> Worker:
         if sid in self.workers:
             w = self.workers[sid]
-            if model:
-                w.model = model
+            if model and model != w.model:
+                w.set_model(model)
             return w
         sess = Session(sid)
         if not sess.log.is_file():
             raise ValueError('unknown session')
-        w = Worker(sess, model or os.environ.get("KERN_MODEL", "gemini-3.8-flash-api"))
+        # model from the journal beats the default (hot reload recovers it)
+        journaled = sess.meta().get("model")
+        chosen = model or journaled or os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
+        w = Worker(sess, chosen)
         self.workers[sid] = w
         return w
 
     def new(self, cwd: str, model: str | None = None) -> Worker:
-        sess = create_session(cwd=cwd)
-        w = Worker(sess, model or os.environ.get("KERN_MODEL", "gemini-3.8-flash-api"))
+        model = model or os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
+        sess = create_session(cwd=cwd, model=model)
+        w = Worker(sess, model)
         self.workers[sess.id] = w
         return w
 
@@ -354,27 +389,81 @@ def pending_background_procs() -> list[str]:
     return alive
 
 
-def daemon_busy() -> tuple[bool, str]:
+async def boot_resume() -> list[str]:
+    """At daemon boot, re-open turns that were left dangling by a hot reload.
+
+    `abort()` deliberately does NOT journal `turn_end`, so after the execv the
+    session journal still has a user message with no turn_end — exactly the
+    shape `Worker.resume()` already handles for daemon crashes. This helper
+    enumerates every session with an open turn and spawns a resume task for
+    each, so a mid-turn reload "resumes like nothing happened".
+
+    Must be called from inside the running asyncio loop (web.run_server).
+    Returns the list of session ids that were resumed (test-visible).
+    """
+    tasks = []
+    for sid in list_sessions():
+        try:
+            sess = Session(sid)
+            if not sess.turn_is_open():
+                continue
+            meta = sess.meta()
+            cwd = meta.get("cwd") or ""
+            if cwd and not os.path.isdir(cwd):
+                continue                     # project gone; don't resurrect it
+            model = meta.get("model")
+            worker = REG.ensure(sid, model=model)
+            tasks.append((sid, asyncio.create_task(worker.resume())))
+            print(f"kern: boot_resume: session {sid} turn open -> resuming (model={model})", flush=True)
+        except Exception as e:
+            print(f"kern: boot_resume: {sid} failed: {e!r}", flush=True)
+    resumed = []
+    if tasks:
+        results = await asyncio.gather(*(t for _, t in tasks), return_exceptions=True)
+        for (sid, _), ok in zip(tasks, results):
+            if ok is True:
+                resumed.append(sid)
+            else:
+                print(f"kern: boot_resume: {sid} resume failed: {ok!r}", flush=True)
+    return resumed
+
+
+def daemon_busy(turn_only: bool = False) -> tuple[bool, str]:
     """Whether ANY work is in flight that a restart would destroy.
 
     Aggregates foreground turns, background subagents (per worker) and live
     background exec processes. Returns (busy, detail). Never raises — a broken
     probe must not stop the update machinery from making progress.
+
+    turn_only=True ignores background work: a foreground turn is RESUMABLE
+    across a restart (abort() leaves it open in the journal and boot_resume()
+    re-spawns it), so with KERN_RESTART_NOW=1 a busy turn no longer defers.
+    Background subagents and exec processes cannot be resumed, so they keep
+    gating even in restart-now mode.
     """
     parts = []
     try:
         for sid, w in REG.workers.items():
             detail = w.busy_detail()
-            if detail != "idle":
-                parts.append(f"{sid}: {detail}")
+            if detail == "idle":
+                continue
+            if turn_only:
+                # busy_detail starts with 'turn in progress' for foreground work
+                if detail.startswith("turn in progress") and not getattr(w, "running", False):
+                    continue
+                if detail.startswith("turn in progress"):
+                    parts.append(f"{sid}: {detail}")
+                continue
+            parts.append(f"{sid}: {detail}")
     except Exception:
         pass
-    try:
-        bg = pending_background_procs()
-        if bg:
-            parts.append(f"{len(bg)} background process(es): {', '.join(bg[:4])}")
-    except Exception:
-        pass
+    if not turn_only:
+        try:
+            bg = pending_background_procs()
+            if bg:
+                parts.append(f"{len(bg)} background process(es): {', '.join(bg[:4])}")
+        except Exception:
+            pass
     return (bool(parts), "; ".join(parts))
 
 
@@ -393,6 +482,7 @@ class DeferGate:
     """
 
     def __init__(self, notify, log_every: float = 300.0, force_after: float = 0.0):
+        self.restart_now = bool(os.environ.get("KERN_RESTART_NOW"))
         self._notify = notify
         self._log_every = max(30.0, float(log_every))
         self._force_after = float(force_after)
@@ -407,7 +497,18 @@ class DeferGate:
         """Returns (proceed, forced).
 
         proceed=False means "keep waiting"; the caller must NOT restart.
+
+        restart_now (KERN_RESTART_NOW=1): the fast path. A mid-turn reload
+        is safe because boot_resume() re-opens the turn from the journal and
+        the pager flags dangling tool calls as uncertain — so busy DOES NOT
+        block; the restart happens immediately, work is resumed not lost.
         """
+        if self.restart_now:
+            self._since = None
+            if busy:
+                self._notify(f'{what}: reloading NOW mid-turn ({detail}) — '
+                             'turn will auto-resume after restart')
+            return True, False
         if not busy:
             self._since = None
             return True, False
@@ -524,6 +625,13 @@ async def local_change_watcher(notify=None, poll: float = 2.0, settle: float = 1
         and replay their journals (no lost work, no visible blip)
 
     Opt out with KERN_LOCAL_RELOAD=0.
+
+    KERN_RESTART_NOW=1 switches the gate to the developer's dream: reload
+    IMMEDIATELY even mid-turn. Safe because abort() leaves the turn open in
+    the journal and boot_resume() picks it straight back up on the next boot —
+    work is resumed, not lost. Background exec processes and background
+    subagents still wait (they cannot be resumed); only the foreground turn
+    reloads instantly.
     """
     if not updater.should_watch_local():
         return
@@ -767,7 +875,7 @@ async def handler(ws):
                 elif m == "model":
                     new_model = msg.get("model")
                     if new_model:
-                        worker.model = new_model
+                        worker.set_model(new_model)
                     await ws.send(reply({"model": worker.model}))
                 elif m == "undo":
                     res = await worker.undo()

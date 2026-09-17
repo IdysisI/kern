@@ -293,13 +293,14 @@ class Session:
         return str(p)
 
 
-def create_session(cwd: str | None = None, parent: str | None = None) -> Session:
+def create_session(cwd: str | None = None, parent: str | None = None,
+                   model: str | None = None) -> Session:
     cwd = str(Path(cwd or os.getcwd()).resolve())
     if not Path(cwd).is_dir():
         raise ValueError('session working directory must exist')
     sid = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(12).hex()
     s = Session(sid)
-    s.emit("meta", cwd=cwd or os.getcwd(), parent=parent)
+    s.emit("meta", cwd=cwd or os.getcwd(), parent=parent, model=model)
     return s
 
 

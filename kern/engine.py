@@ -252,6 +252,7 @@ class Engine:
         # re-executing, so a model that re-reads a file it already has pays ~zero for it.
         # Any successful mutating call (write/edit/exec/py side effect) clears it, because
         # the on-disk/on-system truth may have changed.
+        self.aborting = False   # daemon hot-reload: suppress turn_end so the turn stays resumable
         self._ro_cache: dict = {}
         self.subagents: dict[str, dict] = runtime["subagents"]
         self._approve_lock = asyncio.Lock()
@@ -862,7 +863,11 @@ class Engine:
             reason = self.stop_reason
             return reply
         except asyncio.CancelledError:
-            reason = "interrupted"
+            # abort() (daemon hot-reload) suppresses the turn_end marker so the
+            # turn stays OPEN and is auto-resumed by the next daemon boot. A
+            # normal user interrupt must still close the turn.
+            if not getattr(self, "aborting", False):
+                reason = "interrupted"
             raise
         except Exception:
             reason = "error"
@@ -878,10 +883,11 @@ class Engine:
             # per-turn request accounting (the client counts every paid call)
             self.requests = getattr(self.client, "requests", 0) - self._req0
             self.cost.model_calls = self.requests   # authoritative sync (kills "0 requests" lie)
-            try:
-                self.session.emit("turn_end", reason=reason)
-            except Exception:
-                pass   # a dead journal must not mask the real error
+            if not getattr(self, "aborting", False):
+                try:
+                    self.session.emit("turn_end", reason=reason)
+                except Exception:
+                    pass   # a dead journal must not mask the real error
 
     def _build_facts(self, events):
         from .context import evidence_block

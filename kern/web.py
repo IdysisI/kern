@@ -68,12 +68,30 @@ async def run_server():
         async with serve(safe_handler,daemon.HOST,daemon.PORT,process_request=process_request,
                          max_size=32*1024*1024, ping_interval=20):
             print(f'Kern: http://{daemon.HOST}:{daemon.PORT} — TUI and browser share persistent sessions',flush=True)
+            # restore in-flight work from before a hot reload: any session whose
+            # journal shows an open turn (user msg, no turn_end) gets its engine
+            # spun back up and the turn resumed from where it left off.
+            try:
+                resumed = await daemon.boot_resume()
+                if resumed:
+                    print(f'kern: resumed {len(resumed)} in-flight turn(s): '
+                          + ", ".join(resumed[:6]), flush=True)
+            except Exception as e:
+                print(f'kern: boot_resume failed (non-fatal): {e!r}', flush=True)
             await daemon.SHUTDOWN.wait()
     finally:
         watcher.cancel()
         local_watcher.cancel()
+        # If we are restarting (hot reload), abort() — it cancels the turn
+        # WITHOUT journaling turn_end, leaving it open so the fresh process's
+        # boot_resume() picks it back up. A plain shutdown uses interrupt()
+        # which closes the turn so it is not resurrected.
+        is_restart = daemon.RESTART
         for worker in daemon.REG.workers.values():
-            await worker.interrupt()
+            if is_restart:
+                await worker.abort()
+            else:
+                await worker.interrupt()
             runtime = getattr(worker.session,'_runtime',{})
             for entry in runtime.get('subagents',{}).values():
                 task = entry.get('async_task')
