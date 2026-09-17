@@ -23,6 +23,41 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 
 import httpx
+import ipaddress
+
+# Bypass proxies for private / loopback / Tailscale (CGNAT 100.64.0.0/10) targets.
+# A shell proxy env var (e.g. a GNOME/system proxy or stray ALL_PROXY) makes httpx
+# route these through a proxy that can't reach the tailnet -> stage=transport
+# ConnectError, while curl (which ignores those env vars) still works. We only honor
+# proxy env vars for public internet hosts.
+_PRIVATE_NETS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),   # Tailscale / CGNAT
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+)
+
+def _is_private_host(host: str) -> bool:
+    h = (host or "").strip().strip("[]").lower()
+    if h in ("localhost", ""):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return h.endswith(".local") or "." not in h   # bare hostnames are local
+    return any(ip in n for n in _PRIVATE_NETS)
+
+def _client_kwargs(base_url: str, timeout: float) -> dict:
+    """trust_env=False for private targets so proxy env vars can't blackhole them;
+    trust_env=True for public hosts so a needed corporate proxy still works."""
+    from urllib.parse import urlparse
+    host = urlparse(base_url).hostname or ""
+    return {"timeout": timeout, "trust_env": not _is_private_host(host)}
 
 BASE_URL = os.environ.get("KERN_BASE_URL", "http://127.0.0.1:8790")
 KERN_HOME = os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern"))
@@ -134,7 +169,7 @@ class Client:
         self.requests = 0          # EVERY paid API call, ever, on this client
 
     async def list_models(self) -> list[dict]:
-        async with httpx.AsyncClient(timeout=15) as c:
+        async with httpx.AsyncClient(**_client_kwargs(self.base_url, 15)) as c:
             r = await c.get(f"{self.base_url}/v1/models", headers={
                 "Authorization": "Bearer " + os.environ.get("KERN_API_KEY", "kern")})
             r.raise_for_status()
@@ -274,7 +309,7 @@ class Client:
         pending: dict[int, dict] = {}   # index -> partial tool call
         finished = False
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as c:
+            async with httpx.AsyncClient(**_client_kwargs(self.base_url, self.timeout)) as c:
                 async with c.stream("POST", f"{self.base_url}/v1/chat/completions",
                                     headers=headers, json=body) as r:
                     if r.status_code != 200:
@@ -347,7 +382,7 @@ class Client:
         finished = False
         usage = {}
         try:
-            async with httpx.AsyncClient(timeout=self.timeout) as c:
+            async with httpx.AsyncClient(**_client_kwargs(self.base_url, self.timeout)) as c:
                 async with c.stream("POST", f"{self.base_url}/v1/messages",
                                     headers=headers, json=body) as r:
                     if r.status_code != 200:
