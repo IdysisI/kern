@@ -192,7 +192,51 @@ class ContextManager:
             raise RuntimeError(f'context needs approximately {size} tokens; input allowance {available}. '
                                'Use memory history/artifact slices or configure the verified model context window.')
         e.output_budget = min(default_max_output_tokens(e.model), max(256, window-size-1024))
-        return self._with_recall(view, e)
+        return self._with_recall(self._with_repo_context(view, e), e)
+
+    # ---- Repo orientation: compact code map + KERN.md, first turn only ------
+    def _with_repo_context(self, view, e):
+        """Prepend a compact repo-orientation block on the first turn only.
+
+        User constraint: the user does NOTHING — Kern must orient itself. So on a
+        fresh session we inject (a) the deterministic code map (top modules) and
+        (b) the project's KERN.md guidance if present. This replaces blind
+        grep-and-read exploration (the token sink the graph solves). Fails open.
+        """
+        try:
+            # Only inject when there is no prior work history (fresh orientation),
+            # so we never re-spend these tokens on later turns.
+            if any(m.get('role') in ('assistant', 'tool') for m in view):
+                return view
+            cwd = getattr(e, 'cwd', None)
+            if not cwd:
+                return view
+            from pathlib import Path as _P
+            blocks = []
+            # (b) KERN.md guidance (user-authored project conventions).
+            try:
+                kp = _P(cwd) / 'KERN.md'
+                if kp.is_file():
+                    txt = kp.read_text(errors='replace').strip()
+                    if txt:
+                        blocks.append('<project-instructions source="KERN.md">\n'
+                                      + txt[:4000] + '\n</project-instructions>')
+            except Exception:
+                pass
+            # (a) Compact code map (top modules by connectivity).
+            try:
+                from .codegraph import CodeGraph
+                g = CodeGraph(cwd)
+                if g.stats()['files'] > 0:
+                    blocks.append('<repo-map note="deterministic AST index; use the map tool to query deeper">\n'
+                                  + g.map(max_modules=25) + '\n</repo-map>')
+            except Exception:
+                pass
+            if not blocks:
+                return view
+            return [{'role': 'system', 'text': '\n\n'.join(blocks)}] + view
+        except Exception:
+            return view
 
     # ---- M2 + M5: zero-cost deterministic recall injection -----------------
     def _with_recall(self, view, e):

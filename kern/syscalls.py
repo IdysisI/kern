@@ -107,6 +107,14 @@ SCHEMAS = [
             "topic": {"type": "string", "description": "topic slug for remember()"}, "key": {"type":"string", "description":"Explicit key to supersede an older note; omit to retain both"}},
             "required": ["action"]}}},
     {"type": "function", "function": {
+        "name": "map",
+        "description": "Structural repo map — deterministic AST/regex index, 0 model cost. PREFER this over grep or repeated reads for architectural/cross-module questions: find where a symbol is defined, who calls it, what a module imports/depends on, or the repo outline. Actions: map (top modules), outline(path), find(name), callers(name), deps(path), dependents(name).",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["map", "outline", "find", "callers", "deps", "dependents"]},
+            "path": {"type": "string", "description": "repo-relative file, for outline/deps"},
+            "name": {"type": "string", "description": "symbol or module name, for find/callers/dependents"}},
+            "required": ["action"]}}},
+    {"type": "function", "function": {
         "name": "py",
         "description": "Run Python code in a persistent interpreter: variables, imports and functions survive across py() calls for the whole session (fresh after a restart). One call can loop, compute, and batch many file transformations — prefer ONE py() call over many edit() calls for repetitive work. Print what you need (output capped).",
         "parameters": {"type": "object", "properties": {
@@ -790,6 +798,38 @@ def tool_memory(session, cwd: str, action: str, pattern: str = "",
                 return "error: forget needs pattern", {}
             return tree.forget(pattern), {}
         return f"error: unknown memory action {action!r}", {}
+    except Exception as e:
+        return f"error: {type(e).__name__}: {e}", {}
+
+
+def tool_map(cwd: str, action: str = "map", path: str = "", name: str = "") -> tuple[str, dict]:
+    """Deterministic structural repo map (kern.codegraph.CodeGraph). 0 model cost."""
+    from kern.codegraph import CodeGraph
+    try:
+        g = CodeGraph(cwd)
+        if action == "map":
+            return g.map(), {}
+        if action == "outline":
+            if not path:
+                return "error: outline needs path", {}
+            return g.outline(path), {}
+        if action == "find":
+            if not name:
+                return "error: find needs name", {}
+            return g.find(name), {}
+        if action == "callers":
+            if not name:
+                return "error: callers needs name", {}
+            return g.callers(name), {}
+        if action == "deps":
+            if not path:
+                return "error: deps needs path", {}
+            return g.deps(path), {}
+        if action == "dependents":
+            if not name:
+                return "error: dependents needs name", {}
+            return g.dependents(name), {}
+        return f"error: unknown map action {action!r}", {}
     except Exception as e:
         return f"error: {type(e).__name__}: {e}", {}
 

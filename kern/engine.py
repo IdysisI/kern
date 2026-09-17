@@ -486,6 +486,7 @@ class Engine:
             "search": lambda: syscalls.tool_search(**args),
             "scrape": lambda: syscalls.tool_scrape(**args),
             "memory": lambda: syscalls.tool_memory(self.session, self.cwd, **args),
+            "map": lambda: syscalls.tool_map(self.cwd, **args),
             "py": lambda: syscalls.tool_py(self.session, **args, _cancel=cancel),
             "todo": lambda: syscalls.tool_todo(**args),
         }
