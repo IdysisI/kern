@@ -371,7 +371,32 @@ class ContextManager:
         summaries = [s for s in summaries if s is not None]
         degraded = llm_done < total
 
-        text = json.dumps(summaries, ensure_ascii=False)
+        # M1: deterministic structured ledger from the RAW span (0 LLM calls).
+        # The LLM summary above is a navigation aid (P2); this structured record
+        # retains decisions/artifacts/open-threads/tool-errors verbatim so a lossy
+        # summary can never drop a number, path, or error count.
+        structured = {'goal': getattr(self, '_last_user', '') or '',
+                      'decisions': [], 'artifacts': [], 'open_threads': [],
+                      'tool_errors': {}, 'event_span': [start, end]}
+        try:
+            from .recall import extract_ledger
+            led = extract_ledger(list(span))
+            for ent in led:
+                structured['decisions'].extend(ent.decisions)
+                structured['artifacts'].extend(ent.artifacts)
+                structured['open_threads'].extend(ent.open_threads)
+            structured['decisions'] = list(dict.fromkeys(structured['decisions']))[:40]
+            structured['artifacts'] = list(dict.fromkeys(structured['artifacts']))[:40]
+            structured['open_threads'] = list(dict.fromkeys(structured['open_threads']))[:40]
+            errs = {}
+            for ev in span:
+                if ev.get('kind') == 'tool_result' and str(ev.get('status', '')).lower() == 'error':
+                    errs[ev.get('name', '?')] = errs.get(ev.get('name', '?'), 0) + 1
+            structured['tool_errors'] = errs
+        except Exception:
+            pass
+
+        text = json.dumps({'summaries': summaries, 'ledger': structured}, ensure_ascii=False)
         e.session.emit('episode', start=start, end=end, source=str(source), text=text)
         done_note = f'Episode {start}–{end}: attributed navigation notes ({llm_done}/{total} chunks summarized); original: {source}\n{text}'
         if degraded:
