@@ -107,7 +107,7 @@ kern/
 
 ## ⭐ Star history
 
-<a href="https://www.star-history.com/?type=date&repos=IdysisI%2Fkern">
+<a href="https://www.star-history.com/?repos=IdysisI%2Fkern&type=date&legend=top-left">
  <picture>
    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=IdysisI/kern&type=date&theme=dark&legend=top-left" />
    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=IdysisI/kern&type=date&legend=top-left" />
