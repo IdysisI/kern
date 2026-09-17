@@ -28,8 +28,10 @@ from PySide6.QtCore import (
     QPropertyAnimation,
     QRect,
     QRectF,
+    QRunnable,
     QSize,
     Qt,
+    QThreadPool,
     QTimer,
     Signal,
 )
@@ -41,6 +43,7 @@ from PySide6.QtGui import (
     QKeySequence,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
     QPolygonF,
@@ -296,7 +299,11 @@ _MD_CSS = f"""
 body {{
   font-family: {UI_FONT}, sans-serif;
   font-size: 13.5px; line-height: 1.62; color: {FG_1};
-  margin: 0; padding: 0; background: transparent;
+  /* Opaque background — NOT transparent. A transparent QTextDocument body lets the
+     un-painted widget framebuffer (black) bleed through behind text on real
+     GPU-backed displays (Wayland/HW accel), even though offscreen renders looked
+     fine. Paint the surface colour explicitly. */
+  margin: 0; padding: 0; background: {BG_0};
 }}
 p {{ margin: 0 0 9px; }}
 p:last-child {{ margin-bottom: 0; }}
@@ -356,7 +363,9 @@ def md_html(text: str) -> str:
 QSS = f"""
 * {{ font-family: {UI_FONT}, "Noto Sans", sans-serif; }}
 
-QMainWindow, QWidget {{ background: {BG_0}; color: {FG_1}; font-size: 13px; }}
+QMainWindow {{ background: {BG_0}; }}
+QWidget {{ color: {FG_1}; font-size: 13px; }}
+QLabel {{ background: transparent; }}
 QToolTip {{
   background: {BG_3}; color: {FG_1}; border: 1px solid {LINE_STRONG};
   padding: 4px 7px; border-radius: 4px; font-size: 11.5px;
@@ -421,7 +430,13 @@ QComboBox QAbstractItemView {{
 }}
 
 /* ── text areas ─────────────────────────────────────────────── */
-QTextBrowser {{ border: none; background: transparent; color: {FG_1}; }}
+/* Labels must never paint a background: under some styles (Windows/native) a
+   QLabel with autoFillBackground would fill its rect with the palette Window
+   colour (near-black), producing the black rectangle over cards. Force
+   transparency by default; specific widgets opt into a fill via setAutoFillBackground. */
+QLabel {{ background: transparent; }}
+
+QTextBrowser {{ border: none; background: {BG_0}; color: {FG_1}; }}
 QTextEdit {{ border: none; background: transparent; color: {FG_1}; font-size: 13.5px; }}
 QTextEdit::placeholder {{ color: {FG_4}; }}
 
@@ -434,6 +449,29 @@ QLineEdit:focus {{ border-color: {LINE_STRONG}; }}
 
 
 # ════════════════════════════════════════════════════════ small primitives ═
+def _transparent_text_surface(w, bg=BG_0):
+    """Ensure QTextBrowser blends seamlessly with its parent container.
+    Set Base/Window palette and stylesheet to match bg.
+    """
+    base = QColor(bg)
+    for widget in (w, w.viewport()):
+        pal = widget.palette()
+        for role in (QPalette.Base, QPalette.Window, QPalette.AlternateBase):
+            pal.setColor(role, base)
+        pal.setColor(QPalette.Text, QColor(FG_1))
+        pal.setColor(QPalette.Highlight, QColor(ACCENT_SOFT))
+        widget.setPalette(pal)
+    w.setAutoFillBackground(True)
+    w.viewport().setAutoFillBackground(True)
+    w.setStyleSheet(
+        f"QTextBrowser {{ background: {bg}; border: none; }}"
+    )
+    try:
+        w.document().setDocumentMargin(2)
+    except Exception:
+        pass
+
+
 class HRule(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -448,6 +486,23 @@ class MetaLabel(QLabel):
         self.setStyleSheet(
             f"color: {FG_3}; font-size: 10.5px; font-weight: 600; letter-spacing: 0.9px;"
         )
+
+
+class _MdSignals(QObject):
+    done = Signal(int, str)   # index, html
+
+
+class _MdJob(QRunnable):
+    """Render one markdown string to HTML off the UI thread (mistune is pure Python)."""
+    def __init__(self, idx: int, text: str, signals: _MdSignals):
+        super().__init__()
+        self.idx, self.text, self.signals = idx, text, signals
+
+    def run(self):
+        try:
+            self.signals.done.emit(self.idx, md_html(self.text))
+        except Exception:
+            self.signals.done.emit(self.idx, f"<pre>{_html.escape(self.text)}</pre>")
 
 
 class IconButton(QPushButton):
@@ -485,13 +540,13 @@ class UserBubble(QFrame):
         row.addWidget(ic)
 
         who = QLabel("You")
-        who.setStyleSheet(f"color: {FG_3}; font-size: 11px; font-weight: 600; border: none;")
+        who.setStyleSheet(f"color: {FG_3}; font-size: 11px; font-weight: 600; border: none; background: transparent;")
         row.addWidget(who)
         row.addStretch()
 
         if ts:
             stamp = QLabel(time.strftime("%H:%M", time.localtime(ts)))
-            stamp.setStyleSheet(f"color: {FG_4}; font-size: 10.5px; border: none;")
+            stamp.setStyleSheet(f"color: {FG_4}; font-size: 10.5px; border: none; background: transparent;")
             row.addWidget(stamp)
         outer.addLayout(row)
 
@@ -499,7 +554,7 @@ class UserBubble(QFrame):
         body.setWordWrap(True)
         body.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
         body.setStyleSheet(
-            f"color: {FG_1}; font-size: 13.5px; line-height: 1.55; border: none; padding: 0 {S2}px;"
+            f"color: {FG_1}; font-size: 13.5px; line-height: 1.55; border: none; padding: 0 {S2}px; background: transparent;"
         )
         outer.addWidget(body)
 
@@ -522,7 +577,7 @@ class AssistantView(QFrame):
         mark.setPixmap(icon("logo", 13, ACCENT).pixmap(13, 13))
         head.addWidget(mark)
         name = QLabel("Kern")
-        name.setStyleSheet(f"color: {FG_2}; font-size: 11.5px; font-weight: 600; border: none;")
+        name.setStyleSheet(f"color: {FG_2}; font-size: 11.5px; font-weight: 600; border: none; background: transparent;")
         head.addWidget(name)
         head.addStretch()
         lay.addLayout(head)
@@ -532,17 +587,36 @@ class AssistantView(QFrame):
         self.browser.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.browser.setFocusPolicy(Qt.NoFocus)
-        self.browser.setStyleSheet("background: transparent; border: none;")
+        _transparent_text_surface(self.browser)
         self.browser.document().contentsChanged.connect(self._fit)
         lay.addWidget(self.browser)
 
     def append(self, chunk: str):
         self._raw += chunk
-        self._paint()
+        self._dirty = True
+        # Re-rendering markdown on every token is quadratic. Coalesce repaints.
+        if not getattr(self, "_throttle", None):
+            self._throttle = QTimer(self, timeout=self._flush_throttled)
+            self._throttle.setSingleShot(True)
+        if not self._throttle.isActive():
+            self._throttle.start(70)
+
+    def _flush_throttled(self):
+        if getattr(self, "_dirty", False):
+            self._dirty = False
+            self._paint()
 
     def set_text(self, text: str):
         self._raw = text or ""
+        self._dirty = False
         self._paint()
+
+    def set_prerendered(self, html: str):
+        """Set pre-rendered HTML (computed off the UI thread) — no md_html() here."""
+        self._raw = ""
+        self._dirty = False
+        self.browser.setHtml(html)
+        self._fit()
 
     def _paint(self):
         self.browser.setHtml(md_html(self._raw))
@@ -551,8 +625,9 @@ class AssistantView(QFrame):
     def _fit(self):
         doc = self.browser.document()
         doc.setTextWidth(max(200, self.browser.viewport().width()))
-        h = int(doc.size().height()) + 8
-        self.browser.setFixedHeight(max(24, h))
+        h = int(doc.size().height()) + 4
+        self.browser.setMinimumHeight(max(22, h))
+        self.browser.setMaximumHeight(max(22, h))
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
@@ -579,9 +654,9 @@ class ToolRow(QFrame):
         self._t0 = time.time()
 
         self.setStyleSheet(
-            f"ToolRow {{ background: transparent; border: 1px solid {LINE_SOFT}; "
+            f"ToolRow {{ background: {BG_1}; border: 1px solid {LINE_SOFT}; "
             f"border-radius: {R_SM}px; }}"
-            f"ToolRow:hover {{ border-color: {LINE_STRONG}; }}"
+            f"ToolRow:hover {{ border-color: {LINE_STRONG}; background: {BG_2}; }}"
         )
         self.lay = QVBoxLayout(self)
         self.lay.setContentsMargins(0, 0, 0, 0)
@@ -592,63 +667,91 @@ class ToolRow(QFrame):
         self.head.setCursor(Qt.PointingHandCursor)
         self.head.setStyleSheet(
             f"QPushButton {{ background: transparent; border: none; text-align: left; padding: 0; }}"
+            f"QPushButton:hover {{ background: transparent; }}"
         )
+        # Comfortable 40px height for tool command rows
+        self.head.setMinimumHeight(40)
         h = QHBoxLayout(self.head)
-        h.setContentsMargins(S2 + 2, 6, S2 + 2, 6)
-        h.setSpacing(S2)
+        h.setContentsMargins(S3 + 2, 8, S3 + 2, 8)
+        h.setSpacing(S2 + 2)
 
         self.glyph = QLabel()
         gname = self._GLYPH.get(name, "proc")
-        self.glyph.setPixmap(icon(gname, 13, FG_3).pixmap(13, 13))
+        self.glyph.setFixedSize(14, 14)
+        self.glyph.setPixmap(icon(gname, 14, FG_3).pixmap(14, 14))
+        self.glyph.setStyleSheet("border: none; background: transparent;")
         h.addWidget(self.glyph)
 
         self.lbl_name = QLabel(name)
         self.lbl_name.setStyleSheet(
-            f"color: {FG_2}; font-size: 12px; font-weight: 600; border: none;"
+            f"color: {FG_2}; font-size: 12.5px; font-weight: 600; border: none; background: transparent;"
         )
+        self.lbl_name.setMinimumHeight(20)
         h.addWidget(self.lbl_name)
 
         self.lbl_arg = QLabel(self._summary())
         self.lbl_arg.setStyleSheet(
-            f"color: {FG_3}; font-family: {MONO_FONT}, monospace; font-size: 11.5px; border: none;"
+            f"color: {FG_3}; font-family: {MONO_FONT}, monospace; font-size: 12px; "
+            f"border: none; background: transparent; padding-top: 1px;"
         )
+        self.lbl_arg.setMinimumHeight(20)
         self.lbl_arg.setTextInteractionFlags(Qt.NoTextInteraction)
         h.addWidget(self.lbl_arg, 1)
 
         self.lbl_state = QLabel("running")
-        self.lbl_state.setStyleSheet(f"color: {FG_4}; font-size: 10.5px; border: none;")
+        self.lbl_state.setStyleSheet(
+            f"color: {FG_4}; font-size: 11px; border: none; background: transparent;"
+        )
+        self.lbl_state.setMinimumHeight(20)
         h.addWidget(self.lbl_state)
 
         self.chev = QLabel()
-        self.chev.setPixmap(icon("chev_r", 12, FG_4).pixmap(12, 12))
+        self.chev.setFixedSize(13, 13)
+        self.chev.setPixmap(icon("chev_r", 13, FG_4).pixmap(13, 13))
+        self.chev.setStyleSheet("border: none; background: transparent;")
         h.addWidget(self.chev)
 
         self.head.clicked.connect(self.toggle)
         self.lay.addWidget(self.head)
 
-        # ── body (collapsed) ──
-        self.body = QFrame()
-        self.body.setStyleSheet(
-            f"QFrame {{ background: {BG_0}; border-top: 1px solid {LINE_SOFT}; }}"
+        # ── body: built LAZILY on first expand ──
+        # Constructing a QTextBrowser costs ~3-4ms; with 150 tool rows in a long
+        # session that alone was ~0.6s of the replay. Almost all rows stay
+        # collapsed, so defer the whole body until the user actually opens one.
+        self._body: QFrame | None = None
+        self._out_text = ""
+        self._diff = ""
+
+    def _ensure_body(self) -> QFrame:
+        if self._body is not None:
+            return self._body
+
+        body = QFrame()
+        body.setStyleSheet(
+            f"QFrame {{ background: transparent; border: none; "
+            f"border-top: 1px solid {LINE_SOFT}; }}"
         )
-        bl = QVBoxLayout(self.body)
-        bl.setContentsMargins(S3, S2, S3, S2 + 2)
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(S3 + 2, S3, S3 + 2, S3 + 2)
         bl.setSpacing(S1)
 
-        self.out = QTextBrowser()
-        self.out.setOpenExternalLinks(False)
-        self.out.setFocusPolicy(Qt.NoFocus)
-        self.out.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.out.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.out.setStyleSheet(
+        out = QTextBrowser()
+        out.setOpenExternalLinks(False)
+        out.setFocusPolicy(Qt.NoFocus)
+        out.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        out.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        _transparent_text_surface(out)
+        out.setStyleSheet(
             f"background: transparent; border: none; color: {FG_2}; "
             f"font-family: {MONO_FONT}, monospace; font-size: 11.5px;"
         )
-        self.out.document().contentsChanged.connect(self._fit_out)
-        bl.addWidget(self.out)
+        out.document().contentsChanged.connect(self._fit_out)
+        bl.addWidget(out)
 
-        self.body.setVisible(False)
-        self.lay.addWidget(self.body)
+        self.out = out
+        self._body = body
+        self.lay.addWidget(body)
+        return body
 
     def _summary(self) -> str:
         a = self.args
@@ -671,27 +774,31 @@ class ToolRow(QFrame):
             return _one_line(json.dumps(a, ensure_ascii=False), 70)
         return ""
 
-    def set_result(self, text: str, failed: bool = False):
-        dt = time.time() - self._t0
-        self.lbl_state.setText(("failed" if failed else "done") + f" · {dt:.1f}s")
+    def set_result(self, text: str, failed: bool = False, elapsed: float | None = None):
+        # On replay every row was just constructed, so time.time()-self._t0 would
+        # report ~0.0s for historical tools. Callers pass the real elapsed value.
+        dt = elapsed if elapsed is not None else (time.time() - self._t0)
+        label = "failed" if failed else "done"
+        self.lbl_state.setText(label + (f" · {dt:.1f}s" if dt and dt > 0.05 else ""))
         self.lbl_state.setStyleSheet(
             f"color: {ERR if failed else OK}; font-size: 10.5px; border: none;"
         )
         self._out_text = text or ""
-        if self._open:
+        if self._open and self._body is not None:
             self._render_body()
 
     def set_diff(self, diff: str):
-        self._diff = diff
-        if self._open:
+        self._diff = diff or ""
+        if self._open and self._body is not None:
             self._render_body()
 
     def _render_body(self):
+        if self._body is None:
+            self._ensure_body()
         parts = []
-        diff = getattr(self, "_diff", None)
-        if diff:
-            parts.append(_diff_html(diff))
-        txt = getattr(self, "_out_text", None)
+        if self._diff:
+            parts.append(_diff_html(self._diff))
+        txt = self._out_text
         if txt:
             shown = txt if len(txt) <= 6000 else txt[:6000] + f"\n… truncated ({len(txt)} chars)"
             parts.append(
@@ -707,23 +814,30 @@ class ToolRow(QFrame):
         self._fit_out()
 
     def _fit_out(self):
+        if self._body is None:
+            return
         doc = self.out.document()
-        doc.setTextWidth(max(200, self.out.viewport().width()))
-        h = int(doc.size().height()) + 6
-        self.out.setFixedHeight(min(420, max(20, h)))
+        doc.setTextWidth(max(240, self.out.viewport().width()))
+        h = int(doc.size().height()) + 8
+        # keep a comfortable minimum so an opened row never looks pinched
+        h = min(460, max(46, h))
+        self.out.setMinimumHeight(h)
+        self.out.setMaximumHeight(h)
 
     def toggle(self):
         self._open = not self._open
-        self.body.setVisible(self._open)
         if self._open:
+            self._ensure_body()
             self._render_body()
+        if self._body is not None:
+            self._body.setVisible(self._open)
         self.chev.setPixmap(
-            icon("chev_d" if self._open else "chev_r", 12, FG_4).pixmap(12, 12)
+            icon("chev_d" if self._open else "chev_r", 13, FG_3).pixmap(13, 13)
         )
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
-        if self._open:
+        if self._open and self._body is not None:
             self._fit_out()
 
 
@@ -746,7 +860,7 @@ class PlanCard(QFrame):
         head.setSpacing(S2)
         head.addWidget(MetaLabel("Plan"))
         prog = QLabel(f"{done}/{total}")
-        prog.setStyleSheet(f"color: {FG_3}; font-size: 10.5px; border: none;")
+        prog.setStyleSheet(f"color: {FG_3}; font-size: 10.5px; border: none; background: transparent;")
         head.addWidget(prog)
         head.addStretch()
         lay.addLayout(head)
@@ -771,15 +885,16 @@ class PlanCard(QFrame):
             row.setSpacing(S2)
 
             g = QLabel()
+            g.setStyleSheet("background: transparent; border: none;")
             if st == "done":
                 g.setPixmap(icon("check", 12, OK).pixmap(12, 12))
-                style = f"color: {FG_3}; font-size: 12.5px; border: none;"
+                style = f"color: {FG_3}; font-size: 12.5px; border: none; background: transparent;"
             elif st in ("active", "in_progress"):
                 g.setPixmap(icon("dot", 12, ACCENT).pixmap(12, 12))
-                style = f"color: {FG_1}; font-size: 12.5px; font-weight: 500; border: none;"
+                style = f"color: {FG_1}; font-size: 12.5px; font-weight: 500; border: none; background: transparent;"
             else:
                 g.setPixmap(icon("circle", 12, FG_4).pixmap(12, 12))
-                style = f"color: {FG_2}; font-size: 12.5px; border: none;"
+                style = f"color: {FG_2}; font-size: 12.5px; border: none; background: transparent;"
             row.addWidget(g, 0, Qt.AlignTop)
 
             lab = QLabel(txt)
@@ -807,14 +922,14 @@ class SystemNote(QFrame):
 
         ic = QLabel()
         ic.setPixmap(icon(glyph, 12, color).pixmap(12, 12))
-        ic.setStyleSheet("border: none;")
+        ic.setStyleSheet("border: none; background: transparent;")
         lay.addWidget(ic, 0, Qt.AlignTop)
 
         lab = QLabel(_html.escape(text))
         lab.setWordWrap(True)
         lab.setTextFormat(Qt.RichText)
         lab.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        lab.setStyleSheet(f"color: {color if kind != 'info' else FG_3}; font-size: 12px; border: none;")
+        lab.setStyleSheet(f"color: {color if kind != 'info' else FG_3}; font-size: 12px; border: none; background: transparent;")
         lay.addWidget(lab, 1)
 
 
@@ -871,7 +986,7 @@ class ApproveDialog(QDialog):
         ic.setPixmap(icon("alert", 16, WARN).pixmap(16, 16))
         head.addWidget(ic)
         t = QLabel("Kern needs your approval")
-        t.setStyleSheet(f"color: {FG_1}; font-size: 14px; font-weight: 600;")
+        t.setStyleSheet(f"color: {FG_1}; font-size: 14px; font-weight: 600; background: transparent; border: none;")
         head.addWidget(t)
         head.addStretch()
         lay.addLayout(head)
@@ -879,7 +994,7 @@ class ApproveDialog(QDialog):
         d = QLabel(_html.escape(desc))
         d.setWordWrap(True)
         d.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        d.setStyleSheet(f"color: {FG_2}; font-size: 12.5px; line-height: 1.5;")
+        d.setStyleSheet(f"color: {FG_2}; font-size: 12.5px; line-height: 1.5; background: transparent; border: none;")
         lay.addWidget(d)
 
         if diff:
@@ -920,7 +1035,7 @@ class ApproveDialog(QDialog):
         lay.addLayout(btns)
 
         hint = QLabel("Y approve · A allow all · Esc deny")
-        hint.setStyleSheet(f"color: {FG_4}; font-size: 10.5px;")
+        hint.setStyleSheet(f"color: {FG_4}; font-size: 10.5px; background: transparent; border: none;")
         hint.setAlignment(Qt.AlignRight)
         lay.addWidget(hint)
 
@@ -1035,7 +1150,7 @@ class Sidebar(QFrame):
         brand.addWidget(mark)
         word = QLabel("Kern")
         word.setStyleSheet(
-            f"color: {FG_1}; font-size: 14px; font-weight: 700; letter-spacing: 0.3px; border: none;"
+            f"color: {FG_1}; font-size: 14px; font-weight: 700; letter-spacing: 0.3px; border: none; background: transparent;"
         )
         brand.addWidget(word)
         brand.addStretch()
@@ -1058,7 +1173,7 @@ class Sidebar(QFrame):
         head.addWidget(MetaLabel("Sessions"))
         head.addStretch()
         self.lbl_count = QLabel("")
-        self.lbl_count.setStyleSheet(f"color: {FG_4}; font-size: 10.5px; border: none;")
+        self.lbl_count.setStyleSheet(f"color: {FG_4}; font-size: 10.5px; border: none; background: transparent;")
         head.addWidget(self.lbl_count)
         lay.addLayout(head)
 
@@ -1288,6 +1403,14 @@ class KernWindow(QMainWindow):
         self._thinking: ThinkingDots | None = None
         self._pending_tools: dict[str, ToolRow] = {}
         self._suppress_autoscroll = False
+        self._md_pending: dict[int, AssistantView] = {}
+        self._md_cache: dict[int, str] = {}
+        self._pending_anchor: int | None = None
+        self._hist_events: list = []
+        self._hist_cursor = 0
+        self._loading_older = False
+        self._md_pool = None
+        self._md_signals = None
 
         self.setWindowTitle(f"Kern — {os.path.basename(self.cwd)}")
         self.resize(1200, 820)
@@ -1382,7 +1505,7 @@ class KernWindow(QMainWindow):
         self.lbl_project = QLabel(os.path.basename(self.cwd))
         self.lbl_project.setToolTip(self.cwd)
         self.lbl_project.setStyleSheet(
-            f"color: {FG_1}; font-size: 13px; font-weight: 600; border: none;"
+            f"color: {FG_1}; font-size: 13px; font-weight: 600; border: none; background: transparent;"
         )
         lay.addWidget(self.lbl_project)
 
@@ -1406,7 +1529,7 @@ class KernWindow(QMainWindow):
 
         self.lbl_session = QLabel("")
         self.lbl_session.setStyleSheet(
-            f"color: {FG_4}; font-size: 11px; font-family: {MONO_FONT}, monospace; border: none;"
+            f"color: {FG_4}; font-size: 11px; font-family: {MONO_FONT}, monospace; border: none; background: transparent;"
         )
         lay.addWidget(self.lbl_session)
 
@@ -1540,75 +1663,243 @@ class KernWindow(QMainWindow):
         self.setWindowTitle(f"Kern — {os.path.basename(self.cwd)}")
         self._refresh_budget()
 
+    # A long session (this one: ~4.9k events) materialised ~300 widgets up front
+    # and froze the window for ~3s. Replay now paints the recent tail at once and
+    # backfills older history in small batches between event-loop passes, so the
+    # window is usable immediately and never blocks.
+    REPLAY_TAIL = 60
+    # ══ virtualized history load ═══════════════════════════════════════════
+    # The freeze you hit was materialising ~2,700 real Qt widgets for a 4.9k-event
+    # session (measured 11.3s) — widgets are heavy, and each AssistantView ran a
+    # full markdown render on the UI thread. The right way (what Claude Code /
+    # Codex / Discord do): keep the journal in memory (cheap dicts), but only build
+    # widgets for a window of recent history, and load OLDER history only when the
+    # user scrolls up. Markdown is pre-rendered in a background thread so the UI
+    # never blocks on it.
+    TAIL_COUNT = 48        # widgets built synchronously at startup
+    PRELOAD = 160          # older events pre-rendered in bg, inserted silently
+    OLDER_STEP = 80        # widgets added per scroll-up request
+    SCROLL_TOP_TRIGGER = 260  # px from top that triggers loading older history
+
     def _replay(self):
-        """Render history from the journal. Capped for smooth startup."""
         evs = self.session.events
-        # keep the tail so long sessions open fast
-        cap = 500
-        if len(evs) > cap:
-            evs = evs[-cap:]
-            self._note(f"Showing the last {cap} of {len(self.session.events)} events.")
+        total = len(evs)
+        self._hist_events = evs
+        self._hist_cursor = total      # events [0:cursor] not yet shown
+        self._loading_older = False
 
-        tools: dict[str, ToolRow] = {}
-        last_assistant: AssistantView | None = None
+        if not total:
+            self._hist_cursor = 0
+            return
 
+        # index tool results once (cheap; no widgets)
+        results: dict[str, dict] = {}
+        for ev in evs:
+            if ev.get("kind") == "tool_result":
+                cid = ev.get("call_id") or ""
+                if cid:
+                    results[cid] = ev
+        self._replay_results = results
+
+        self._flow_top = 0
+        self._loading_row = QPushButton("Load earlier")
+        self._loading_row.setObjectName("quiet")
+        self._loading_row.setCursor(Qt.PointingHandCursor)
+        self._loading_row.setFlat(True)
+        self._loading_row.clicked.connect(lambda: self._load_older(force=True))
+        self._loading_row.hide()
+        self.flow.insertWidget(0, self._loading_row)
+        self._flow_top = 1
+        self._update_load_button()
+
+        self._md_pool = QThreadPool(self)
+        self._md_pool.setMaxThreadCount(2)
+        self._md_cache: dict[int, str] = {}
+        self._md_signals = _MdSignals()
+        self._md_signals.done.connect(self._on_md_done)
+
+        # 1) build the visible tail synchronously so the first paint is immediate
+        start = max(0, total - self.TAIL_COUNT)
+        self._render_events(evs[start:])
+        self._hist_cursor = start
+        self._to_bottom(force=True)
+
+        # 2) pre-render older-history markdown off the UI thread, then insert a
+        #    chunk of it AFTER the window has painted — so startup stays instant.
+        if self._hist_cursor > 0:
+            self._schedule_preload_md()
+            QTimer.singleShot(0, self._preload_older)
+
+    # ---- background markdown pre-render -------------------------------------
+    def _schedule_preload_md(self):
+        """Queue the next PRELOAD events' assistant markdown on the pool so the
+        HTML is already in _md_cache when those widgets get built."""
+        if self._md_pool is None:
+            return
+        end = self._hist_cursor
+        start = max(0, end - self.PRELOAD)
+        for i in range(start, end):
+            ev = self._hist_events[i]
+            if ev.get("kind") == "assistant":
+                txt = (ev.get("text") or "").strip()
+                idx = ev.get("n")
+                if txt and idx is not None and idx not in self._md_cache:
+                    self._md_pool.start(_MdJob(idx, txt, self._md_signals))
+
+    # ---- background markdown pre-render -------------------------------------
+    def _on_md_done(self, idx: int, html: str):
+        self._md_cache[idx] = html
+        w = self._md_pending.pop(idx, None)
+        if w is not None:
+            w.set_prerendered(html)
+
+    def _schedule_md(self, idx: int, text: str, widget=None):
+        if idx in self._md_cache:
+            if widget is not None:
+                widget.set_prerendered(self._md_cache[idx])
+            return True
+        self._md_pool.start(_MdJob(idx, text, self._md_signals))
+        if widget is not None:
+            self._md_pending[idx] = widget
+        return False
+
+    # ---- older-history loading ----------------------------------------------
+    def _preload_older(self):
+        """Insert PRELOAD older events with layout suspended. Markdown for these
+        was queued to the bg pool by _schedule_preload_md; hits in _md_cache render
+        instantly, misses render inline (a small constant number)."""
+        if self._hist_cursor <= 0:
+            return
+        chunk_start = max(0, self._hist_cursor - self.PRELOAD)
+        self._insert_history_range(chunk_start, self._hist_cursor)
+        self._hist_cursor = chunk_start
+        self._update_load_button()
+        # keep the bg pool primed for the NEXT chunk the user might scroll to
+        self._schedule_preload_md()
+
+    def _load_older(self, force: bool = False):
+        if self._loading_older or self._hist_cursor <= 0:
+            return
+        self._loading_older = True
+        self._loading_row.setEnabled(False)
+        self._loading_row.setText("Loading…")
+        QTimer.singleShot(0, self._do_load_older)
+
+    def _do_load_older(self):
+        try:
+            sb = self.scroll.verticalScrollBar()
+            # anchor: remember the current maximum so _on_range can re-anchor the
+            # viewport over the same content after the prepend (no jump).
+            self._pending_anchor = sb.maximum()
+
+            end = self._hist_cursor
+            start = max(0, end - self.OLDER_STEP)
+            self._insert_history_range(start, end)
+            self._hist_cursor = start
+            self._update_load_button()
+            self._schedule_preload_md()
+        finally:
+            self._loading_older = False
+            self._loading_row.setEnabled(True)
+            self._update_load_button()
+
+    def _insert_history_range(self, start: int, end: int):
+        """Build widgets for events[start:end] and insert above the tail with
+        layout + repaints suspended (the key to no stutter)."""
+        evs = self._hist_events[start:end]
+        cv = self.canvas
+        cv.setUpdatesEnabled(False)
+        lay = cv.layout()
+        if hasattr(lay, "setSizeConstraint"):
+            lay.setSizeConstraint(lay.SizeConstraint.SetNoConstraint)
+        try:
+            self._render_events(evs, at_top=True)
+        finally:
+            cv.setUpdatesEnabled(True)
+            if hasattr(lay, "setSizeConstraint"):
+                lay.setSizeConstraint(lay.SizeConstraint.SetDefaultConstraint)
+
+    def _update_load_button(self):
+        remaining = self._hist_cursor
+        if remaining > 0:
+            self._loading_row.setText(f"Load earlier  ·  {remaining:,} more")
+            self._loading_row.show()
+        else:
+            self._loading_row.hide()
+
+    def _on_scroll(self, v: int):
+        sb = self.scroll.verticalScrollBar()
+        self._suppress_autoscroll = v < sb.maximum() - 80
+        # scrolling near the top loads older history on demand
+        if v < self.SCROLL_TOP_TRIGGER and self._hist_cursor > 0:
+            self._load_older()
+
+    def _render_events(self, evs, at_top: bool = False):
+        results = getattr(self, "_replay_results", {}) or {}
         for ev in evs:
             k = ev.get("kind")
+            w = None
+
             if k == "user":
-                self._add(UserBubble(ev.get("text", ""), ev.get("ts")))
-                last_assistant = None
+                w = UserBubble(ev.get("text", ""), ev.get("ts"))
             elif k == "assistant":
                 txt = (ev.get("text") or "").strip()
                 if txt:
                     av = AssistantView()
-                    av.set_text(txt)
-                    self._add(av)
-                    last_assistant = av
+                    idx = ev.get("n")
+                    # use pre-rendered HTML if the bg thread already did it,
+                    # otherwise render now (cheap for the small tail)
+                    if idx is not None and idx in self._md_cache:
+                        av.set_prerendered(self._md_cache[idx])
+                    else:
+                        av.set_text(txt)
+                    w = av
             elif k == "action":
-                cid = ev.get("call_id") or ""
                 name = ev.get("name", "?")
                 args = ev.get("arguments") or {}
                 if name == "todo" and "items" in args:
-                    self._add(PlanCard(args["items"]))
-                    last_assistant = None
-                    continue
-                row = ToolRow(name, args)
-                self._add(row)
-                if cid:
-                    tools[cid] = row
-                last_assistant = None
-            elif k == "tool_result":
-                cid = ev.get("call_id") or ""
-                row = tools.get(cid) or (self._last_tool_row())
-                if row is not None:
-                    failed = str(ev.get("status", "")) == "error" or \
-                        (ev.get("exit_code") not in (None, 0))
-                    row.set_result(ev.get("text", ""), failed=failed)
-                    if ev.get("diff"):
-                        row.set_diff(ev["diff"])
+                    w = PlanCard(args["items"])
+                else:
+                    row = ToolRow(name, args)
+                    res = results.get(ev.get("call_id") or "")
+                    if res is not None:
+                        failed = str(res.get("status", "")) == "error" or \
+                            (res.get("exit_code") not in (None, 0))
+                        elapsed = None
+                        try:
+                            if res.get("ts") and ev.get("ts"):
+                                elapsed = max(0.0, float(res["ts"]) - float(ev["ts"]))
+                        except Exception:
+                            elapsed = None
+                        row.set_result(res.get("text", ""), failed=failed, elapsed=elapsed)
+                        if res.get("diff"):
+                            row.set_diff(res["diff"])
+                    w = row
             elif k == "todo":
                 items = ev.get("items") or []
                 if items:
-                    self._add(PlanCard(items))
-                    last_assistant = None
+                    w = PlanCard(items)
             elif k == "note":
                 t = (ev.get("text") or "").strip()
                 if t:
-                    self._note(t)
-                    last_assistant = None
+                    w = SystemNote(t)
             elif k == "review":
                 v = ev.get("verdict")
                 if v and str(v).lower() not in ("pass", "ok", "done"):
-                    self._note(f"Review: {v} — {ev.get('reason', '')}".strip(), "warn")
+                    w = SystemNote(
+                        f"Review: {v} — {ev.get('reason', '')}".strip(), "warn"
+                    )
 
-        self._to_bottom(force=True)
+            if w is not None:
+                self._insert(w, at_top)
 
-    def _last_tool_row(self) -> ToolRow | None:
-        for i in range(self.flow.count() - 1, -1, -1):
-            w = self.flow.itemAt(i).widget()
-            if isinstance(w, ToolRow):
-                return w
-        return None
+    def _insert(self, w: QWidget, at_top: bool = False):
+        if at_top:
+            self.flow.insertWidget(self._flow_top, w)
+            self._flow_top += 1
+        else:
+            self.flow.insertWidget(self.flow.count() - 1, w)
+        w.show()
 
     # ── rendering helpers ───────────────────────────────────────────────────
     def _add(self, w: QWidget):
@@ -1636,12 +1927,14 @@ class KernWindow(QMainWindow):
         sb.setValue(sb.maximum())
 
     def _on_range(self, _mn, _mx):
-        self._to_bottom()
-
-    def _on_scroll(self, v: int):
-        sb = self.scroll.verticalScrollBar()
-        # stop yanking the view if the user scrolled up to read
-        self._suppress_autoscroll = v < sb.maximum() - 80
+        # When older history was just prepended, re-anchor so the reader's view
+        # doesn't jump; otherwise keep pinned to the bottom for live streaming.
+        if self._pending_anchor:
+            sb = self.scroll.verticalScrollBar()
+            sb.setValue(sb.value() + (sb.maximum() - self._pending_anchor))
+            self._pending_anchor = None
+        elif not self._suppress_autoscroll:
+            self._to_bottom()
 
     def _show_thinking(self):
         if self._thinking is None:
