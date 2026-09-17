@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from kern.kernfile import (MARK_BEGIN, MARK_END, detect_stack, detect_test_command,
-                           ensure_kern_md, generate, render_auto_section)
+                           detect_workflows, ensure_kern_md, generate, render_auto_section)
 
 
 @pytest.fixture
@@ -80,3 +80,36 @@ def test_node_repo(tmp_path):
     (tmp_path / 'package.json').write_text('{"name":"x"}')
     assert 'node' in detect_stack(tmp_path)
     assert detect_test_command(tmp_path) == 'npm test'
+
+
+def test_detect_workflows_python(pyrepo):
+    wf = detect_workflows(pyrepo)
+    assert wf['test'] == 'pytest -q'
+    assert wf['build'] == 'python -m build'
+    assert wf['lint'] == 'ruff check .'
+
+
+def test_detect_workflows_prefers_pkg_scripts(tmp_path):
+    (tmp_path / 'package.json').write_text(
+        '{"scripts":{"dev":"vite","build":"vite build","lint":"eslint .","test":"vitest"}}')
+    wf = detect_workflows(tmp_path)
+    assert wf['test'] == 'npm test'
+    assert wf['build'] == 'npm run build'
+    assert wf['lint'] == 'npm run lint'
+    assert wf['run'] == 'npm run dev'
+
+
+def test_detect_workflows_go(tmp_path):
+    (tmp_path / 'go.mod').write_text('module x\n')
+    wf = detect_workflows(tmp_path)
+    assert wf['test'] == 'go test ./...'
+    assert wf['build'] == 'go build ./...'
+    assert wf['run'] == 'go run .'
+
+
+def test_render_includes_workflow_line(pyrepo):
+    out = render_auto_section(pyrepo)
+    assert '**workflow**' in out
+    assert '**test** `pytest -q`' in out
+    assert '**build**' in out
+    assert '**lint**' in out

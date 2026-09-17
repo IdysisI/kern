@@ -36,6 +36,33 @@ _TEST_RUNNERS = [
     ('go test', 'go test ./...', ['go.mod']),
 ]
 
+# (label, command, marker-file) — first match wins per category.
+_LINTERS = [
+    ('ruff', 'ruff check .', ['ruff.toml', '.ruff.toml']),
+    ('ruff (pyproject)', 'ruff check .', ['pyproject.toml']),
+    ('flake8', 'flake8', ['.flake8', 'setup.cfg', 'tox.ini']),
+    ('eslint', 'npx eslint .', ['.eslintrc', '.eslintrc.json', 'eslint.config.js']),
+    ('golangci-lint', 'golangci-lint run', ['.golangci.yml', '.golangci.yaml']),
+    ('cargo clippy', 'cargo clippy', ['Cargo.toml']),
+]
+
+_BUILDERS = [
+    ('python -m build', 'python -m build', ['pyproject.toml']),
+    ('npm run build', 'npm run build', ['package.json']),
+    ('cargo build', 'cargo build --release', ['Cargo.toml']),
+    ('go build', 'go build ./...', ['go.mod']),
+    ('make', 'make', ['Makefile', 'makefile']),
+]
+
+_RUNNERS = [
+    ('python -m', None, ['__main__.py']),  # resolved against the package dir
+    ('manage.py', 'python manage.py runserver', ['manage.py']),
+    ('npm start', 'npm start', ['package.json']),
+    ('cargo run', 'cargo run', ['Cargo.toml']),
+    ('go run', 'go run .', ['go.mod']),
+    ('main.py', 'python main.py', ['main.py']),
+]
+
 
 def _read(path: Path) -> str:
     try:
@@ -70,6 +97,65 @@ def detect_test_command(root: Path) -> str:
     return 'pytest -q'
 
 
+def _pkg_scripts(root: Path) -> dict:
+    """package.json scripts (for accurate build/lint/test commands)."""
+    import json
+    pj = root / 'package.json'
+    if not pj.is_file():
+        return {}
+    try:
+        return (json.loads(pj.read_text(errors='replace')) or {}).get('scripts', {}) or {}
+    except Exception:
+        return {}
+
+
+def detect_workflows(root: Path) -> dict:
+    """Detect the dev loop: test / build / lint / run commands (deterministic).
+
+    Returns a dict with only the categories that resolved. Prefers explicit
+    package.json scripts over generic tool guesses so the documented command is
+    the one that actually works in this repo.
+    """
+    root = Path(root)
+    wf: dict[str, str] = {'test': detect_test_command(root)}
+    scripts = _pkg_scripts(root)
+
+    # build
+    if 'build' in scripts:
+        wf['build'] = 'npm run build'
+    else:
+        for _n, cmd, markers in _BUILDERS:
+            if any((root / m).exists() for m in markers):
+                wf['build'] = cmd
+                break
+
+    # lint
+    if 'lint' in scripts:
+        wf['lint'] = 'npm run lint'
+    else:
+        for _n, cmd, markers in _LINTERS:
+            if any((root / m).exists() for m in markers):
+                wf['lint'] = cmd
+                break
+
+    # run / dev server
+    if 'start' in scripts:
+        wf['run'] = 'npm start'
+    elif 'dev' in scripts:
+        wf['run'] = 'npm run dev'
+    else:
+        for _n, cmd, markers in _RUNNERS:
+            hit = next((m for m in markers if (root / m).exists()), None)
+            if hit:
+                if cmd is None:  # python -m <pkg>: resolve to the package holding __main__.py
+                    pkg = root / '__main__.py'
+                    wf['run'] = 'python -m ' + (root.name if pkg.exists() else hit.replace('/__main__.py', '').replace('\\', '/'))
+                else:
+                    wf['run'] = cmd
+                break
+    return wf
+
+
 def detect_entry_points(root: Path) -> list[str]:
     """Likely entry points / top-level modules (bounded, no deep scan)."""
     root = Path(root)
@@ -100,15 +186,18 @@ def render_auto_section(root: Path) -> str:
     """The auto-generated block (lean, deterministic)."""
     root = Path(root)
     stack = detect_stack(root)
-    test_cmd = detect_test_command(root)
+    wf = detect_workflows(root)
     entries = detect_entry_points(root)
     constraints = detect_constraints(root)
     lines = [
         '## Project map (auto-detected by Kern)',
         '',
         f"- **stack**: {', '.join(stack) if stack else 'unknown'}",
-        f"- **tests**: `{test_cmd}`",
     ]
+    # The dev loop: only document commands that resolved for this repo.
+    loop = ' → '.join(f"**{k}** `{v}`" for k, v in wf.items() if v)
+    if loop:
+        lines.append(f'- **workflow**: {loop}')
     if entries:
         lines.append(f"- **entry points**: {', '.join(entries)}")
     if constraints:
