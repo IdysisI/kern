@@ -943,6 +943,12 @@ class Engine:
                    media: dict | None = None) -> str:
         with turn_lease(self.session.dir):
             self._turn_start_n = len(self.session.events)
+            # Audit #1.4: a plain-text user reply signals a fresh intent, so
+            # any stale constraint from a previous turn (force_plan, escalate,
+            # etc.) is cleared here. Without this, a constraint set in turn N
+            # would still gate turn N+1's tool calls even though the user has
+            # moved on. The new turn is a new chance to act cleanly.
+            self._last_constraint_meta = None
             self.session.emit("user", text=user_text, **({"media": media} if media else {}))
             # Preserve active task objective across generic "Continue" prompts:
             # a user saying "Continue" is telling the agent to keep working on its
