@@ -20,6 +20,30 @@ import hashlib
 from .storage import atomic_write, file_lock, path_key, redact_value
 from pathlib import Path
 
+# Audit finding #3.1: same pattern set as kern/syscalls.py:_scrub_injection.
+# Compacted summary/facts are inlined into every subsequent model context,
+# so any injection pattern in them would leak forever. Keep these in sync
+# with syscalls.py if new patterns are added there.
+_COMPACT_INJECTION_PATTERNS = [
+    (re.compile(r"<system>.*?</system>", re.IGNORECASE | re.DOTALL),
+     "[redacted: <system> block]"),
+    (re.compile(r"<ip_reminder>.*?</ip_reminder>", re.IGNORECASE | re.DOTALL),
+     "[redacted: ip_reminder block]"),
+    (re.compile(r"<harness_hint>.*?</harness_hint>", re.IGNORECASE | re.DOTALL),
+     "[redacted: harness_hint block]"),
+    (re.compile(r"<assistant-hint>.*?</assistant-hint>", re.IGNORECASE | re.DOTALL),
+     "[redacted: assistant-hint block]"),
+    (re.compile(r"\[harness hint:[^\]]*\]", re.IGNORECASE),
+     "[redacted: harness-hint prose]"),
+]
+
+
+def _scrub_compact_text(text: str) -> str:
+    out = text
+    for pat, repl in _COMPACT_INJECTION_PATTERNS:
+        out = pat.sub(repl, out)
+    return out
+
 
 KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))
 SESSIONS = KERN_HOME / "sessions"
@@ -223,8 +247,10 @@ class Session:
         with open(self.dir / f"compacted-{int(time.time())}.jsonl", "a", encoding="utf-8") as f:
             for ev in old:
                 f.write(json.dumps(ev, ensure_ascii=False) + "\n")
-        compact_ev = self.emit("compact", upto_n=upto_n, text=summary,
-                               facts=facts, covers=len(old))
+        compact_ev = self.emit("compact", upto_n=upto_n,
+                               text=_scrub_compact_text(summary),
+                               facts=_scrub_compact_text(facts),
+                               covers=len(old))
         return len(old)
 
     def undo_to_last_user(self, keep_last_user: bool = True) -> int:
