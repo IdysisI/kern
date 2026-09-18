@@ -261,6 +261,11 @@ def test_exec_restart_pins_repo_env(monkeypatch, repo_copy):
 
     running_pkg = Path(updater.__file__).resolve().parent
     monkeypatch.setenv('KERN_REPO', str(repo_copy))
+    # hermetic: KERN_RESTART_COUNT/TS leak from a parent Kern process when the
+    # suite runs INSIDE kern (exec-restarted daemon); the assertion below means
+    # "counter starts at 0 and travels as 1", so clear any inherited value.
+    monkeypatch.delenv('KERN_RESTART_COUNT', raising=False)
+    monkeypatch.delenv('KERN_RESTART_TS', raising=False)
     monkeypatch.setattr(os, 'execve', fake_execve)
     monkeypatch.setattr(sys, 'argv', [str(running_pkg / 'daemon.py')])
     with pytest.raises(SystemExit):
