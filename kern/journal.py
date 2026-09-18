@@ -273,10 +273,18 @@ class Session:
         return not any(ev["kind"] == "turn_end" for ev in self.events[last_user + 1:])
 
     def meta(self) -> dict:
+        """Merged view of all meta events, later fields overriding earlier.
+
+        The first meta (create_session) carries cwd/parent/model; subsequent
+        ones (e.g. Worker.set_model) carry only the changed fields. Merging
+        keeps resume/hot-reload recovery reading the CURRENT model instead of
+        the session's initial one.
+        """
+        merged: dict = {}
         for ev in self.events:
             if ev["kind"] == "meta":
-                return ev
-        return {}
+                merged.update(ev)
+        return merged
 
     # ---- paging scratchpad --------------------------------------------------
 

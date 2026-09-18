@@ -117,6 +117,15 @@ class Worker:
         """Change the model and journal it so a hot-reload resume can recover
         the right model instead of falling back to the default."""
         self.model = model
+        eng = getattr(self, "_eng", None)
+        if eng is not None and eng.model != model:
+            # The cached Engine captured its model at construction; everything
+            # downstream (system prompt, tool gating via health_of, output
+            # budget, stream_chat) re-derives from engine.model at call time,
+            # so retargeting in place switches the model without /restart.
+            eng.model = model
+            # fenced fallback was calibrated for the OLD model's tool health
+            eng.forced_fenced = False
         self.session.emit("meta", model=model)
 
     def engine(self) -> Engine:
@@ -125,6 +134,12 @@ class Worker:
             eng = Engine(self.client, self.model, self.session, self.cwd,
                          approve=self.approve, stream_cb=self.stream_cb)
             self._eng = eng
+        elif eng.model != self.model:
+            # defense in depth: any path that changed worker.model without
+            # going through set_model() (e.g. resume handshake) still gets an
+            # engine targeting the current model.
+            eng.model = self.model
+            eng.forced_fenced = False
         return eng
 
     @property
@@ -812,8 +827,11 @@ async def handler(ws):
                     if worker is not None and worker is not new_worker:
                         worker.clients.discard(ws)
                     worker = new_worker
-                    if requested_model:
-                        worker.model = requested_model
+                    if requested_model and requested_model != worker.model:
+                        # go through set_model() so the live engine is
+                        # retargeted and the choice is journaled (a direct
+                        # assignment left the cached Engine on the old model)
+                        worker.set_model(requested_model)
                     worker.clients.add(ws)
                     # LIMIT 1: auto-resume an open turn left by a daemon crash
                     # (user message journaled, no turn_end marker after it).
