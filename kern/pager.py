@@ -98,12 +98,15 @@ def _slate(events: list[dict], session=None) -> str:
     if subagents:
         lines.append("subagents:")
         for hid, info in sorted(subagents.items()):
+            task = str(info.get("task") or "")[:70]
             if info["status"] == "finished":
-                lines.append(f"  ✓ {hid}: finished (report ready: {info.get('report')})")
+                # show the task so the model can tell a STALE report (older
+                # task) from a relevant one BEFORE spending a read on it
+                lines.append(f"  ✓ {hid}: finished [{task}] (report: {info.get('report')})")
             elif info["status"] == "failed":
-                lines.append(f"  ✗ {hid}: failed")
+                lines.append(f"  ✗ {hid}: failed [{task}]")
             else:
-                lines.append(f"  … {hid}: running ({info['task']})")
+                lines.append(f"  … {hid}: running ({task})")
 
     lines.append("</work-state>")
     return "\n".join(lines)
