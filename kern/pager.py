@@ -223,8 +223,16 @@ def materialize(events: list[dict], session) -> list[dict]:
                              "text": f"[identical to tool result #{first_n} — "
                                      f"{len(text):,} bytes, read(path/scratch) if needed]"})
                 continue
-            if rh:
-                seen_result_hashes[rh] = ev.get("n", i)
+            # NOTE: the content hash is registered per-branch below, only where
+            # the body is actually rendered inline in THIS pass. It used to be
+            # registered unconditionally here, which caused a livelock: a big
+            # old result gets cleared to "[old tool result cleared -> path]",
+            # the model re-reads that spill file to recover it, and the fresh
+            # result — byte-identical to the cleared event — collapsed to
+            # "[identical to tool result #N]". Both ends of that chain were
+            # pointers, so the content never reached the model and every retry
+            # looped the same way (observed for ~30 turns in session
+            # 20260918-202511 while trying to read a handoff document).
             if i in keep_inline:
                 out_text = _squash(text)
                 if len(text) > BIG:
@@ -235,6 +243,10 @@ def materialize(events: list[dict], session) -> list[dict]:
                 if ev.get("media"):
                     m_item["media"] = ev["media"]
                 msgs.append(m_item)
+                # Body is visible in this view: a later identical result may
+                # safely collapse to a pointer to it.
+                if rh:
+                    seen_result_hashes[rh] = ev.get("n", i)
             elif i not in keep_inline and n - i > STALE_AGE and len(text) > STALE_MIN \
                     :
                 path = session.offload(f"t{ev['n']}", text)
@@ -242,9 +254,14 @@ def materialize(events: list[dict], session) -> list[dict]:
                              "text": f"[old tool result cleared: {ev.get('name', '?')} — "
                                      f"{len(text):,} bytes -> {path}. "
                                      f"Use read(path) if you need it again.]"})
+                # Deliberately NOT registered: the body is gone from this view,
+                # so it is not a valid dedup target.
             else:
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
                              "text": _squash(text)})
+                # Body visible (squashed): valid dedup target.
+                if rh:
+                    seen_result_hashes[rh] = ev.get("n", i)
         elif kind == "note":
             # Some note events carry items=[{id,text},...] (the note tool completion
             # path) while others carry text= directly. Normalize so consumers don't
