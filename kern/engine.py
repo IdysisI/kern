@@ -773,6 +773,14 @@ class Engine:
                 await asyncio.sleep(_stall_poll)
                 if child_state.get("done"):
                     break
+                if not entry.get("acquired"):
+                    # Queued: waiting for a concurrency permit. Queue time is
+                    # NOT idle time — counting it here killed agents 4..N of a
+                    # batch before they could issue a single request (observed:
+                    # 8 of 11 audit agents dead after 240s in queue), and
+                    # status then lied "still running (1944s, 0 requests)".
+                    child_state["last"] = time.monotonic()
+                    continue
                 idle_for = time.monotonic() - child_state["last"]
                 reqs = getattr(child_engine, "requests", 0)
                 prev_reqs = child_state.get("reqs", -1)
@@ -814,6 +822,7 @@ class Engine:
             "started": time.time(),
             "max_steps": steps_cap,
             "completed": False,
+            "acquired": False,  # concurrency permit held? (queued vs running)
             "result": None,
             "error": None,
             "report_path": None,
@@ -878,9 +887,29 @@ class Engine:
                 child_state["done"] = True
                 hb.cancel()
                 wd.cancel()
+                # Guarantee a terminal state. Cancelling a QUEUED body raises at
+                # the sem acquisition — before the body's inner try — so none of
+                # its handlers run and entry["completed"] would stay False
+                # forever (zombie: status lies "still running (1944s,
+                # 0 requests)" and the delegation guard counts it live forever).
+                # Also cancel the body task itself: cancelling run_subagent from
+                # outside (cancel action, daemon shutdown) would otherwise leave
+                # the body running — still hitting the API and still holding its
+                # concurrency permit.
+                if not body.done():
+                    body.cancel()
+                    try:
+                        await body
+                    except BaseException:
+                        pass
+                if not entry.get("completed"):
+                    entry["completed"] = True
+                    if not entry.get("error"):
+                        entry["error"] = "cancelled before completion"
 
         async def _run_subagent_body():
             async with sem:
+                entry["acquired"] = True
                 try:
                     reply = await child_engine.chat(prompt, max_steps=steps_cap)
                     entry["completed"] = True
@@ -972,6 +1001,12 @@ class Engine:
                 reqs = entry["engine"].requests if entry["engine"] else "?"
                 dt = round(time.time() - entry["started"], 1)
                 return f"subagent {handle}: completed in {dt}s ({reqs} requests). Report: {entry['report_path']}", {}
+            elif not entry.get("acquired"):
+                dt = round(time.time() - entry["started"], 1)
+                return (f"subagent {handle}: QUEUED — waiting for a concurrency permit "
+                        f"({dt}s in queue; all KERN_SUBAGENT_CONCURRENCY slots busy). "
+                        f"It will start automatically when a slot frees — it is NOT "
+                        f"stalled, and queue time does not count toward its stall budget.", {})
             else:
                 dt = round(time.time() - entry["started"], 1)
                 reqs = entry["engine"].requests if entry["engine"] else "?"
