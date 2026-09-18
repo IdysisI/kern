@@ -1429,7 +1429,16 @@ class Engine:
                     # journal only: notes re-enter the context via <work-state>
                     # (pager._slate). Don't stream the raw JSON list — the tool
                     # result text already told the model/user what happened.
-                    self.session.emit("note", items=meta["notes"])
+                    # Also include a synthesized text= summary so any consumer
+                    # that does ev["text"] (legacy code paths) keeps working.
+                    notes_text = "\n".join(
+                        str(n.get("text", "")) for n in meta["notes"] if isinstance(n, dict)
+                    )
+                    self.session.emit(
+                        "note",
+                        items=meta["notes"],
+                        text=notes_text or None,
+                    )
                 if meta.get("handle"):
                     self.stream_cb("handle", meta["handle"])
                 if getattr(self, "_cancel_after_receipt", False):

@@ -1579,7 +1579,16 @@ class KernApp(App):
                 if ev.get("diff"):
                     hit[2].set_diff(ev["diff"])
         elif kind == "note":
-            self._chat_note("◈ " + ev.get("text", "").splitlines()[0])
+            # Defensive: older note events may lack "text" (carried items= instead).
+            note_text = ev.get("text")
+            if not note_text:
+                items = ev.get("items") or []
+                note_text = next(
+                    (str(it.get("text", "")) for it in items if isinstance(it, dict) and it.get("text")),
+                    "",
+                )
+            head = note_text.splitlines()[0] if note_text else "(empty note)"
+            self._chat_note("◈ " + head)
         elif kind == "compact":
             self._chat_note(f"◈ session compacted ({ev.get('covers', '?')} events)")
 

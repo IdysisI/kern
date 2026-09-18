@@ -246,7 +246,18 @@ def materialize(events: list[dict], session) -> list[dict]:
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
                              "text": _squash(text)})
         elif kind == "note":
-            msgs.append({"role": "user", "text": f"<system-note>{ev['text']}</system-note>"})
+            # Some note events carry items=[{id,text},...] (the note tool completion
+            # path) while others carry text= directly. Normalize so consumers don't
+            # KeyError on the missing field.
+            note_text = ev.get("text")
+            if note_text is None:
+                items = ev.get("items") or []
+                note_text = "\n".join(
+                    str(it.get("text", "")) for it in items if isinstance(it, dict)
+                )
+            if not note_text:
+                continue
+            msgs.append({"role": "user", "text": f"<system-note>{note_text}</system-note>"})
         elif kind == "thinking":
             continue
     return _complete_exchanges(msgs)
