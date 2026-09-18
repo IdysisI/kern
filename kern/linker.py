@@ -14,6 +14,7 @@ confirms with a note. Nothing is preloaded. Nothing is permanent by default.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -272,6 +273,24 @@ class MountTable:
                     "description": f"[{srv} mcp] " + (t.get("description") or "")[:200],
                     "parameters": clean_params}})
         return out
+
+    @property
+    def version(self) -> int:
+        """Stable hash of mount state; bumps whenever a skill or MCP is added/removed.
+
+        Used by Engine._tools() to invalidate its cached tool schema. Computed
+        on demand (no mutation of MountTable needed) so adding/removing mounts
+        via the existing event handlers naturally invalidates downstream
+        caches. Cost is O(n) over mount names — cheap compared to the JSON
+        round-trip on the tool schema it protects.
+        """
+        h = hashlib.sha256()
+        for name in sorted(self.skills):
+            h.update(name.encode())
+        for name in sorted(self.mcps):
+            h.update(name.encode())
+        # Use the first 8 bytes as a stable int (enough entropy for cache key).
+        return int.from_bytes(h.digest()[:8], "big")
 
     @staticmethod
     def wire_name(server, tool):

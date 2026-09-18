@@ -330,6 +330,23 @@ class Engine:
         # If model has been probed and native_tools is explicitly False, use fenced mode
         if h and h.get("ok") and not h.get("native_tools", True) and not include_fenced:
             return None
+
+        # Audit #1.3: cache the schema when nothing that affects it has changed.
+        # Cache key captures every input that influences the resulting list:
+        # model id, health probe (native_tools / py_repl), recursion depth,
+        # mount state (via MountTable.version, see kern/linker.py).
+        cache_key = (
+            self.model,
+            bool(h and h.get("ok") and not h.get("native_tools", True)),
+            bool(h.get("py_repl") if h else False),
+            bool(os.environ.get("KERN_FORCE_PY")),
+            getattr(self, "depth", 0),
+            getattr(self.mounts, "version", 0),
+        )
+        cached = getattr(self, "_tools_cache", None)
+        if cached is not None and cached[0] == cache_key and not include_fenced:
+            return cached[1]
+
         tools = syscalls.SCHEMAS + self.mounts.extra_tools()
         # A repeated effect needs an explicit rationale; reads remain freely
         # repeatable. The field belongs to the harness, not the remote tool.
@@ -347,6 +364,8 @@ class Engine:
             tools = [t for t in tools if t.get("function", {}).get("name") != "py"]
         if getattr(self, 'depth', 0) >= 2:
             tools = [t for t in tools if t.get("function", {}).get("name") != "spawn"]
+
+        self._tools_cache = (cache_key, tools)
         return tools
 
     def _replay_mounts(self) -> None:
