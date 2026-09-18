@@ -204,6 +204,37 @@ def _top_repeats(counter_like, limit: int = 5) -> list:
 
 def _human_desc(name: str, args: dict) -> str:
     return Engine._human_desc_static(name, args)
+
+
+def _call_is_error(name: str, args: dict, text: str, meta: dict) -> bool:
+    """Error-loop sensor: did this call genuinely FAIL?
+
+    Structural, never content-based. The previous implementation sniffed the
+    payload ("error:" in text) which matched ANYWHERE in a successful result:
+    reading a source file that contains the string 'error:' (kern/client.py
+    has five occurrences) was counted as a failure, and three such reads
+    tripped force_plan — the engine then hard-rejected every tool call while
+    nothing was actually wrong (reproduced live four times during the audit
+    that found it, 2026-09-18).
+
+    Truth sources, in order:
+      1. meta["status"] when the tool set one (failed/denied/uncertain) —
+         tool_exec reports non-zero exits, timeouts and interrupts this way;
+      2. an explicit non-zero exit_code;
+      3. the result TEXT starting with the conventional 'error:'/'denied'
+         prefix tools emit on failure (startswith only — never `in`, which
+         would match file contents, grep output or test summaries).
+    """
+    text = str(text)
+    status = str((meta or {}).get("status") or "")
+    if status in ("failed", "denied", "uncertain"):
+        return True
+    code = (meta or {}).get("exit_code")
+    if isinstance(code, int) and code != 0:
+        return True
+    return text.startswith("error:") or text.startswith("denied")
+
+
 MOUNT_RE = re.compile(r"^\[(mount|mount-once|unmount|list capabilities)(?::\s*([^\]]+))?\]", re.M)
 
 
@@ -1377,7 +1408,7 @@ class Engine:
                             f"{prior_clean[:120]!r}. You have just re-run it; side effects "
                             f"may have been repeated.]\n{text}")
                 # Error loop sensor: prevent agents from stubbornly brute-forcing failing calls
-                is_err = "error:" in str(text) or ("exit=" in str(text) and "exit=0" not in str(text))
+                is_err = _call_is_error(name, args, text, meta)
                 if is_err:
                     self._consecutive_errors.append(str(text).splitlines()[0][:60])
                     if len(self._consecutive_errors) >= 3:
