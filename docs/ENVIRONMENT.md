@@ -19,8 +19,9 @@ Until that script lands, this file is maintained manually.
 
 | Variable | Default | Where | What it does |
 |----------|---------|-------|--------------|
-| `KERN_API_KEY` | `"kern"` | `client.py`, `__main__.py` | Bearer token for the model gateway. **Must be set** to a real key — the literal string `"kern"` is a placeholder that always 401s. |
-| `KERN_BASE_URL` | `"http://127.0.0.1:8790"` | `client.py` | URL of the model gateway. Change if you self-host or use a proxy. |
+| `KERN_API_KEY` | `"kern"` | `client.py`, `__main__.py` | Bearer token for the model gateway. **Required only for the default gateway** — the literal string `"kern"` is a placeholder that always 401s. Keyless setups are supported, see `KERN_BASE_URL` below. |
+| `KERN_BASE_URL` | `"http://127.0.0.1:8790"` | `client.py` | URL of the model gateway. Point it at a keyless provider (Ollama `http://127.0.0.1:11434`, LM Studio, llama.cpp, vLLM, or any local/LAN/Tailscale proxy) and no API key is needed — the first-run guard then downgrades to an informational note instead of exiting. |
+| `KERN_ALLOW_KEYLESS` | *(unset)* | `__main__.py` | When `1` (or `true`/`yes`), silences the first-run API-key check entirely — for keyless defaults or fully scripted setups. |
 | `KERN_MODEL` | `"gemini-3.8-flash-api"` | `__main__.py` | Default model. Any model the gateway knows about. |
 | `KERN_PROTOCOL` | *(unset)* | `client.py` | Wire format override (`anthropic`, `openai`, `gemini`). Normally auto-detected from the gateway. |
 
