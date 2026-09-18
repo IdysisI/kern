@@ -315,10 +315,31 @@ class Session:
     # ---- paging scratchpad --------------------------------------------------
 
     def offload(self, tag: str, content: str) -> str:
+        """Spill bulky content to scratch/ and return a stable path.
+
+        The filename is CONTENT-addressed: the digest is derived from the
+        content, and the tag is only a human-readable prefix. Because
+        callers derive the tag from the event number (``t{ev['n']}``) and
+        ``_truncate()`` RENUMBERS every surviving event on compaction, the
+        same content is re-offloaded under a different tag after each
+        renumber. Without this lookup that produced two failure modes
+        (observed in session 20260918-202511): pointers rendered before a
+        renumber dangled (the model was told to read ``t287-<digest>.txt``
+        while the only file on disk was ``t154-<digest>.txt``), and every
+        re-render duplicated the spill file without bound.
+
+        Returning the FIRST existing file for a digest keeps every pointer
+        that has ever been rendered resolvable and stops the growth.
+        """
         if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,100}',tag):
             raise ValueError('invalid artifact tag')
         self.scratch.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(content.encode('utf-8')).hexdigest()[:24]
+        # Content already spilled under an earlier (pre-renumber) tag? Reuse
+        # it so the path we return is the one that actually exists.
+        existing = sorted(self.scratch.glob(f"*-{digest}.txt"))
+        if existing:
+            return str(existing[0])
         p = self.scratch / f"{tag}-{digest}.txt"
         if not p.exists():
             atomic_write(p, content)
