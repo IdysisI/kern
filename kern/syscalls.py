@@ -1254,6 +1254,12 @@ _REDACT_RULES = [
 def redact(text: str) -> str:
     """Secrets must never leave the machine toward a third-party proxy, and
     must not sit in plaintext journals either."""
+    # Audit #5.3: user-marked secrets via [secret]...[/secret] tags.
+    # Complements the automatic pattern-based redaction below — lets a user
+    # explicitly opt a span out of journals and out of model context without
+    # needing to depend on pattern recognition.
+    text = re.sub(r"\[secret\].*?\[/secret\]", "[redacted:secret-marked-by-user]",
+                  text, flags=re.DOTALL | re.IGNORECASE)
     for rule in _REDACT_RULES:
         if rule.groups == 2:
             text = rule.sub(lambda m: m.group(1) + "[redacted-by-kern]", text)
