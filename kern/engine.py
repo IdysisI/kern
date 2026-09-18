@@ -235,6 +235,42 @@ def _call_is_error(name: str, args: dict, text: str, meta: dict) -> bool:
     return text.startswith("error:") or text.startswith("denied")
 
 
+def _repeat_key(name: str, args: dict, tgt: str) -> str:
+    """Key identifying *the same action* for repeat-suppression.
+
+    Contract: identical actions share a key (real loops still suppress);
+    distinct actions never share one. The previous implementation used the
+    regex-extracted ``tgt`` fragment for exec/py, so genuinely different
+    commands collided: ``grep -rn pat kern/`` and ``grep -rn pat tests/``
+    both keyed on 'pat'; ``sed -n 1,40p a.py`` and ``...b.py`` both keyed
+    on '1,40p'. A routine multi-scope search was soft-suppressed at the 3rd
+    command and hard-suppressed at the 5th — the model silently lost the
+    output of legitimate exploration (same class as the 2026-09-18
+    read-tool incident).
+
+    Per tool:
+      read  -> path + requested slice (offset/limit/full)
+      exec  -> the normalized command itself
+      py    -> a digest of the code itself
+      other -> the explicit target arg (url/query/path/handle/memory key),
+               which is reliable because the model supplied it directly.
+    """
+    args = args or {}
+    if name == "read":
+        return (
+            f"{tgt}@off={args.get('offset', '')}"
+            f":lim={args.get('limit', '')}"
+            f":{'full' if args.get('full') else ''}"
+        )
+    if name == "exec":
+        return "exec:" + " ".join(str(args.get("cmd", "")).split())[:200]
+    if name == "py":
+        import hashlib
+        code = str(args.get("code", ""))
+        return "py:" + hashlib.sha1(code.encode()).hexdigest()[:16]
+    return tgt
+
+
 MOUNT_RE = re.compile(r"^\[(mount|mount-once|unmount|list capabilities)(?::\s*([^\]]+))?\]", re.M)
 
 
@@ -1466,23 +1502,13 @@ class Engine:
                 # open files. Direction C: silently suppress the duplicate content
                 # instead of telling the model to stop re-reading.
                 if not _step_is_progress(name, args) and tgt:
-                    # Key reads on the requested SLICE, not just the path:
-                    # reading consecutive chunks of one file is linear
-                    # progress, not a repeat. Only identical
-                    # (path, offset, limit, full) re-reads count toward
-                    # suppression. (Root cause of the 2026-09-18
-                    # "read tool broken" incident: distinct slices of one
-                    # file were soft-suppressed at 3 and HARD-suppressed
-                    # to '' at 5, rendering as '(no output)'.)
-                    if name == "read":
-                        _ra = args or {}
-                        repeat_key = (
-                            f"{tgt}@off={_ra.get('offset', '')}"
-                            f":lim={_ra.get('limit', '')}"
-                            f":{'full' if _ra.get('full') else ''}"
-                        )
-                    else:
-                        repeat_key = tgt
+                    # Key on the ACTION, not a lossy fragment of it: see
+                    # _repeat_key(). Distinct slices/commands/scopes are
+                    # linear progress, not repeats; only identical actions
+                    # count toward suppression. (Root cause of the
+                    # 2026-09-18 "read tool broken" incident and its
+                    # exec/py sibling found in audit C round 1.)
+                    repeat_key = _repeat_key(name, args, tgt)
                     self._inspection_targets[repeat_key] = self._inspection_targets.get(repeat_key, 0) + 1
                     seen_n = self._inspection_targets[repeat_key]
                     # Precedence: an existing force_plan/escalate (set earlier in
