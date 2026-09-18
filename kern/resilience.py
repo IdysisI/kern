@@ -33,6 +33,9 @@ _UNKNOWN = "unknown"
 
 _HTTP_RE = re.compile(r"http status[=:\s]+(\d{3})", re.I)
 _429_RE = re.compile(r"\b(429|rate.?limit|too many requests|quota exceeded)\b", re.I)
+# gateway/proxy rejections: request never reached the model, so never billed
+_GATEWAY_RE = re.compile(r"\b(502|503|504)\b|proxy_error|bad gateway|"
+                         r"gateway ?time|overloaded|unavailable", re.I)
 
 
 def classify_error(error: str) -> str:
@@ -129,10 +132,17 @@ def decide_retry(error: str, *, produced_output: bool, attempt: int,
     if cls not in _RETRYABLE:
         return RetryDecision(False, cls, reason=f"non-retryable class={cls}")
 
-    # A transport error before ANY output is a free retry candidate: the connection
-    # died before a request necessarily reached the model. Treat attempt==0 +
-    # no output as free; everything else is billed.
-    billed = not (cls == _TRANSPORT and not produced_output and attempt == 0)
+    # FREE retries = the provider never billed us:
+    #  - transport errors: connection died before/while sending, nothing ran
+    #  - gateway 502/503/504 with no output: the proxy/overload guard rejected
+    #    the request — the model never ran (this is what burned 3/3 billed
+    #    budget on a single proxy outage before the fix)
+    # A plain 500 with no output stays BILLED (ambiguous: the model may have
+    # run and the response was lost). Free retries don't decrement the billed
+    # budget; total attempts are still capped by the engine's max_attempts.
+    gateway_unbilled = bool(cls == _SERVER and not produced_output
+                            and _GATEWAY_RE.search(error or ""))
+    billed = not ((cls == _TRANSPORT or gateway_unbilled) and not produced_output)
 
     if not budget.can_retry(billed):
         return RetryDecision(False, cls, billed=billed,

@@ -495,6 +495,14 @@ class Engine:
                         "If repetition is intentional, set _kern_repeat_reason to the concrete reason/new evidence.")
         return None
 
+    def _current_notes(self) -> list[dict]:
+        """Latest working-memory notes, derived from journal events (never stale,
+        survives resume/hot-reload because the journal is the source of truth)."""
+        for ev in reversed(self.session.events):
+            if ev.get("kind") == "note":
+                return ev.get("items") or []
+        return []
+
     async def _call_tool(self, name: str, args: dict) -> tuple[str, dict]:
         if self.mounts.owns_tool(name):
             try:
@@ -517,6 +525,7 @@ class Engine:
             "map": lambda: syscalls.tool_map(self.cwd, **args),
             "py": lambda: syscalls.tool_py(self.session, **args, _cancel=cancel),
             "todo": lambda: syscalls.tool_todo(**args),
+            "note": lambda: syscalls.tool_note(self._current_notes(), **args),
         }
         if name in funcs:
             # Shield the concrete effect until its receipt is known. Cancellation
@@ -1416,6 +1425,11 @@ class Engine:
                     self.todo = meta["todo"]
                     self.session.emit("todo", items=meta["todo"])
                     self.stream_cb("todo", json.dumps(meta["todo"]))
+                if "notes" in meta:
+                    # journal only: notes re-enter the context via <work-state>
+                    # (pager._slate). Don't stream the raw JSON list — the tool
+                    # result text already told the model/user what happened.
+                    self.session.emit("note", items=meta["notes"])
                 if meta.get("handle"):
                     self.stream_cb("handle", meta["handle"])
                 if getattr(self, "_cancel_after_receipt", False):

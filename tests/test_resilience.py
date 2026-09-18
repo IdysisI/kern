@@ -77,24 +77,45 @@ class TestRetryBudgetAndDecision(unittest.TestCase):
         self.assertFalse(d.billed)  # free — connection died before model
 
     def test_billed_retry_for_server(self):
+        # plain 500 (no gateway marker): ambiguous — model may have run, so billed
         b = RetryBudget(max_billed=2)
-        d = decide_retry("http status=502 proxy_error", produced_output=False,
+        d = decide_retry("http status=500 internal error", produced_output=False,
                          attempt=0, budget=b, rng=random.Random(0))
         self.assertTrue(d.retry)
         self.assertTrue(d.billed)
 
+    def test_gateway_502_without_output_is_free(self):
+        # 502/503/504 with no output: proxy rejected before the model ran
+        b = RetryBudget(max_billed=2)
+        d = decide_retry("http status=502 proxy_error", produced_output=False,
+                         attempt=0, budget=b, rng=random.Random(0))
+        self.assertTrue(d.retry)
+        self.assertFalse(d.billed)
+
     def test_budget_exhaustion_stops_billed_retries(self):
         b = RetryBudget(max_billed=2)
         for i in range(2):
-            d = decide_retry("http status=502", produced_output=False, attempt=i,
+            d = decide_retry("http status=500", produced_output=False, attempt=i,
                              budget=b, rng=random.Random(0))
             self.assertTrue(d.retry)
             b.record(d.cls, d.billed, d.delay)
         # third billed attempt must be refused
-        d3 = decide_retry("http status=502", produced_output=False, attempt=2,
+        d3 = decide_retry("http status=500", produced_output=False, attempt=2,
                           budget=b, rng=random.Random(0))
         self.assertFalse(d3.retry)
         self.assertIn("budget exhausted", d3.reason)
+
+    def test_gateway_outage_never_exhausts_billed_budget(self):
+        # the incident this guards against: one proxy outage killing the turn
+        b = RetryBudget(max_billed=2)
+        for i in range(5):
+            d = decide_retry("http status=502: <!DOCTYPE html> proxy_error",
+                             produced_output=False, attempt=i, budget=b,
+                             rng=random.Random(0))
+            self.assertTrue(d.retry)
+            self.assertFalse(d.billed)
+            b.record(d.cls, d.billed, d.delay)
+        self.assertEqual(b.billed_used, 0)
 
     def test_free_retries_do_not_consume_billed_budget(self):
         b = RetryBudget(max_billed=1)

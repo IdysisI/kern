@@ -85,6 +85,16 @@ def _slate(events: list[dict], session=None) -> str:
     elif not subagents:
         lines.append("(no plan yet — multi-step? set one with todo())")
 
+    notes = []
+    for ev in reversed(events):
+        if ev.get("kind") == "note":
+            notes = ev.get("items") or []
+            break
+    if notes:
+        lines.append("notes (durable findings — do NOT re-derive these):")
+        for n in notes:
+            lines.append(f" {n.get('id')}. {n.get('text', '')}")
+
     if subagents:
         lines.append("subagents:")
         for hid, info in sorted(subagents.items()):

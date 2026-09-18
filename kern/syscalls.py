@@ -122,6 +122,14 @@ SCHEMAS = [
             "timeout": {"type": "integer", "description": "seconds, default 60, max 300"}},
             "required": ["code"]}}},
     {"type": "function", "function": {
+        "name": "note",
+        "description": "Record a durable finding in working memory: an anchor you located, a decision made, a root cause identified, a constraint from the user. Notes are re-injected into <work-state> on EVERY step and survive context compaction — record conclusions instead of re-deriving them (re-reading files you already analyzed). action=add with short text; action=drop with id; action=list to review.",
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["add", "drop", "list"]},
+            "text": {"type": "string", "description": "the finding, one line (add)"},
+            "id": {"type": "integer", "description": "note id (drop)"}},
+            "required": ["action"]}}},
+    {"type": "function", "function": {
         "name": "todo",
         "description": "Set the live task list. Each item: {text, status: pending|active|done|blocked}. Mark done only after checking evidence; retain completed work to avoid repeating it.",
         "parameters": {"type": "object", "properties": {
@@ -974,6 +982,51 @@ def tool_todo(items: list[dict]) -> tuple[str, dict]:
     n = len(items)
     done = sum(1 for i in items if i.get("status") == "done")
     return f"todo updated: {done}/{n} done", {"todo": items}
+
+
+# ---- working-memory notes ---------------------------------------------------
+# Findings the model records mid-task. They are journaled and re-injected into
+# <work-state> EVERY step, so they survive compaction/folding. This is the fix
+# for "the model re-reads files because it forgot what it concluded earlier":
+# a note is a conclusion that persists; a receipt is just an action log.
+
+NOTE_MAX = 16
+NOTE_TEXT_MAX = 220
+
+
+def tool_note(current: list[dict], action: str = "add", text: str = "",
+              id: int | None = None) -> tuple[str, dict]:
+    """Add/drop a working-memory note. Returns (result, meta with full list).
+
+    current: latest notes list (engine derives from journal events).
+    Notes are short findings: anchors, decisions, root causes, constraints.
+    """
+    notes = [dict(n) for n in (current or [])]
+    if action == "add":
+        text = str(text).strip()
+        if not text:
+            return "error: note text required", {"status": "failed"}
+        if len(text) > NOTE_TEXT_MAX:
+            text = text[:NOTE_TEXT_MAX - 1] + "…"
+        # de-dupe: same finding re-added updates in place, keeps list tight
+        for n in notes:
+            if n.get("text") == text:
+                return "note already recorded (no-op)", {"notes": notes}
+        notes.append({"id": (max((n.get("id", 0) for n in notes), default=0) + 1),
+                      "text": text})
+        if len(notes) > NOTE_MAX:
+            notes = notes[-NOTE_MAX:]  # oldest out; journal keeps everything
+        return f"note added ({len(notes)} active)", {"notes": notes}
+    if action == "drop":
+        before = len(notes)
+        notes = [n for n in notes if n.get("id") != id]
+        if len(notes) == before:
+            return f"error: no note with id={id}", {"status": "failed"}
+        return f"note {id} dropped ({len(notes)} active)", {"notes": notes}
+    if action == "list":
+        return ("notes:\n" + "\n".join(f" {n.get('id')}. {n.get('text','')}" for n in notes)
+                or "no notes"), {}
+    return f"error: unknown note action '{action}' (add|drop|list)", {"status": "failed"}
 
 
 def preview_write(fs: FS, path: str, content: str) -> str:

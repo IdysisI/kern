@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import hashlib
 from pathlib import Path
@@ -41,6 +42,26 @@ _PRIVATE_NETS = (
     ipaddress.ip_network("fc00::/7"),
     ipaddress.ip_network("fe80::/10"),
 )
+
+_HTML_MARK = re.compile(rb"<!doctype\s+html|<html", re.I)
+
+
+def _sanitize_error_body(raw: bytes) -> str:
+    """Make transport error bodies safe to surface to user AND model.
+
+    A proxy 502 returns Cloudflare's HTML error page; dumping it verbatim
+    floods the chat and the journal with markup that helps nobody. Detect
+    HTML and collapse it to a one-line summary; otherwise pass JSON/text
+    through (capped).
+    """
+    body = raw[:4000].decode("utf-8", errors="replace")
+    if _HTML_MARK.search(raw[:512]) or "<!DOCTYPE html" in body[:200]:
+        return ("proxy returned an HTML error page (not an API error) — "
+                "the provider/gateway is unreachable or overloaded; this "
+                "attempt did NOT reach the model and was not billed")
+    return body[:400]
+
+
 
 def _is_private_host(host: str) -> bool:
     h = (host or "").strip().strip("[]").lower()
@@ -313,7 +334,8 @@ class Client:
                 async with c.stream("POST", f"{self.base_url}/v1/chat/completions",
                                     headers=headers, json=body) as r:
                     if r.status_code != 200:
-                        yield StreamEvent("error", error=f"stage=transport http status={r.status_code}: " + (await r.aread()).decode()[:400])
+                        yield StreamEvent("error", error="stage=transport http status=%d: %s"
+                                          % (r.status_code, _sanitize_error_body(await r.aread())))
                         return
                     async for line in _lines_with_stall(r, model):
                         if not line.startswith("data:"):
@@ -386,7 +408,8 @@ class Client:
                 async with c.stream("POST", f"{self.base_url}/v1/messages",
                                     headers=headers, json=body) as r:
                     if r.status_code != 200:
-                        yield StreamEvent("error", error=f"stage=transport http status={r.status_code}: " + (await r.aread()).decode()[:400])
+                        yield StreamEvent("error", error="stage=transport http status=%d: %s"
+                                          % (r.status_code, _sanitize_error_body(await r.aread())))
                         return
                     async for line in _lines_with_stall(r, model):
                         if not line.startswith("data:"):
