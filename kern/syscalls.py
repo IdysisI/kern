@@ -677,6 +677,14 @@ def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False, *, 
         else:
             data = f.read()
     out = data.decode('utf-8', errors='replace') or '(no output)'
+    # Audit finding #2.2: cap large exec results so a stray `cat /etc/passwd`
+    # or `head /var/log/secret` cannot dump the whole file into the model's
+    # context. The constraint system's redact_py_file_reads only fires for
+    # commands matching an `open()` regex, which misses shell cat/head/tail.
+    if len(out) > 4000:
+        head = out[:1500]
+        tail = out[-500:]
+        out = head + "\n\n[output truncated; exec result >4KB. Use read() for file contents, or pipe through head/tail/grep.]\n\n" + tail
     return f"exit={proc.returncode}\n{out}\n[full output: {logfile}]", {
         "exit_code": proc.returncode, "status": "succeeded" if proc.returncode == 0 else "failed",
         "output_path": str(logfile), "timed_out": False}
