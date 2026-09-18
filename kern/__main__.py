@@ -74,6 +74,25 @@ def _first_run_check(args) -> None:
     if api_key and api_key.lower() != "kern":
         return  # user has set a real key
 
+    # Keyless setups are legitimate: local model servers (Ollama, LM Studio,
+    # llama.cpp, vLLM) and self-hosted proxies typically don't require any
+    # API key. If the user points KERN_BASE_URL somewhere other than the
+    # default gateway, assume they know what they're doing — downgrade the
+    # hard exit to a one-line note. KERN_ALLOW_KEYLESS=1 silences it fully.
+    base_url = os.environ.get("KERN_BASE_URL", "").strip()
+    default_url = "http://127.0.0.1:8790"
+    if os.environ.get("KERN_ALLOW_KEYLESS", "").strip() in ("1", "true", "yes"):
+        return
+    if base_url and base_url.rstrip("/") != default_url:
+        print(
+            "ℹ  KERN_API_KEY is not set — fine for keyless providers\n"
+            "   (Ollama, LM Studio, llama.cpp, local proxies).\n"
+            f"   Using KERN_BASE_URL={base_url}. Set KERN_ALLOW_KEYLESS=1 to\n"
+            "   silence this note.\n",
+            file=sys.stderr,
+        )
+        return
+
     print(
         "⚠  KERN_API_KEY is not set (or is still the placeholder 'kern').\n"
         "   Without it, every model call will fail with a 401.\n"
@@ -81,6 +100,10 @@ def _first_run_check(args) -> None:
         "   To fix:\n"
         "     export KERN_API_KEY='your-real-key'\n"
         "     export KERN_MODEL='gemini-2.5-flash'   # or any supported model\n"
+        "\n"
+        "   Running a keyless provider or local proxy instead? Point\n"
+        "   KERN_BASE_URL at it (e.g. http://127.0.0.1:11434 for Ollama)\n"
+        "   and no API key is needed.\n"
         "\n"
         "   Run `kern doctor` to verify config.\n",
         file=sys.stderr,
