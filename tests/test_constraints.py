@@ -26,6 +26,18 @@ class TestHeadSummary(unittest.TestCase):
         self.assertIn("read_head summary", text)
         self.assertEqual(meta.get("constraint"), "head_summary")
 
+    def test_large_file_keeps_real_body_lines(self):
+        # Regression (2026-09-18 read-tool incident): head_summary used to
+        # discard the ENTIRE body while claiming 'full body follows'. It must
+        # keep the first _HEAD_SUMMARY_KEEP_LINES real lines and say
+        # 'truncated' honestly when the rest is dropped.
+        big = "\n".join(f"def fn_{i}(): pass" for i in range(300))
+        text, _meta = c.head_summary(None, "f.py", big)
+        self.assertIn("def fn_0(): pass", text)  # real first line present
+        self.assertIn("def fn_29(): pass", text)  # within the kept window
+        self.assertIn("truncated", text)
+        self.assertNotIn("full body follows", text)  # the lie is gone
+
     def test_small_file_passes_through(self):
         text, meta = c.head_summary(None, "s.py", "small")
         self.assertEqual(text, "small")
@@ -54,9 +66,14 @@ class TestSuppressRepeat(unittest.TestCase):
         text, meta = c.suppress_repeat(None, "/x.py", 3, "body\n\n[harness hint: x]")
         self.assertIn("repeated 3", text)
 
-    def test_hard_suppress_at_count_5_returns_empty(self):
+    def test_hard_suppress_at_count_5_returns_pointer_not_empty(self):
+        # Regression (2026-09-18 read-tool incident): hard suppression used to
+        # return '' which rendered as '(no output)' — indistinguishable from a
+        # broken tool. It must always return a visible pointer.
         text, meta = c.suppress_repeat_hard(None, "/x.py", 5)
-        self.assertEqual(text, "")
+        self.assertTrue(text.strip(), "hard suppress must never return empty text")
+        self.assertIn("/x.py", text)
+        self.assertIn("read 5", text)
         self.assertEqual(meta.get("constraint"), "suppress_repeat_hard")
 
 

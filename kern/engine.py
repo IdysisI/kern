@@ -1435,7 +1435,23 @@ class Engine:
                 # open files. Direction C: silently suppress the duplicate content
                 # instead of telling the model to stop re-reading.
                 if not _step_is_progress(name, args) and tgt:
-                    repeat_key = tgt
+                    # Key reads on the requested SLICE, not just the path:
+                    # reading consecutive chunks of one file is linear
+                    # progress, not a repeat. Only identical
+                    # (path, offset, limit, full) re-reads count toward
+                    # suppression. (Root cause of the 2026-09-18
+                    # "read tool broken" incident: distinct slices of one
+                    # file were soft-suppressed at 3 and HARD-suppressed
+                    # to '' at 5, rendering as '(no output)'.)
+                    if name == "read":
+                        _ra = args or {}
+                        repeat_key = (
+                            f"{tgt}@off={_ra.get('offset', '')}"
+                            f":lim={_ra.get('limit', '')}"
+                            f":{'full' if _ra.get('full') else ''}"
+                        )
+                    else:
+                        repeat_key = tgt
                     self._inspection_targets[repeat_key] = self._inspection_targets.get(repeat_key, 0) + 1
                     seen_n = self._inspection_targets[repeat_key]
                     # Precedence: an existing force_plan/escalate (set earlier in
@@ -1500,9 +1516,20 @@ class Engine:
                 # preserved in the journal for replay, but the model's view starts
                 # with the summary so it can target the next read.
                 if name == "read" and tgt:
-                    text, _hmeta = constraints.head_summary(self.session, tgt, text)
-                    if _hmeta:
-                        meta = {**(meta or {}), **_hmeta}
+                    # Skip head_summary when the caller explicitly asked for a
+                    # slice (offset/limit) or the full file: that is a targeted
+                    # request, and collapsing it to a summary is exactly the
+                    # data-loss bug being fixed. Also skip when an earlier
+                    # constraint already replaced the text (suppress/dedup/
+                    # paginate) so we never summarize a pointer.
+                    _ra = args or {}
+                    _explicit_slice = bool(
+                        _ra.get("full") or _ra.get("offset") or _ra.get("limit")
+                    )
+                    if not _explicit_slice and not (meta or {}).get("constraint"):
+                        text, _hmeta = constraints.head_summary(self.session, tgt, text)
+                        if _hmeta:
+                            meta = {**(meta or {}), **_hmeta}
 
                 # Carry constraint meta forward: this is how the gate at the
                 # top of the next iteration knows force_plan / escalate is active.

@@ -161,12 +161,11 @@ def constraint_gate(session: Any, name: str, meta: dict | None) -> dict | None:
 
 def suppress_repeat(session: Any, target: str, seen_n: int, text: str) -> tuple[str, dict]:
     """Replace a repeat-read result with a single-line pointer."""
-    cleaned = re.sub(r"\n*\[harness (hint|WARNING)[^\]]+\]\s*$", "", str(text))
-    line_count = cleaned.count("\n") + 1 if cleaned.strip() else 0
     new_text = (
         f"(suppressed: read of `{target}` repeated {seen_n}× in this session; "
-        f"original {line_count} lines already in work-state above. Use "
-        f"`read(path, offset=N, limit=M)` to fetch only the slice you need.)"
+        f"an earlier copy may still be in context above — if it has been "
+        f"paged out, use `read(path, offset=N, limit=M)` to re-fetch only "
+        f"the slice you need.)"
     )
     _log(session, "suppress_repeat.soft", target=target[:80], seen=seen_n)
     return new_text, {"constraint": "suppress_repeat", "suppress_target": target, "suppress_seen": seen_n}
@@ -180,8 +179,16 @@ def suppress_repeat(session: Any, target: str, seen_n: int, text: str) -> tuple[
 
 
 def suppress_repeat_hard(session: Any, target: str, seen_n: int) -> tuple[str, dict]:
-    """Drop the repeat-read result entirely."""
-    new_text = ""  # empty -> pager drops it
+    """Replace a hard repeat-read with a one-line pointer.
+
+    Never returns an empty body: empty renders as '(no output)' on the
+    model side and is indistinguishable from a broken tool (the exact
+    confusion this caused in the 2026-09-18 read-tool incident)."""
+    new_text = (
+        f"(suppressed: `{target}` read {seen_n}× this session; content is "
+        f"already in context above. This pointer replaces the body — make "
+        f"progress, or read a DIFFERENT slice/file.)"
+    )
     _log(session, "suppress_repeat.hard", target=target[:80], seen=seen_n)
     return new_text, {
         "constraint": "suppress_repeat_hard",
@@ -340,10 +347,14 @@ def log_breaker(session: Any, count: int, last_target: str, distinct: int,
 
 
 _HEAD_SUMMARY_LIMIT = 4000  # chars; below this we don't summarize
+_HEAD_SUMMARY_KEEP_LINES = 30  # real content lines kept alongside the summary
 
 
 def head_summary(session: Any, path: str, text: str) -> tuple[str, dict]:
-    """For a `read` result > _HEAD_SUMMARY_LIMIT chars, prepend a structural summary."""
+    """For a `read` result > _HEAD_SUMMARY_LIMIT chars, prepend a structural
+    summary and keep the first _HEAD_SUMMARY_KEEP_LINES real lines. Anything
+    beyond that is truncated with an explicit, honest notice — the body is
+    never silently discarded while the text claims otherwise."""
     if len(text) <= _HEAD_SUMMARY_LIMIT:
         return text, {}
     # Cheap structural summary: pull Python `def`/`class` lines and their
@@ -363,16 +374,26 @@ def head_summary(session: Any, path: str, text: str) -> tuple[str, dict]:
         summary = (
             f"[read_head summary: {path} — {len(text)} chars, "
             f"{len(lines)} lines, {len(sigs)} top-level symbols]\n{body}\n"
-            f"[end summary; full body follows]\n\n"
+            f"[end summary; first {_HEAD_SUMMARY_KEEP_LINES} lines follow, "
+            f"rest truncated]\n\n"
         )
     else:
         summary = (
             f"[read_head summary: {path} — {len(text)} chars, {len(lines)} "
-            f"lines; first 30 shown, rest omitted. Use read(offset,limit) "
-            f"or grep to inspect specific sections.]\n\n"
+            f"lines; first {_HEAD_SUMMARY_KEEP_LINES} shown, rest truncated. "
+            f"Use read(offset,limit) or grep to inspect specific sections.]\n\n"
+        )
+    keep = _HEAD_SUMMARY_KEEP_LINES
+    head_body = "\n".join(lines[:keep])
+    tail = ""
+    if len(lines) > keep:
+        tail = (
+            f"\n\n[... truncated: first {keep} of {len(lines)} lines shown. "
+            f"Use read(path, offset={keep + 1}, limit=M) for more — the full "
+            f"body is NOT included below.]"
         )
     _log(session, "head_summary.fire", path=path[:80], chars=len(text), sigs=len(sigs))
-    return summary, {"constraint": "head_summary", "head_path": path}
+    return summary + head_body + tail, {"constraint": "head_summary", "head_path": path}
 
 
 __all__ = [
