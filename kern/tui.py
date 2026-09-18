@@ -470,6 +470,21 @@ class PromptArea(TextArea):
         self.compact = True
 
     def on_key(self, event):
+        if event.key in ("ctrl+v", "ctrl+shift+v"):
+            # Clipboard paste: if an image is on the clipboard, attach it to
+            # the prompt (grab is fast/local) — otherwise DON'T prevent the
+            # default so TextArea pastes text normally.
+            from . import clipboard as _clip
+            if _clip.has_image():
+                event.prevent_default()
+                event.stop()
+                self.app.attach_clipboard_image()
+            return
+        if event.key == "escape" and getattr(self.app, "_clip_image", None):
+            event.prevent_default()
+            event.stop()
+            self.app._clear_clip_image()
+            return
         if event.key == "enter":
             event.prevent_default()
             event.stop()
@@ -594,7 +609,9 @@ class KernApp(App):
         self._pending_diff: dict[str, str] = {}   # path -> last diff (for approval modal)
         self._t0 = 0.0
         self._always = bool(os.environ.get("KERN_AUTO_APPROVE"))
-        self._queue: list[str] = []
+        self._queue: list[tuple[str, dict | None]] = []
+        self._clip_image: dict | None = None      # pending ctrl+v attachment
+        self._clip_chip: Static | None = None
         self._catalog: dict[str, dict] = {}   # model id -> context_length / pricing
         self._queued_chip: Static | None = None
 
@@ -980,9 +997,9 @@ class KernApp(App):
                             widget._rendered_text = reply
                             self.chat.mount(widget)
                     if self._queue:
-                        nxt = self._queue.pop(0)
+                        nxt, nxt_media = self._queue.pop(0)
                         self.chat.scroll_end(animate=False)
-                        self._remote_send_chat(nxt)
+                        self._remote_send_chat(nxt, media=nxt_media)
                     else:
                         self._chat_note("■ turn finished (session idle)")
                 elif ev == "approve_request":
@@ -1011,18 +1028,21 @@ class KernApp(App):
         self.chat.mount(self._waiting_widget)
         self.chat.scroll_end(animate=False)
 
-    def _remote_send_chat(self, text: str):
+    def _remote_send_chat(self, text: str, media: dict | None = None):
         self._remote_running = True
         self._remote_turn_started()
-        asyncio.create_task(self._remote_send_chat_async(text))
+        asyncio.create_task(self._remote_send_chat_async(text, media=media))
 
-    async def _remote_send_chat_async(self, text: str):
+    async def _remote_send_chat_async(self, text: str, media: dict | None = None):
         try:
             if self.remote is None:
                 self._remote_running = False
-                self._start_turn(text)
+                self._start_turn(text, media=media)
                 return
-            await self.remote.send(json.dumps({"method": "chat", "text": text}, ensure_ascii=False))
+            payload = {"method": "chat", "text": text}
+            if media:
+                payload["media"] = media
+            await self.remote.send(json.dumps(payload, ensure_ascii=False))
         except Exception as e:
             self._remote_running = False
             self._dismiss_waiting()
@@ -1112,7 +1132,7 @@ class KernApp(App):
                 self._tool_card.tick(frame)
         self.query_one("#bar").update(
             f" [dim]{right}[/]   "
-            f"[dim]enter send · ctrl-p models · ctrl-r resume · ctrl-n new · ctrl-c stop/quit · /help[/]")
+            f"[dim]enter send · ctrl-v image · ctrl-p models · ctrl-r resume · ctrl-n new · ctrl-c stop/quit · /help[/]")
 
     _verb = "thinking…"
 
@@ -1328,44 +1348,79 @@ class KernApp(App):
 
     # ---- turn lifecycle ------------------------------------------------------
 
+    def attach_clipboard_image(self):
+        """Ctrl+V handler: attach the clipboard image (if any) to the pending
+        prompt. Returns True when an image was attached — plain-text clipboards
+        fall through to TextArea's native paste."""
+        from . import clipboard as _clip
+        img, reason = _clip.grab_image()
+        if img is None:
+            return False  # let textual paste text normally
+        self._clip_image = img  # replace any previous attachment
+        kb = len(img["data"]) * 3 // 4 // 1024
+        if self._clip_chip is None:
+            self._clip_chip = Static(classes="queued", markup=True)
+            try:
+                self.query_one("#prompt").parent.mount(self._clip_chip)
+            except Exception:
+                self.chat.mount(self._clip_chip)
+        self._clip_chip.update(f"[dim]🖼[/] image attached ({kb} KB) — "
+                               f"ctrl+v replaces, esc clears")
+        return True
+
+    def _clear_clip_image(self):
+        self._clip_image = None
+        if self._clip_chip is not None:
+            self._clip_chip.remove()
+            self._clip_chip = None
+
+    def _take_clip_image(self) -> dict | None:
+        img = self._clip_image
+        self._clear_clip_image()
+        return img
+
     @on(PromptArea.Submitted)
     async def on_prompt_submitted(self, ev: "PromptArea.Submitted"):
         text = ev.area.text.strip()
-        if not text:
+        media = self._clip_image  # peek; consumed below if we actually send
+        if not text and not media:
             return
         inp = self.query_one("#prompt", PromptArea)
         inp.load_text("")
-        inp.past.append(text)
+        if text:
+            inp.past.append(text)
         inp._hi = None
-        if text.startswith("/"):
+        if text.startswith("/") and not media:
             await self._slash(text)
             return
+        media = self._take_clip_image()
+        label = text or "[image]"
         if self.remote is not None:
-            self.chat.mount(UserMsg(text))
+            self.chat.mount(UserMsg(label + ("  🖼" if media and text else "")))
             self.chat.scroll_end(animate=False)
             if self._remote_running:
-                self._queue.append(text)
+                self._queue.append((label, media))
                 if self._queued_chip is None:
                     self._queued_chip = Static(classes="queued", markup=True)
                     self.chat.mount(self._queued_chip)
-                self._queued_chip.update(f"[dim]⏳[/] queued: {safe(text)}")
+                self._queued_chip.update(f"[dim]⏳[/] queued: {safe(label)}")
                 self.chat.scroll_end(animate=False)
             else:
-                self._remote_send_chat(text)
+                self._remote_send_chat(label, media=media)
             return
         if self._turn_running():
-            self._queue.append(text)
+            self._queue.append((label, media))
             if self._queued_chip is None:
                 self._queued_chip = Static(classes="queued", markup=True)
                 self.chat.mount(self._queued_chip)
-            self._queued_chip.update(f"[dim]⏳[/] queued: {safe(text)}")
+            self._queued_chip.update(f"[dim]⏳[/] queued: {safe(label)}")
             self.chat.scroll_end(animate=False)
             return
-        self.chat.mount(UserMsg(text))
+        self.chat.mount(UserMsg(label + ("  🖼" if media and text else "")))
         self.chat.scroll_end(animate=False)
-        self._start_turn(text)
+        self._start_turn(label, media=media)
 
-    def _start_turn(self, text: str):
+    def _start_turn(self, text: str, media: dict | None = None):
         """Fire-and-forget: NEVER await the turn inside a message handler —
         the worker needs the app's message pump (approvals), so blocking the
         pump deadlocks. Completion arrives via Worker.StateChanged."""
@@ -1381,7 +1436,7 @@ class KernApp(App):
         self.chat.mount(self._waiting_widget)
         self.chat.scroll_end(animate=False)
         self._t0 = time.monotonic()
-        self.turn_worker = self.run_worker(self.engine.chat(text), name="turn",
+        self.turn_worker = self.run_worker(self.engine.chat(text, media=media), name="turn",
                                            exclusive=False, exit_on_error=False)
 
     @on(Worker.StateChanged)
@@ -1401,12 +1456,12 @@ class KernApp(App):
         self.chat.scroll_end(animate=False)
         # deliver queued steering
         if self._queue:
-            nxt = self._queue.pop(0)
+            nxt, nxt_media = self._queue.pop(0)
             if self._queued_chip is not None:
                 self._queued_chip.remove()
                 self._queued_chip = None
             self.chat.mount(UserMsg(nxt))
-            self._start_turn(nxt)
+            self._start_turn(nxt, media=nxt_media)
 
     def _turn_running(self) -> bool:
         if self.remote is not None:
@@ -1764,6 +1819,7 @@ class KernApp(App):
 
 
 HELP = ("/model <name> · ctrl-p model picker · /probe re-handshake\n"
+        "ctrl+v paste image from clipboard (vision models) · esc clear attachment\n"
         "/new fresh session · /resume (ctrl+r) pick an old session\n"
         "/restart save + full restart (daemon included), same session\n"
         "/fork [n] branch · /rewind <n> checkpoint · /undo last turn\n"

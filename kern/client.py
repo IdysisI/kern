@@ -540,6 +540,27 @@ class Client:
 
 # ---- IR <-> wire conversions ------------------------------------------------
 
+def _media_items(m: dict) -> list[dict]:
+    """Normalized image dicts ({type,mime,data}) attached to one IR message.
+
+    Accepts both shapes the journal can carry: a single ``media`` dict (read
+    tool results, clipboard paste) and a ``media_list`` of dicts. Non-image
+    or malformed entries are dropped — wire conversion never raises on them.
+    """
+    raw = m.get("media_list")
+    if not isinstance(raw, list):
+        raw = []
+        single = m.get("media")
+        if isinstance(single, dict):
+            raw.append(single)
+    items = []
+    for it in raw:
+        if (isinstance(it, dict) and it.get("type") == "image"
+                and it.get("data") and isinstance(it.get("data"), str)):
+            items.append(it)
+    return items
+
+
 def _ir_to_openai(messages: list[dict], model: str = "") -> list[dict]:
     out = []
     images = []
@@ -565,7 +586,23 @@ def _ir_to_openai(messages: list[dict], model: str = "") -> list[dict]:
             else:
                 out.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["text"]})
         else:
-            out.append({"role": m["role"], "content": m.get("content", m.get("text", ""))})
+            content = m.get("content", m.get("text", ""))
+            items = _media_items(m) if m.get("role") == "user" else []
+            if items:
+                if supports_vision(model):
+                    blocks = []
+                    if content:
+                        blocks.append({"type": "text", "text": content})
+                    for it in items:
+                        blocks.append({"type": "image_url", "image_url": {
+                            "url": f"data:{it.get('mime','image/png')};base64,{it['data']}"}})
+                    content = blocks
+                else:
+                    note = (f"[{len(items)} image(s) attached by the user but this model "
+                            f"has no verified vision; image bytes omitted. If the user saved "
+                            f"them to a path, read() that path instead.]")
+                    content = f"{content}\n\n{note}" if content else note
+            out.append({"role": m["role"], "content": content})
     if images:
         out.append({'role':'user', 'content':images})
     return out
@@ -615,5 +652,21 @@ def _ir_to_anthropic(messages: list[dict], model: str = "") -> list[dict]:
                     else:
                         converted.append(block)
                 content = converted
+            items = _media_items(m) if m.get("role") == "user" else []
+            if items:
+                if supports_vision(model):
+                    blocks = []
+                    if content:
+                        blocks.append({"type": "text", "text": content})
+                    for it in items:
+                        blocks.append({"type": "image", "source": {
+                            "type": "base64", "media_type": it.get("mime", "image/png"),
+                            "data": it["data"]}})
+                    content = blocks
+                else:
+                    note = (f"[{len(items)} image(s) attached by the user but this model "
+                            f"has no verified vision; image bytes omitted. If the user saved "
+                            f"them to a path, read() that path instead.]")
+                    content = f"{content}\n\n{note}" if content else note
             out.append({"role": m["role"], "content": content})
     return out

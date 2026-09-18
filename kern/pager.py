@@ -178,7 +178,10 @@ def materialize(events: list[dict], session) -> list[dict]:
         if kind == "compact":
             continue
         elif kind == "user":
-            msgs.append({"role": "user", "text": ev["text"]})
+            m = {"role": "user", "text": ev["text"]}
+            if ev.get("media"):
+                m["media"] = ev["media"]
+            msgs.append(m)
         elif kind == "assistant":
             m = {"role": "assistant", "text": ev.get("text", "")}
             if ev.get("tool_calls"):
@@ -243,6 +246,14 @@ def budget(events: list[dict], session) -> dict:
     out = {"events": len(events), "assistant_bytes": 0, "user_bytes": 0, "tool_bytes": 0}
     for m in view:
         size = len(m.get("text", "")) + len(json.dumps(m.get("tool_calls", "")))
+        media = m.get("media")
+        if isinstance(media, dict):
+            # base64 payload ships in the request body; count it so /context
+            # reflects what the provider actually receives.
+            size += len(media.get("data", ""))
+        if isinstance(m.get("media_list"), list):
+            size += sum(len(md.get("data", "")) for md in m["media_list"]
+                        if isinstance(md, dict))
         if m["role"] == "assistant":
             out["assistant_bytes"] += size
         elif m["role"] == "user":

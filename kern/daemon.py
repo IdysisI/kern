@@ -193,12 +193,12 @@ class Worker:
             parts.append(f"{len(subs)} background subagent(s): {', '.join(subs[:4])}")
         return "; ".join(parts) or "idle"
 
-    async def chat(self, text: str):
+    async def chat(self, text: str, media: dict | None = None):
         async with self._turn_lock:
             if self.running:
                 raise RuntimeError("turn already running; interrupt first")
             await self.broadcast(event="turn_start")
-            self._run_turn(eng_cb=lambda e: e.chat(text))
+            self._run_turn(eng_cb=lambda e: e.chat(text, media=media))
 
     async def resume(self):
         """A daemon crash left the journal mid-turn (user message, no
@@ -877,7 +877,10 @@ async def handler(ws):
                     elif not isinstance(msg.get('text'),str) or not msg['text'].strip():
                         await ws.send(reply('nonempty text required',is_result=False))
                     else:
-                        await worker.chat(msg['text'])
+                        media = msg.get('media')
+                        if not (media is None or isinstance(media, dict)):
+                            media = None
+                        await worker.chat(msg['text'], media=media)
                         if req_id is not None:
                             await ws.send(reply({"started": True}))
                 elif m == "approve":

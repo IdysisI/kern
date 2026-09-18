@@ -1259,7 +1259,7 @@ class Sidebar(QFrame):
 
 # ══════════════════════════════════════════════════════════════ composer ══
 class Composer(QFrame):
-    submitted = Signal(str)
+    submitted = Signal(str, object)  # (text, media_dict_or_None)
     interrupted = Signal()
 
     def __init__(self, parent=None):
@@ -1287,9 +1287,18 @@ class Composer(QFrame):
         bar.setContentsMargins(2, 0, 2, 0)
         bar.setSpacing(S2)
 
-        self.hint = QLabel("Enter to send · Shift+Enter newline · / for commands")
+        self.hint = QLabel("Enter to send · Shift+Enter newline · Ctrl+V paste image · / for commands")
         self.hint.setStyleSheet(f"color: {FG_4}; font-size: 10.5px; border: none; background: transparent;")
         bar.addWidget(self.hint)
+
+        # clipboard-image attachment chip (ctrl+v with an image)
+        self._images: list[dict] = []
+        self._img_chip = QLabel("")
+        self._img_chip.setStyleSheet(
+            f"color: {ACCENT}; font-size: 10.5px; border: 1px solid {LINE_SOFT};"
+            f"border-radius: 6px; padding: 0 6px; background: transparent;")
+        self._img_chip.setVisible(False)
+        bar.addWidget(self._img_chip)
         bar.addStretch()
 
         self.lbl_budget = QLabel("")
@@ -1359,11 +1368,63 @@ class Composer(QFrame):
         if self._busy:
             return
         text = self.edit.toPlainText().strip()
-        if not text:
+        if not text and not self._images:
             return
+        media = None
+        if self._images:
+            media = {"type": "image", "mime": self._images[0]["mime"],
+                     "data": self._images[0]["data"]}
         self.edit.clear()
+        self._clear_images()
         self._grow()
-        self.submitted.emit(text)
+        self.submitted.emit(text or "[image]", media)
+
+    # ── clipboard image paste (ctrl+v / ctrl+shift+v) ─────────────────────
+    def _clear_images(self):
+        self._images.clear()
+        if self._img_chip is not None:
+            self._img_chip.setText("")
+            self._img_chip.setVisible(False)
+
+    def _grab_clip_image(self):
+        """Try Qt clipboard first (native, no subprocess), fall back to the
+        shared kern.clipboard grabbers for exotic X11 image targets."""
+        try:
+            from PySide6.QtGui import QImage, QClipboard
+            cb = QApplication.clipboard()
+            img = cb.image()
+            if not img.isNull():
+                from PySide6.QtCore import QBuffer
+                buf = QBuffer()
+                buf.open(QBuffer.WriteOnly)
+                img.save(buf, "PNG")
+                data = bytes(buf.data())
+                if data:
+                    import base64 as _b64
+                    from . import clipboard as _clip
+                    return _clip._finish(data, "image/png")
+        except Exception:
+            pass
+        from . import clipboard as _clip
+        return _clip.grab_image()
+
+    def paste_image(self):
+        img, reason = self._grab_clip_image()
+        if img is None:
+            # No image on the clipboard — let normal text paste happen.
+            return False
+        if len(self._images) >= 1:
+            self._note("one image per message for now — remove the current one first")
+            return True
+        self._images.append(img)
+        kb = len(img["data"]) * 3 // 4 // 1024
+        self._img_chip.setText(f"🖼 image attached ({kb} KB)")
+        self._img_chip.setVisible(True)
+        return True
+
+    def _note(self, msg: str):
+        self._img_chip.setText(msg)
+        self._img_chip.setVisible(True)
 
     def eventFilter(self, obj, ev):
         if obj is self.edit and ev.type() == ev.Type.KeyPress:
@@ -1371,6 +1432,14 @@ class Composer(QFrame):
                 if ev.modifiers() & Qt.ShiftModifier:
                     return False
                 self._submit()
+                return True
+            if ev.key() == Qt.Key_V and ev.modifiers() & Qt.ControlModifier:
+                # Ctrl+V (and Ctrl+Shift+V): image on clipboard wins; plain
+                # text falls through to Qt's normal paste.
+                if self.paste_image():
+                    return True
+            if ev.key() == Qt.Key_Escape and self._images:
+                self._clear_images()
                 return True
             if ev.key() == Qt.Key_Up and not self.edit.toPlainText():
                 return True
@@ -2066,15 +2135,15 @@ class KernWindow(QMainWindow):
                 self._note(f"subagent {text}")
         self._refresh_budget()
 
-    def _submit(self, text: str):
+    def _submit(self, text: str, media: dict | None = None):
         if self._busy():
             self._note("Kern is still working — press Esc to stop.", "warn")
             return
-        if text.startswith("/"):
+        if text.startswith("/") and media is None:
             self._slash(text)
             return
 
-        self._add(UserBubble(text, time.time()))
+        self._add(UserBubble(text + ("  [🖼 image]" if media else ""), time.time()))
         self._cur_assistant = None
         self._cur_tool = None
         self._suppress_autoscroll = False
@@ -2086,7 +2155,7 @@ class KernWindow(QMainWindow):
         async def run():
             eng = self._engine()
             try:
-                final = await eng.chat(text)
+                final = await eng.chat(text, media=media)
                 self._hide_thinking()
                 # the authoritative text; heals any partial streaming
                 if final and final.strip():

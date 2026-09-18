@@ -907,10 +907,11 @@ class Engine:
         return f"error: unknown action '{action}'. Valid actions: status, logs, wait, cancel", {}
 
 
-    async def chat(self, user_text: str, max_steps: int | None = None) -> str:
+    async def chat(self, user_text: str, max_steps: int | None = None,
+                   media: dict | None = None) -> str:
         with turn_lease(self.session.dir):
             self._turn_start_n = len(self.session.events)
-            self.session.emit("user", text=user_text)
+            self.session.emit("user", text=user_text, **({"media": media} if media else {}))
             # Preserve active task objective across generic "Continue" prompts:
             # a user saying "Continue" is telling the agent to keep working on its
             # current goal, NOT changing the goal to the word "Continue".

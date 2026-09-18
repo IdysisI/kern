@@ -85,7 +85,8 @@ class Conn:
             eng = self.engine()
             async def run():
                 try:
-                    reply = await eng.chat(msg["text"])
+                    media = msg.get("media") if isinstance(msg.get("media"), dict) else None
+                    reply = await eng.chat(msg["text"], media=media)
                     await self.send(event="turn_end", reply=reply,
                                     usage={"in": eng.usage_in, "out": eng.usage_out,
                                             "requests": eng.requests})
