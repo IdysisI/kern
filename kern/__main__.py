@@ -51,6 +51,43 @@ def _probe(model: str):
     print(asyncio.run(Client().probe(model)))
 
 
+def _first_run_check(args) -> None:
+    """Detect a missing/placeholder API key and print actionable guidance.
+
+    Audit #4.2: a user running `kern` for the first time with no config
+    set gets an opaque auth error much later. Surface it early with a
+    clear message pointing at the env vars to set.
+
+    Skipped for subcommands that don't talk to a model (--probe, doctor,
+    login, whoami, update, etc.) — only fired for the model-using paths
+    (TUI, GUI, web, --task).
+    """
+    sub = getattr(args, "interface", None)
+    if sub in (None, "tui", "gui", "web"):
+        pass  # these go through the model
+    elif getattr(args, "task", None):
+        pass  # headless --task uses the model
+    else:
+        return  # no model call → no need to check
+
+    api_key = os.environ.get("KERN_API_KEY", "").strip()
+    if api_key and api_key.lower() != "kern":
+        return  # user has set a real key
+
+    print(
+        "⚠  KERN_API_KEY is not set (or is still the placeholder 'kern').\n"
+        "   Without it, every model call will fail with a 401.\n"
+        "\n"
+        "   To fix:\n"
+        "     export KERN_API_KEY='your-real-key'\n"
+        "     export KERN_MODEL='gemini-2.5-flash'   # or any supported model\n"
+        "\n"
+        "   Run `kern doctor` to verify config.\n",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 def main():
     # Redirected Windows streams can inherit an ANSI codec. Model output is
     # arbitrary Unicode; a check mark must not crash a completed agent turn.
@@ -70,6 +107,7 @@ def main():
     args = parser.parse_args()
     if args.quiet:
         os.environ['KERN_QUIET'] = '1'   # constraints.debug_enabled() reads this
+    _first_run_check(args)
     model = args.model or os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
     if args.max_steps is not None and (args.max_steps < 1 or not args.task):
         parser.error('--max-steps requires --task and a positive value')
