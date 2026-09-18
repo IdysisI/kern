@@ -206,6 +206,19 @@ def _is_continuation_prompt(text: str, has_active_objective: bool = True) -> boo
 # prevents blasting local VSLLM with 8+ parallel requests and hitting 429.
 _SUBAGENT_SEMAPHORE: asyncio.Semaphore | None = None
 
+# Wall-clock cap: a subagent that runs forever (stuck waiting on its own
+# sub-subagents, or looping) must be killed even if max_steps hasn't tripped.
+# max_steps counts tool-call turns, NOT elapsed time — a subagent that polls
+# `subagent(action="wait")` can run for 39+ minutes without ever tripping it.
+# Configurable via env for tests; default 20 minutes.
+_SUBAGENT_TIMEOUT_S = float(os.environ.get("KERN_SUBAGENT_TIMEOUT", "1200"))
+
+# A subagent that spawns its own sub-subagents and then merely WAITS on them is
+# a delegation anti-pattern: it burns tokens, adds latency, and loses context.
+# Detect a child that spawns N subagents but does no real work itself.
+_DELEGATE_SPAWN_LIMIT = int(os.environ.get("KERN_SUBAGENT_DELEGATE_LIMIT", "4"))
+
+
 def _get_subagent_semaphore() -> asyncio.Semaphore:
     global _SUBAGENT_SEMAPHORE
     if _SUBAGENT_SEMAPHORE is None:
@@ -564,6 +577,18 @@ class Engine:
         if self.depth >= 2:
             return "error: max subagent depth reached (level 2). Execute the task directly.", {}
 
+        # Delegation-loop guard: a subagent that keeps spawning children to do
+        # its work (then merely waits on them) is an anti-pattern — it burns
+        # tokens, adds latency, and the parent never sees the child's reasoning.
+        # Soft-warn past the limit so the model self-corrects; still allowed.
+        if self.depth >= 1:
+            live_children = sum(1 for e in self.subagents.values() if not e["completed"])
+            if live_children >= _DELEGATE_SPAWN_LIMIT:
+                return (f"error: you already have {live_children} sub-subagents in flight. "
+                        f"Do NOT keep delegating — gather their results (subagent wait) and "
+                        f"do the remaining work directly. Delegation loops waste time and lose "
+                        f"context; the deliverable is YOUR final report, not more subagents."), {}
+
         steps_cap = max(5, min(int(max_steps or 50), 120))
         hid = f"sub_{len(self.subagents) + 1}"
 
@@ -590,8 +615,10 @@ class Engine:
             elif kind == "thinking":
                 # Throttled heartbeat so a long-thinking subagent still shows life.
                 child_state["thinking"] = child_state.get("thinking", 0) + len(text)
+                child_state["last"] = time.monotonic()   # streaming = progress
             elif kind == "text":
                 child_state["text"] = child_state.get("text", 0) + len(text)
+                child_state["last"] = time.monotonic()   # streaming = progress
 
         # Periodic liveness: surface what the subagent is doing even when it emits
         # no note/tool events (e.g. long model thinking), so the TUI never looks dead.
@@ -611,6 +638,38 @@ class Engine:
                     bits.append(f"last: {child_state['label']}")
                 detail = ", ".join(bits) if bits else "working"
                 self.stream_cb("note", f"[{hid}] … {detail}")
+
+        # Stall watchdog: NOT a wall-clock cap. A subagent doing real work (tool
+        # calls, model requests, streaming) can run as long as it needs. We only
+        # intervene when it has made NO observable progress — no tool calls, no
+        # streamed output, no new API requests — for a sustained window, which is
+        # the signature of a stuck delegation/wait loop. Active work resets the
+        # clock, so a long-but-productive subagent is never killed.
+        _stall_window = float(os.environ.get("KERN_SUBAGENT_STALL_S", "240"))
+        # Poll often enough to catch a stall promptly, but cheaply: every 15s in
+        # production, scaled down for small windows (tests / short budgets).
+        _stall_poll = min(15.0, max(0.05, _stall_window / 4))
+
+        async def _stall_watchdog():
+            while not child_state.get("done"):
+                await asyncio.sleep(_stall_poll)
+                if child_state.get("done"):
+                    break
+                idle_for = time.monotonic() - child_state["last"]
+                reqs = getattr(child_engine, "requests", 0)
+                prev_reqs = child_state.get("reqs", -1)
+                if reqs != prev_reqs:
+                    # made progress (an API call) even if it streamed nothing
+                    child_state["reqs"] = reqs
+                    child_state["last"] = time.monotonic()
+                    continue
+                if idle_for >= _stall_window:
+                    self.stream_cb(
+                        "note",
+                        f"[{hid}] stalled {int(idle_for)}s with no tool/model progress — "
+                        f"cancelling (override with KERN_SUBAGENT_STALL_S)")
+                    entry["error"] = f"stalled {int(idle_for)}s with no progress"
+                    break
 
         # Approvals serialization: avoid concurrent modal collisions in TUI
         async def child_approve(desc: str, diff: str | None = None) -> bool:
@@ -678,11 +737,29 @@ class Engine:
 
         async def run_subagent():
             hb = asyncio.create_task(_heartbeat())
+            wd = asyncio.create_task(_stall_watchdog())
+            body = asyncio.create_task(_run_subagent_body())
             try:
-                return await _run_subagent_body()
+                # Race the work against the stall watchdog: whichever finishes
+                # first wins. A stalled subagent is cancelled by the watchdog;
+                # a productive one runs to completion unhindered.
+                done, pending = await asyncio.wait(
+                    {body, wd}, return_when=asyncio.FIRST_COMPLETED)
+                for t in pending:
+                    t.cancel()
+                if body in done and not body.cancelled():
+                    return body.result()
+                # watchdog won: the body was stalled
+                body.cancel()
+                try:
+                    await body
+                except (asyncio.CancelledError, Exception):
+                    pass
+                raise TimeoutError(entry.get("error") or f"subagent {hid} stalled")
             finally:
                 child_state["done"] = True
                 hb.cancel()
+                wd.cancel()
 
         async def _run_subagent_body():
             async with sem:
@@ -716,11 +793,14 @@ class Engine:
                     return reply
                 except asyncio.CancelledError:
                     entry["completed"] = True
-                    entry["error"] = "cancelled"
+                    # Preserve a stall diagnosis set by the watchdog (it cancelled
+                    # us); don't clobber it with a generic "cancelled".
+                    if not (entry.get("error") or "").startswith("stalled"):
+                        entry["error"] = "cancelled"
                     self.session.emit("subagent_finish", handle=hid, result=None,
-                                      report_path=None, error="cancelled",
+                                      report_path=None, error=entry["error"],
                                       requests=child_engine.requests)
-                    self.stream_cb("note", f"■ subagent {hid} cancelled")
+                    self.stream_cb("note", f"■ subagent {hid} {entry['error']}")
                 except Exception as e:
                     entry["completed"] = True
                     entry["error"] = str(e)
@@ -760,7 +840,8 @@ class Engine:
             wt_note = f"\n[worktree: {worktree}]" if worktree else ""
             return f"subagent {hid} completed:{cost}{wt_note}\n{str(reply)[:4000]}", {"handle": hid, "session_id": child_session.id, **({"worktree": worktree} if worktree else {})}
 
-    async def _tool_subagent(self, handle: str, action: str, timeout: int = 120) -> tuple[str, dict]:
+    async def _tool_subagent(self, handle: str, action: str, timeout: int = 120,
+                             tail: int | None = None) -> tuple[str, dict]:
         entry = self.subagents.get(handle)
         if not entry:
             live = list(self.subagents.keys())
@@ -791,8 +872,9 @@ class Engine:
                     lines.append(f"[action] {ev.get('name')}")
                 elif k == "tool_result":
                     lines.append(f"[result] {ev.get('name')}: {str(ev.get('text', ''))[:150]}")
-            body = "\n".join(lines[-20:]) if lines else "(no activity yet)"
-            return f"--- subagent {handle} activity (last {min(20, len(lines))} steps) ---\n{body}", {}
+            n = max(1, int(tail)) if tail else 20
+            body = "\n".join(lines[-n:]) if lines else "(no activity yet)"
+            return f"--- subagent {handle} activity (last {min(n, len(lines))} steps) ---\n{body}", {}
 
         elif action == "wait":
             if entry["completed"]:
