@@ -124,11 +124,17 @@ def poll_for_token(device_code: str, interval: int = 5, expires_in: int = 900,
     return {'error': 'timeout', 'error_description': 'Timed out waiting for authorization.'}
 
 
-def store_token(token: str, login: str = '', scopes: str = '') -> Path:
+def store_token(token: str, login: str = '', scopes: str = '',
+                refresh_token: str = '', expires_in: int = 0) -> Path:
     """Persist the token under KERN_HOME with owner-only perms. Returns the path."""
     path = _credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {'token': token, 'login': login, 'scopes': scopes, 'obtained': int(time.time())}
+    if refresh_token:
+        payload['refresh_token'] = refresh_token
+    if expires_in:
+        payload['expires_in'] = expires_in
+        payload['expires_at'] = int(time.time()) + expires_in
     path.write_text(json.dumps(payload, indent=2))
     try:
         os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
@@ -138,13 +144,21 @@ def store_token(token: str, login: str = '', scopes: str = '') -> Path:
 
 
 def load_stored_token() -> str | None:
-    """Read the stored token (None if absent/corrupt)."""
+    """Read the stored token; auto-refresh if expired and a refresh_token exists."""
     try:
         data = json.loads(_credentials_path().read_text())
-        tok = data.get('token')
-        return tok or None
     except Exception:
         return None
+    expires_at = data.get('expires_at')
+    if expires_at and time.time() >= expires_at - 60 and data.get('refresh_token'):
+        refreshed = refresh_access_token(data['refresh_token'])
+        if refreshed and 'access_token' in refreshed:
+            store_token(refreshed['access_token'], login=data.get('login', ''),
+                        scopes=data.get('scopes', ''),
+                        refresh_token=refreshed.get('refresh_token', data.get('refresh_token', '')),
+                        expires_in=int(refreshed.get('expires_in', 0)))
+            return refreshed['access_token']
+    return data.get('token')
 
 
 def get_token() -> str | None:
@@ -152,6 +166,15 @@ def get_token() -> str | None:
     return (os.environ.get('KERN_GITHUB_TOKEN')
             or os.environ.get('GITHUB_TOKEN')
             or load_stored_token())
+
+
+def refresh_access_token(refresh_token: str) -> dict:
+    """Exchange a refresh_token for a new access_token (OAuth App refresh flow)."""
+    return _post_form(ACCESS_TOKEN_URL, {
+        'client_id': _client_id(),
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token,
+    })[1]
 
 
 def forget() -> bool:
@@ -232,8 +255,15 @@ def login(scopes: str = DEFAULT_SCOPES, open_browser: bool = True, out=None) -> 
     token = result['access_token']
     me = whoami(token)
     login_name = me.get('login', '')
-    store_token(token, login=login_name, scopes=result.get('scope', scopes))
-    out(f'\n✓ Signed in to GitHub as {login_name or "(unknown)"}. Token stored in {kern_home()}/github.json')
+    store_token(token, login=login_name, scopes=result.get('scope', scopes),
+                refresh_token=result.get('refresh_token', ''),
+                expires_in=int(result.get('expires_in', 0)))
+    expiry_note = ''
+    if result.get('expires_in'):
+        expiry_note = f' (expires in {int(result["expires_in"])//3600}h — will auto-refresh)'
+    else:
+        expiry_note = ' (never expires)'
+    out(f'\n✓ Signed in to GitHub as {login_name or "(unknown)"}. Token stored in {kern_home()}/github.json{expiry_note}')
     return {'token': token, 'login': login_name, 'scopes': result.get('scope', scopes)}
 
 
@@ -289,27 +319,19 @@ def git_credential_helper_command() -> str:
 
 
 def ensure_git_credentials(repo: str | None = None, out=None) -> tuple[bool, str]:
-    """Wire git to use the stored GitHub token for https://github.com (repo-local config
-    if `repo` is a git dir, else global). Returns (ok, message). No-op if no token."""
+    """Confirm git can use the stored GitHub token. **Kern-only by design.**
+
+    Kern's git auth is deliberately IN-MEMORY ONLY (via git_env()'s
+    GIT_CONFIG_* injection). It must never write to ~/.gitconfig (--global)
+    or a repo's .git/config (--local) — the user asked for the login to belong
+    to Kern alone and to leave the rest of the system untouched. This function
+    therefore only verifies a token exists and reports that in-memory auth is
+    active; it performs no disk writes.
+
+    Returns (ok, message). No-op if no token.
+    """
     out = out or (lambda s: None)
     if not get_token():
         return False, 'not logged in (run: kern login github)'
-    import subprocess
-    scope = ['--global']
-    if repo:
-        try:
-            r = subprocess.run(['git', '-C', repo, 'rev-parse', '--is-inside-work-tree'],
-                               capture_output=True, text=True, timeout=10)
-            if r.returncode == 0 and r.stdout.strip() == 'true':
-                scope = ['-C', repo, '--local']
-        except Exception:
-            pass
-    helper = git_credential_helper_command()
-    try:
-        r = subprocess.run(['git', *scope, 'config', 'credential.https://github.com.helper', helper],
-                           capture_output=True, text=True, timeout=10, env=git_env())
-        if r.returncode == 0:
-            return True, f'git credential helper set ({scope[-1]}) for https://github.com'
-        return True, f'git credentials active in-memory (disk config {scope[-1]} skipped: {r.stderr.strip()[:60]})'
-    except Exception as e:
-        return True, f'git credentials active in-memory ({e})'
+    out('git credentials active in-memory (Kern-scoped; global config untouched)')
+    return True, 'git credentials active in-memory (Kern-scoped, no disk config)'
