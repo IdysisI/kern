@@ -28,6 +28,7 @@ from .journal import Session, create_session
 from . import linker
 from .linker import CapabilityIndex, MCPClient, MountTable
 from .debuglog import dbg as _dbg, dbg_exc as _dbg_exc
+from . import constraints
 
 
 def _parse_xml_invoke(text: str) -> list[dict]:
@@ -180,6 +181,27 @@ def _step_is_progress(name: str, args: dict) -> bool:
     return False
 
 
+def _top_repeats(counter_like, limit: int = 5) -> list:
+    """Return the top-N (key, count) pairs from a counter (dict or list).
+
+    Accepts both dict (counts) and list (raw items) — used for both the
+    _consecutive_errors list and the _inspection_targets dict. The output
+    is JSON-safe (strings + ints only).
+    """
+    try:
+        if isinstance(counter_like, dict):
+            pairs = [(str(k), int(v)) for k, v in counter_like.items()]
+        else:
+            # Treat as a list of strings; collapse duplicates.
+            from collections import Counter
+            c = Counter(str(x) for x in counter_like)
+            pairs = [(k, v) for k, v in c.items()]
+        pairs.sort(key=lambda kv: -kv[1])
+        return pairs[:limit]
+    except Exception:
+        return []
+
+
 def _human_desc(name: str, args: dict) -> str:
     return Engine._human_desc_static(name, args)
 MOUNT_RE = re.compile(r"^\[(mount|mount-once|unmount|list capabilities)(?::\s*([^\]]+))?\]", re.M)
@@ -257,6 +279,7 @@ class Engine:
         self._consecutive_errors: list[str] = []
         self._inspection_targets: dict[str, int] = {}
         self._consecutive_inspections: int = 0
+        self._last_constraint_meta: dict | None = None   # direction C: gate state
         self._run_targets: set = set()   # distinct targets seen in current read-run (typed breaker)
         self._last_inspection_target: str | None = None  # most recent inspection target (breaker diagnostics)
         self._read_limit_hinted: set = set()  # files already nudged once toward offset/limit reads
@@ -1239,6 +1262,19 @@ class Engine:
                     self.session.emit('tool_result', call_id=cid, name=name, text=blocked, status='denied')
                     self.stream_cb('result', blocked)
                     continue
+                # Direction C: structural-constraint gate. If the *previous* tool
+                # result carried a force_plan / escalate meta, this call is rejected
+                # unless it is think(plan=...) or ask_user(...). The model sees the
+                # rejection as a synthetic tool_result, not an English hint.
+                gate_meta = getattr(self, "_last_constraint_meta", None)
+                gate = constraints.constraint_gate(self.session, name, gate_meta)
+                if gate:
+                    self.session.emit("tool_result", call_id=cid, name=name,
+                                      text=gate["text"], status="rejected",
+                                      constraint=gate["meta"].get("constraint"))
+                    self.stream_cb("result", gate["text"])
+                    self._last_constraint_meta = gate["meta"]  # keep gate active
+                    continue
                 prior = self._prior_execution(name, args)
                 needs_ok = name in ("write", "edit", "exec", "py") or "__" in name
                 if name == "exec" and syscalls.is_safe_readonly(str(args.get("cmd", ""))):
@@ -1277,13 +1313,18 @@ class Engine:
                         if ro_key is not None and ro_key in self._ro_cache:
                             text, meta = self._ro_cache[ro_key]
                             _dbg(self.session, "dedup.hit", tool=name, target=str(_inspection_target(name, args))[:60])
-                            text = (str(text) + "\n\n[harness: identical call already ran this turn — "
-                                               "returning the cached result. You already have this; do not re-read it.]")
-                            # Same delivery path as a real result: journal + stream. The model
-                            # receives it on the next loop iteration via journal replay.
+                            # Direction C: silent dedup. No hint text — just a
+                            # short, structural pointer + meta marker so the
+                            # pager/UI can decide how to render. The full
+                            # cached result is still journaled for replay.
+                            tgt = str(_inspection_target(name, args))[:60]
+                            text, meta = constraints.mark_dedup(
+                                self.session, name, tgt, text, meta
+                            )
                             self.session.emit("action", call_id=cid, name=name, arguments=args)
                             self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
-                                              status="cached")
+                                              status="cached",
+                                              constraint=meta.get("constraint"))
                             self.stream_cb("result", str(text))
                             continue
                     # Action receipt: record intent BEFORE the effect, so a
@@ -1315,11 +1356,29 @@ class Engine:
                 if is_err:
                     self._consecutive_errors.append(str(text).splitlines()[0][:60])
                     if len(self._consecutive_errors) >= 3:
-                        text = (str(text) + "\n\n[harness hint: 3 consecutive actions failed with similar errors. "
-                                           "Stop brute-forcing: inspect the premises with read(), check file contents, "
-                                           "or test a fundamentally different approach before repeating.]")
+                        # Direction C: force_plan. Instead of an English hint, the
+                        # meta of this failed result now carries constraint=force_plan.
+                        # The gate at the top of the next iteration hard-rejects any
+                        # non-planning call; a think/todo/ask_user call clears it.
+                        fp = constraints.force_plan(
+                            self.session,
+                            consecutive_count=len(self._consecutive_errors),
+                            last_error=str(text).splitlines()[0][:60],
+                        )
+                        meta = {**(meta or {}), **fp}
+                    if len(self._consecutive_errors) >= 5:
+                        constraints.log_breaker(
+                            self.session,
+                            count=len(self._consecutive_errors),
+                            last_target=str(tgt or "")[:60],
+                            distinct=len(set(self._consecutive_errors)),
+                            top_repeats=_top_repeats(self._consecutive_errors),
+                        )
                 else:
                     self._consecutive_errors.clear()
+                    # A successful call also satisfies any pending force_plan:
+                    # the retry worked, so there is no loop to break anymore.
+                    self._last_constraint_meta = None
 
                 _dbg(self.session, "action.result", step=attempt, tool=name,
                      is_error=is_err, error_streak=len(self._consecutive_errors),
@@ -1346,56 +1405,53 @@ class Engine:
                     if tgt:
                         self._last_inspection_target = tgt
 
-                # Per-target repeat hint: same file/command inspected over and over.
+                # Per-target repeat constraint: same file/command inspected over and over.
                 # Uses _inspection_target so it works for read AND for py/exec that
-                # open files (Gemini reads everything via `py`, so a read-only check
-                # on the `read` tool alone misses the real loop).
+                # open files. Direction C: silently suppress the duplicate content
+                # instead of telling the model to stop re-reading.
                 if not _step_is_progress(name, args) and tgt:
                     repeat_key = tgt
                     self._inspection_targets[repeat_key] = self._inspection_targets.get(repeat_key, 0) + 1
                     seen_n = self._inspection_targets[repeat_key]
-                    if seen_n == 3:
-                        text = (str(text) + f"\n\n[harness hint: you have now read '{repeat_key}' {seen_n} times. "
-                                           "You already have its contents. Do NOT re-read it — act on what you know: "
-                                           "make the edit with write()/edit(), or move to the next distinct file.]")
-                    elif seen_n >= 5:
-                        text = (str(text) + f"\n\n[harness WARNING: '{repeat_key}' read {seen_n} times with no edit. "
-                                           "This is a loop. STOP re-reading. Apply your planned change NOW via edit()/write(), "
-                                           "or if you are blocked, say so and ask the user.]")
+                    # Precedence: an existing force_plan/escalate (set earlier in
+                    # this same call's meta) wins over suppress_repeat. Once we're
+                    # forcing a re-plan, the soft "stop repeating" message would
+                    # compete with the hard rejection and confuse both the model
+                    # and the gate on the next iteration.
+                    if seen_n == 3 and not (meta or {}).get("constraint"):
+                        text, _rmeta = constraints.suppress_repeat(self.session, repeat_key, seen_n, text)
+                        meta = {**(meta or {}), **_rmeta}
+                    elif seen_n >= 5 and not (meta or {}).get("constraint"):
+                        text, _rmeta = constraints.suppress_repeat_hard(self.session, repeat_key, seen_n)
+                        meta = {**(meta or {}), **_rmeta}
 
-                # Line-limit enforcement: an unlimited read() of a large file dumps
-                # up to 200 numbered lines into context even when the model only needs
-                # a symbol. After the FIRST unlimited read of a given file (which surfaces
-                # the "N lines, showing lo-hi" header), nudge once toward targeted reads.
+                # Line-limit enforcement: after the FIRST unlimited read of a large file
+                # (which surfaces the "N lines" header), inject a structured pointer instead
+                # of a "next time use offset/limit" hint. The model gets the next page call
+                # spelled out so a weak model can act without parsing English.
                 if name == "read" and tgt and not (args or {}).get("full"):
                     if not (args or {}).get("limit") and tgt not in self._read_limit_hinted:
-                        # only nudge when the file is actually bigger than one page
                         hdr = re.search(r"\((\d+) lines,", str(text))
                         if hdr and int(hdr.group(1)) > 200:
                             self._read_limit_hinted.add(tgt)
-                            text = (str(text) + "\n\n[harness hint: this file has more lines than shown. "
-                                               "Next time pass offset/limit (or grep first) to read only the part you "
-                                               "need — pulling whole files floods your context and triggers loops.]")
+                            text, _ameta = constraints.auto_paginate(
+                                self.session, tgt, int(hdr.group(1)), text, args
+                            )
+                            meta = {**(meta or {}), **_ameta}
 
                 # Escalating ladder on consecutive inspection-without-progress.
-                # Each rung is MORE directive than the last and names a concrete next
-                # action, so a weak model is pushed toward acting instead of just being
-                # told it "looped". The breaker only hard-halts as a last resort.
+                # Direction C: silent meta. At rung 5/10 the gate hard-rejects
+                # non-think/ask_user calls; at rung 15 the breaker hard-halts.
                 ci = self._consecutive_inspections
-                if ci == 5:
-                    files = ", ".join(list(self._inspection_targets)[:6])
-                    text = (str(text) + f"\n\n[harness hint: 5 read-only steps with no file change yet. "
-                                       f"You have already read: {files}. "
-                                       "STOP reading and START editing — apply your planned change with write() or edit() now.]")
-                elif ci == 10:
-                    text = (str(text) + "\n\n[harness DIRECTIVE: 10 consecutive read-only steps and nothing written. "
-                                       "You are looping. Do NOT read another file. Pick the file that most needs the change "
-                                       "and edit() it in your NEXT action. If you genuinely cannot proceed, state the blocker "
-                                       "in plain text and stop.]")
-                elif ci == 15:
-                    text = (str(text) + "\n\n[harness FINAL WARNING: 15 read-only steps, zero edits. The circuit breaker "
-                                       "will halt this turn soon. Make one concrete edit() or write() immediately, or reply "
-                                       "with your findings as text — but do not read again.]")
+                if ci in (5, 10, 15):
+                    emeta = constraints.escalate_inspection(
+                        self.session,
+                        rung=ci,
+                        count=ci,
+                        distinct=len(self._inspection_targets),
+                        top_repeats=_top_repeats(self._inspection_targets),
+                    )
+                    meta = {**(meta or {}), **emeta}
 
                 _dbg(self.session, "breaker.tick", step=attempt, tool=name,
                      target=tgt, novel=novel,
@@ -1404,20 +1460,36 @@ class Engine:
                      distinct_targets=len(self._run_targets))
 
                 # Gemini habitually reads files via py()/exec instead of read(),
-                # which bypasses truncation/line limits and floods context. Nudge
-                # it toward the right tool the moment the pattern appears.
+                # which bypasses truncation/line limits and floods context.
+                # Direction C: redact the file bytes from the output instead of
+                # telling the model to use read().
                 if name in ("py", "exec"):
                     code = str((args or {}).get("code") or (args or {}).get("cmd") or "")
                     if _PY_READS_FILE_RE.search(code):
-                        text = (str(text) + "\n\n[harness hint: reading files via py()/exec wastes context and "
-                                           "bypasses the read() tool's line-limit/truncation. Use read() for files, "
-                                           "grep (or `exec rg`) to locate text, and py() only for computation.]")
+                        text, _rmeta = constraints.redact_py_file_reads(self.session, name, code, text)
+                        meta = {**(meta or {}), **_rmeta}
+
+                # Site 11 (direction C): auto-summarize large read() results so
+                # the model sees the *shape* of the file (top-level symbols + line
+                # numbers) before the bytes burn the context window. The body is
+                # preserved in the journal for replay, but the model's view starts
+                # with the summary so it can target the next read.
+                if name == "read" and tgt:
+                    text, _hmeta = constraints.head_summary(self.session, tgt, text)
+                    if _hmeta:
+                        meta = {**(meta or {}), **_hmeta}
+
+                # Carry constraint meta forward: this is how the gate at the
+                # top of the next iteration knows force_plan / escalate is active.
+                if meta.get("constraint"):
+                    self._last_constraint_meta = meta
 
                 self.session.emit("tool_result", call_id=cid, name=name, text=str(text),
                                    status=meta.get("status") or ("failed" if str(text).startswith(("error", "denied")) else "succeeded"),
                                    exit_code=meta.get("exit_code"), path=meta.get("path"),
                                    diff=meta.get("diff") or None,
-                                   media=meta.get("media") or None)
+                                   media=meta.get("media") or None,
+                                   constraint=meta.get("constraint"))
                 self.stream_cb("result", str(text))
                 if meta.get("diff"):
                     self.stream_cb("diff", meta["diff"])

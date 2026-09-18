@@ -7,8 +7,10 @@
     - Relative basename ('tui.py') auto-resolves to unique project match ('kern/tui.py')
  3. Process Tree Cleanup:
     - cleanup_procs() terminates lingering background processes cleanly
- 4. Error Loop Entropy Sensor:
-    - 3 consecutive failing tool calls inject a methodology hint
+ 4. Error Loop Constraint (direction C):
+    - 3 consecutive failing tool calls set force_plan in tool_result meta
+    - The 4th tool call is rejected by constraint_gate unless it is think/ask_user
+    - No "[harness hint: ...]" text leaks into the model's tool_result
 """
 import asyncio, base64, json, os, sys, tempfile, pathlib
 sys.path.insert(0, "/home/marty/kern")
@@ -128,11 +130,28 @@ sess_err = create_session(cwd=tmp_home)
 eng_err = ke.Engine(FailingModel(), "fake-model", sess_err, tmp_home, approve=lambda *a, **k: True)
 reply_err = asyncio.run(eng_err.chat("run bad commands"))
 
-# Inspect events: the 3rd tool result must contain the entropy hint
+# Inspect events: structural constraint (no hint-text leak).
+# The 3rd tool_result must carry the force_plan marker in its meta, but must
+# NOT contain the old prose hint — forcing a re-plan is enforced structurally,
+# not by jamming prose into the result the model would re-read.
 tool_results = [e for e in sess_err.events if e.get("kind") == "tool_result"]
 assert len(tool_results) == 3
-third_result = tool_results[2].get("text", "")
-assert "harness hint: 3 consecutive actions failed" in third_result, f"Hint missing in: {third_result}"
-print("4) Error entropy sensor: 3 consecutive failures injected methodology hint")
+third_meta = tool_results[2]
+third_text = tool_results[2].get("text", "")
+assert third_meta.get("constraint") == "force_plan", f"force_plan marker missing in: {third_meta}"
+assert "harness hint: 3 consecutive actions failed" not in third_text, \
+    f"prose hint leaked (should be structural only): {third_text!r}"
+
+# Gate contract: a non-allowed tool call after force_plan must be rejected,
+# and allowed calls (todo / note / memory) must pass.
+import kern.constraints as kc
+fp = {"constraint": "force_plan", "force_plan_consecutive": 3, "force_plan_last_error": "x"}
+assert kc.constraint_gate(None, "exec", fp) is not None   # rejected
+assert kc.constraint_gate(None, "read", fp) is not None  # rejected
+assert kc.constraint_gate(None, "todo", fp) is None      # passes — re-plan tool
+assert kc.constraint_gate(None, "note", fp) is None      # passes — durable note
+assert kc.constraint_gate(None, "memory", fp) is None    # passes — persistent memory
+assert kc.constraint_gate(None, "exec", {}) is None      # no constraint → no gate
+print("4) Error entropy sensor: 3 consecutive failures → force_plan meta + gate blocks non-plan tools, re-plan tools pass")
 
 print("\nPASS T25: All 4 Perfection Pillars 100% verified!")

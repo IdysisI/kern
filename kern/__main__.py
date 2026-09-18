@@ -65,7 +65,11 @@ def main():
     modes.add_argument('--task', nargs='+', help='headless task; actions are automatically approved')
     modes.add_argument('--probe', nargs='?', const='', metavar='MODEL', help='probe model capabilities')
     parser.add_argument('--max-steps', type=int, help='headless iteration limit; exits nonzero if exhausted')
+    parser.add_argument('--quiet', action='store_true',
+                        help='disable constraint/debug journal logging (default: on)')
     args = parser.parse_args()
+    if args.quiet:
+        os.environ['KERN_QUIET'] = '1'   # constraints.debug_enabled() reads this
     model = args.model or os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
     if args.max_steps is not None and (args.max_steps < 1 or not args.task):
         parser.error('--max-steps requires --task and a positive value')
