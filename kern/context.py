@@ -11,6 +11,13 @@ import re
 import hashlib
 import time as _time
 from .storage import atomic_write
+# Audit #3.1 residual surface (Phase D): evidence_block() inlines raw call
+# targets and tool-result snippets into every render, and history() returns
+# raw event JSON. compact_into() already scrubs these patterns at journal
+# write time (journal.py), but this raw text reaches the model through
+# context.py instead. Reuse the same scrubber; journal does not import
+# context, so there is no circular dependency.
+from .journal import _scrub_compact_text
 
 
 def summary_fields(data):
@@ -76,7 +83,7 @@ def evidence_block(events, session):
     for r in unresolved[-12:] + recent:
         args = r['arguments']
         target = args.get('path') or args.get('cmd') or args.get('url') or args.get('task') or ''
-        lines.append(f"{r['id']} {r['name']} {str(target)[:220]} -> {r['status']} (event {r.get('result_event',r['event'])}) {r.get('result','')[:180]}")
+        lines.append(f"{r['id']} {r['name']} {_scrub_compact_text(str(target))[:220]} -> {r['status']} (event {r.get('result_event',r['event'])}) {_scrub_compact_text(r.get('result',''))[:180]}")
     lines.append('Older operations: memory(action="history", pattern="..."). Never repeat uncertain effects without checking actual state.')
     return '\n'.join(lines) + '\n</execution-evidence>'
 
@@ -90,6 +97,10 @@ def history(session, pattern='', start=0, limit=20):
         raw = json.dumps(ev, ensure_ascii=False)
         if terms and not all(t in raw.casefold() for t in terms):
             continue
+        # Scrub BEFORE truncation: an injection pattern split across the
+        # 3000-char cut must not survive half-redacted, and the pattern match
+        # for `terms` still runs on the raw JSON above (search fidelity).
+        raw = _scrub_compact_text(raw)
         if len(raw) > 4000:
             path = session.offload(f'event-{ev["n"]}', raw)
             raw = raw[:3000] + f'\n[full event: {path}]'
