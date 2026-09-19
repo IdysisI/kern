@@ -2,6 +2,7 @@
 const $ = id => document.getElementById(id);
 let socket, sequence = 0, session = sessionStorage.getItem('kern-session'), running = false;
 let pending = new Map(), allSessions = {}, live = null, currentTool = null, approval = null, reconnect;
+let renderedN = 0, renderedSession = null, calls = new Map(), liveRaf = 0, livePending = '';
 const welcome = $('messages').innerHTML;
 
 function notice(message) { $('notice').textContent = message; $('notice').hidden = !message; }
@@ -91,9 +92,23 @@ function toolCard(name, args, result='', status='') {
   el.append(head,pre); $('messages').append(el); return {el,pre,args};
 }
 function renderEvents(events) {
-  $('messages').replaceChildren(); live=null; currentTool=null;
-  const calls = new Map();
-  for (const ev of events) {
+  // Incremental append: this used to rebuild the ENTIRE message DOM on every
+  // state() call (O(n) per poll -> O(n^2) over a session, audit r3 F2). We keep
+  // a watermark (renderedN) and only append events newer than it.
+  const total = events.length;
+  if (renderedSession === session && renderedN === total) return;
+  let slice = events;
+  if (renderedSession === session && renderedN > 0 && total > renderedN) slice = events.slice(renderedN);
+  if (slice === events) { $('messages').replaceChildren(); calls = new Map(); }
+  renderedSession = session; renderedN = total;
+  // The in-flight streaming bubble is not in the journal yet: keep it, and put
+  // it back at the end after appending newer events (correct chronology).
+  const journalledLive = live && slice.some(ev => ev.kind === 'assistant' && ev.text &&
+      (ev.text === live.text || ev.text.startsWith(live.text) || live.text.startsWith(ev.text)));
+  if (liveRaf) { cancelAnimationFrame(liveRaf); liveRaf = 0; }
+  if (journalledLive) { live.article.remove(); live = null; }
+  currentTool = null;
+  for (const ev of slice) {
     if (ev.kind==='user') bubble('user',ev.text || '');
     if (ev.kind==='assistant') {
       if (ev.text) bubble('assistant',ev.text);
@@ -105,6 +120,7 @@ function renderEvents(events) {
     }
     if (ev.kind==='note') { const el=document.createElement('p');el.className='tool';el.textContent=ev.text;$('messages').append(el); }
   }
+  if (live) $('messages').append(live.article);
   if (!$('messages').children.length) $('messages').innerHTML=welcome;
 }
 function renderPlan(items) {
@@ -155,7 +171,15 @@ $('approval').addEventListener('close',()=>{if(approval!==null){rpc('approve',{i
 async function onEvent(m){
   if(m.session && m.session!==session)return;
   if(m.event==='turn_start'){busy(true);live=null;notice('');}
-  else if(m.event==='text'){if(!live)live=bubble('assistant');live.text+=m.text;renderText(live.content,live.text);scrollIfNear();}
+  else if(m.event==='text'){
+    if(!live)live=bubble('assistant');
+    live.text+=m.text;
+    // Coalesce chunk re-renders to one per animation frame: renderText rebuilds
+    // the whole assistant message DOM, so per-chunk calls cost O(n^2) on long
+    // answers and froze the tab on multi-kB streams (audit r3 F1).
+    livePending=live.text;
+    if(!liveRaf)liveRaf=requestAnimationFrame(()=>{liveRaf=0;if(live)renderText(live.content,livePending);scrollIfNear();});
+  }
   else if(m.event==='tool'){live=null;const t=JSON.parse(m.text);currentTool=toolCard(t.name,t.arguments || {});scrollIfNear();}
   else if(m.event==='result' && currentTool){currentTool.pre.textContent=JSON.stringify(currentTool.args,null,2)+'\n\n'+m.text;currentTool.el.classList.toggle('failed',/^error|^denied|^exit=[1-9]/.test(m.text));}
   else if(m.event==='diff' && currentTool)currentTool.pre.textContent+='\n\n'+m.text;
