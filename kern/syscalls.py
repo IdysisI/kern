@@ -658,6 +658,13 @@ def _stop_process(proc):
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            # Not our process group (e.g. spawned without start_new_session by
+            # an older code path): fall back to killing the direct child.
+            try:
+                proc.kill()
+            except Exception:
+                pass
     try:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
@@ -700,7 +707,10 @@ def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False, *, 
                 pass
     except subprocess.TimeoutExpired:
         _stop_process(proc)
-        return f"error: timed out after {timeout}s; process tree stopped. Partial effects possible. Output: {logfile}", {"status": "uncertain", "timed_out": True}
+        return (f"error: timed out after {timeout}s; process tree stopped. Partial effects possible. "
+                f"Output so far: {logfile}. Next step: read that file (or proc logs) to see how far it got, "
+                f"then rerun with a larger timeout or background=true and poll with proc."), \
+            {"status": "uncertain", "timed_out": True}
     finally:
         PROCS.pop(hid, None)
     size = logfile.stat().st_size
