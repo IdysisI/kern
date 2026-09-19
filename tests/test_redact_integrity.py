@@ -76,3 +76,38 @@ def test_short_output_without_file_bytes_gets_nudge_not_trim():
     assert "redacted (" not in out, "trimmed without verified bytes"
     assert meta.get("constraint") == "redact_py_file_reads", \
         "pattern match must still be reported (anti-bypass intent)"
+
+
+def test_heredoc_and_string_literals_are_not_file_reads():
+    """cat/open tokens inside heredoc bodies or string literals are DATA, not
+    commands (audit r4-verify F1: a heredoc writing a python file that reads
+    /etc/passwd made the constraint fire and truncate the whole exec output)."""
+    s = _Sess()
+    heredoc = ('bash -c "cat > /tmp/x.py <<\'EOF\'\n'
+               'import json\n'
+               'data = open(\'/etc/passwd\',\'r\').read()\n'
+               'EOF"')
+    out, meta = redact_py_file_reads(s, "exec", heredoc, "X" * 6000)
+    assert meta == {}, f"heredoc body matched as a file read: {meta}"
+    assert out.count("X") == 6000, "output truncated on heredoc false positive"
+
+    out2, meta2 = redact_py_file_reads(s, "exec", 'grep -n "open(" kern/engine.py', "Y" * 6000)
+    assert meta2 == {}, f"string-literal pattern matched: {meta2}"
+    assert out2.count("Y") == 6000
+
+
+def test_stdin_cat_and_flag_targets_not_matched():
+    s = _Sess()
+    out, meta = redact_py_file_reads(s, "exec", "echo hi | cat - > /dev/null", "Z" * 6000)
+    assert meta == {}, f"cat - (stdin) matched as file read: {meta}"
+
+
+def test_true_positives_still_fire_with_clean_targets():
+    s = _Sess()
+    f = Path("/tmp/kern_redact_tp.txt")
+    f.write_text("TPCONTENT\n" * 5)
+    out, meta = redact_py_file_reads(s, "exec", f"cat {f},", "TPCONTENT\n" * 500)
+    assert meta.get("constraint") == "redact_py_file_reads"
+    assert meta.get("redact_target") == str(f), f"target not cleaned: {meta}"
+    out2, meta2 = redact_py_file_reads(s, "py", f"print(open('{f}').read())", "TPCONTENT\n" * 500)
+    assert meta2.get("redact_target") == str(f), f"py target masked: {meta2}"

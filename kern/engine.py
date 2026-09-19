@@ -1768,7 +1768,7 @@ class Engine:
                 # telling the model to use read().
                 if name in ("py", "exec"):
                     code = str((args or {}).get("code") or (args or {}).get("cmd") or "")
-                    if _PY_READS_FILE_RE.search(code):
+                    if _PY_READS_FILE_RE.search(constraints.code_surface(code)):
                         text, _rmeta = constraints.redact_py_file_reads(self.session, name, code, text)
                         meta = {**(meta or {}), **_rmeta}
 

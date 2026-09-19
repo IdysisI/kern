@@ -301,22 +301,85 @@ _PY_OPEN_PATH_RE = re.compile(
 )
 _WRITE_MODE = re.compile(r"^[wax]")
 
+_HEREDOC_RE = re.compile(r"<<-?\s*['\"]?(?P<tag>\w+)['\"]?[ \t]*\n(?P<body>.*?)(?P=tag)[ \t]*(?:\n|$)", re.S)
+_CMD_POS_RE = re.compile(r"(?:^|[;|&`]|\$\(|\b(?:sudo|time|nice|nohup|env|while|if|then|else|do)\b)\s*$")
+
+
+def code_surface(code: str) -> str:
+    """Length-preserving mask of a py/exec snippet: string CONTENTS become 'x',
+    comments and heredoc BODIES become spaces (quote chars and newlines kept).
+
+    Matching read-patterns against raw code false-positives on data: heredoc
+    bodies ('cat > f <<EOF'), test fixtures and grep patterns all contain
+    cat/open tokens that are not commands (audit r4-verify F1). Positions are
+    preserved so a match span on the surface maps 1:1 onto the original.
+    """
+    def _blank_body(m):
+        body = m.group('body')
+        return code[m.start():m.start('body')] + ' ' * len(body) + code[m.end('body'):m.end()]
+    out = _HEREDOC_RE.sub(_blank_body, code)
+    res = []
+    i, n, q = 0, len(out), None
+    while i < n:
+        c = out[i]
+        if q:
+            if q in ('"""', "'''"):
+                if out.startswith(q, i):
+                    res.append(q); i += 3; q = None; continue
+                res.append('\n' if c == '\n' else 'x'); i += 1; continue
+            if c == '\\':
+                res.append('xx'); i += 2; continue
+            if c == q:
+                q = None; res.append(c); i += 1; continue
+            res.append('x'); i += 1; continue
+        if out.startswith('"""', i) or out.startswith("'''", i):
+            q = out[i:i + 3]; res.append(q); i += 3; continue
+        if c in '"\'':
+            q = c; res.append(c); i += 1; continue
+        if c == '#':
+            j = out.find('\n', i)
+            j = n if j < 0 else j
+            res.append(' ' * (j - i)); i = j; continue
+        res.append(c); i += 1
+    return ''.join(res)
+
+
+def _at_cmd_pos(surface: str, idx: int) -> bool:
+    head = surface[:idx].rstrip()
+    return not head or bool(_CMD_POS_RE.search(head))
+
+
+def _clean_target(tok: str) -> str:
+    return tok.strip('\'"`').rstrip(',;:)]}|>&').strip('\'"`')
+
 
 def redact_py_file_reads(session: Any, name: str, code: str, text: str) -> tuple[str, dict]:
     """If py/exec code reads a file, redact that file's contents from the output."""
     if name not in ("py", "exec"):
         return text, {}
-    m = _PY_OPEN_PATH_RE.search(str(code or ""))
+    code = str(code or "")
+    surface = code_surface(code)
+    m = None
+    for cand in _PY_OPEN_PATH_RE.finditer(surface):
+        if cand.group("path3") is not None and not _at_cmd_pos(surface, cand.start()):
+            continue          # cat/open token inside a string or heredoc: data, not a command
+        m = cand
+        break
     if not m:
         return text, {}
+    # Groups come from the ORIGINAL code at the same offset: the surface masks
+    # string contents, so open('...')/Path('...') paths would read as 'xxx'.
+    m = _PY_OPEN_PATH_RE.match(code, m.start()) or m
     mode = (m.group("mode") or "").strip()
     if mode and _WRITE_MODE.match(mode):
         # write/append/exclusive open: the output cannot contain the file's
         # prior contents, so trimming would destroy a legit result (audit r3 F1)
         return text, {}
     target = next((g for k, g in m.groupdict().items() if g and k != "mode"), None)
-    if not target:
-        return text, {}
+    if target:
+        target = _clean_target(target)
+    if not target or target == "-" or target.startswith("-"):
+        return text, {}          # cat - reads stdin: no file involved
     out = str(text)
     # Verify the file's bytes actually appear in the output before destroying
     # anything: piped cat (`cat f | grep x`) or failed opens produce output that
