@@ -186,7 +186,20 @@ def _inspection_target(name: str, args: dict) -> str:
 
     Priority: explicit target args > a file path extracted from a py/exec payload >
     a digest of the payload (so re-running the IDENTICAL code still counts as the same
-    target, but DIFFERENT code is correctly seen as distinct exploration)."""
+    target, but DIFFERENT code is correctly seen as distinct exploration).
+
+    `read` gets special treatment: the slice IS part of the identity. Paging through
+    one large file (offset 1616, then 1495, then 1555) is *research*, not looping —
+    but keying on the bare path counted every distinct slice as "revisiting the same
+    target", so 20 legitimate slice-reads tripped the breaker and halted a productive
+    turn (observed live). Same contract as _repeat_key: different slice -> different
+    target; identical slice -> same target; full-file reads still collapse."""
+    if name == "read":
+        path = args.get("path", "")
+        off, lim = args.get("offset"), args.get("limit")
+        if args.get("full") or (off is None and lim is None):
+            return f"read:{path}"
+        return f"read:{path}@{off}-{lim}"
     for k in ("path", "url", "query", "handle"):
         v = args.get(k)
         if v:
@@ -633,6 +646,24 @@ class Engine:
             uncertain = (name in ('exec','py','write','edit') or self.mounts.owns_tool(name)) and not isinstance(e,(ValueError,TypeError))
             return f"error executing {name}: {type(e).__name__}: {e}", {"status": "uncertain" if uncertain else "failed"}
 
+    def _count_rejection(self, name, args):
+        """Feed a REJECTED call into the inspection sensor (audit R1).
+
+        Rejected calls `continue` before the post-execution sensor, so the
+        consecutive-inspection counter used to FREEZE on a model stuck in
+        rejections — it spun to max_steps and returned an empty reply (this made
+        test_inspection_circuit_breaker_halts_looping_turn hang).
+
+        But only count the rejection when the blocked call was itself read-only.
+        A blocked duplicate *write* is a no-op of a PROGRESS-intent call: inflating
+        a "read-only loop" counter with it fired the breaker on turns that were
+        productively alternating between probing and writing. Counting those turned
+        one false-negative into a false-positive — exactly what this audit targets.
+        """
+        if _is_read_only(name, args):
+            self._consecutive_inspections += 1
+            self._last_inspection_target = _inspection_target(name, args)
+
     def _repeat_guard(self, name, args, reason):
         from .context import receipts
         if name not in ('write', 'edit', 'exec', 'py') and '__' not in name:
@@ -760,9 +791,12 @@ class Engine:
 
         # Opt-in git-worktree isolation for mutating subagents. Default off: the common
         # (research/exploration) path is unchanged. Degrades gracefully outside git.
+        # Audit R1 (sub_12 F1): the git probe/add calls block up to ~30s total —
+        # running them inline froze the whole event loop (heartbeats, TUI streaming,
+        # sibling subagents). Offload to a worker thread.
         child_cwd, worktree = (self.cwd, None)
         if isolate:
-            child_cwd, worktree = self._setup_worktree(hid)
+            child_cwd, worktree = await asyncio.to_thread(self._setup_worktree, hid)
             if worktree is None:
                 context = (context + "\n[note: worktree isolation requested but unavailable "
                            "(not a clean git repo) — running in place; do not leave uncommitted "
@@ -1429,6 +1463,7 @@ class Engine:
                 if blocked:
                     self.session.emit('tool_result', call_id=cid, name=name, text=blocked, status='denied')
                     self.stream_cb('result', blocked)
+                    self._count_rejection(name, args)
                     continue
                 # Direction C: structural-constraint gate. If the *previous* tool
                 # result carried a force_plan / escalate meta, this call is rejected
@@ -1442,6 +1477,7 @@ class Engine:
                                       constraint=gate["meta"].get("constraint"))
                     self.stream_cb("result", gate["text"])
                     self._last_constraint_meta = gate["meta"]  # keep gate active
+                    self._count_rejection(name, args)
                     continue
                 prior = self._prior_execution(name, args)
                 needs_ok = name in ("write", "edit", "exec", "py") or "__" in name

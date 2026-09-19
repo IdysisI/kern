@@ -297,8 +297,16 @@ def test_projection_stable(tmp_path):
 
 @pytest.mark.asyncio
 async def test_inspection_loop_sensor(tmp_path):
+    """Repeat-suppression contract (post a83750f structural refactor):
+
+    - reads at DISTINCT offsets are distinct actions -> full results, no suppression
+      (legitimate paging must never lose content — the 2026-09-18 read-tool incident)
+    - an IDENTICAL read within one turn hits the in-turn dedup cache and gets a
+      BOUNDED, self-contained stub (audit R1 sub_13 F1: the stub must stay usable
+      even after the pager clears the original — no dangling "full result above")."""
     target_file = tmp_path / "hello.txt"
-    target_file.write_text("hello world", encoding="utf-8")
+    target_file.write_text("hello world\nsecond line\nthird line", encoding="utf-8")
+
     class LoopingReader:
         count = 0
         async def probe(self, model):
@@ -314,9 +322,36 @@ async def test_inspection_loop_sensor(tmp_path):
     await e.chat('Read repeatedly', max_steps=6)
     results = [x for x in s.events if x['kind'] == 'tool_result']
     assert len(results) == 5
-    # new ladder: per-target hint fires at the 3rd read, a firmer WARNING at the 5th
-    assert "now read" in results[2]['text'] and "3 times" in results[2]['text']
-    assert "WARNING" in results[4]['text'] and "5 times" in results[4]['text']
+    # distinct slices: every result keeps its real content (no suppression pointers)
+    assert not any('suppressed' in r['text'] for r in results)
+    assert all('hello.txt' in r['text'] for r in results)
+
+    # IDENTICAL slice repeated: dedup stub at the 2nd hit, carrying a bounded
+    # excerpt (never empty, never a pointer to a possibly-cleared original)
+    class SameSliceReader:
+        count = 0
+        async def probe(self, model):
+            pass
+        async def stream_chat(self, model, messages, **kwargs):
+            self.count += 1
+            if self.count <= 5:
+                yield StreamEvent('tool_call', tool_call={'id': f'r{self.count}', 'name': 'read', 'arguments': {'path': str(target_file), 'offset': 1, 'limit': 2}})
+            else:
+                yield StreamEvent('text', text='done')
+    s2 = create_session(str(tmp_path))
+    e2 = Engine(SameSliceReader(), 'fake', s2, str(tmp_path))
+    await e2.chat('Read one slice repeatedly', max_steps=6)
+    r2 = [x for x in s2.events if x['kind'] == 'tool_result']
+    first = r2[0]
+    dupes = [r for r in r2[1:] if 'cached from earlier this turn' in r['text']]
+    assert len(dupes) == 4, f"identical reads must dedup after the first, got {len(dupes)}"
+    assert first['text'].strip() and 'cached' not in first['text']
+    for d in dupes:
+        assert d.get('constraint') == 'dedup'
+        # F1: the stub must be self-contained — it carries the original's head,
+        # so it survives the pager clearing the first result.
+        assert 'hello world' in d['text'], "dedup stub must inline a bounded excerpt"
+        assert len(d['text']) < 2500, "excerpt must be bounded"
 
 
 def test_step_is_progress_classifier():
@@ -381,8 +416,15 @@ def test_inspection_target_extracts_real_target():
     # exec: file target extracted from common inspection commands
     assert t('exec', {'cmd': 'cat kern/daemon.py'}) == 'kern/daemon.py'
     assert t('exec', {'cmd': 'git diff kern/static'}) == 'kern/static'
-    # explicit args win
-    assert t('read', {'path': 'a/b.py'}) == 'a/b.py'
+    # explicit args win; read is slice-aware (audit R1 sub_13/user FP):
+    # the tool name is namespaced in, and a full-file read collapses to one key
+    # while DISTINCT slices are DISTINCT targets (paging != looping).
+    assert t('read', {'path': 'a/b.py'}) == 'read:a/b.py'
+    assert t('read', {'path': 'a/b.py', 'full': True}) == 'read:a/b.py'
+    assert t('read', {'path': 'a/b.py', 'offset': 10, 'limit': 5}) == 'read:a/b.py@10-5'
+    assert t('read', {'path': 'a/b.py', 'offset': 20, 'limit': 5}) == 'read:a/b.py@20-5'
+    assert t('read', {'path': 'a/b.py', 'offset': 10, 'limit': 5}) != \
+           t('read', {'path': 'a/b.py', 'offset': 20, 'limit': 5})
     assert t('fetch', {'url': 'https://x'}) == 'https://x'
     # code with no file literal: identical rerun -> same key; different code -> different key
     c1, c2 = t('py', {'code': 'print(1)'}), t('py', {'code': 'print(2)'})
