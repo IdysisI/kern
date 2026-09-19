@@ -47,23 +47,46 @@ class Conn:
         self.auto_approve = False
         self._approvals: dict[int, asyncio.Future] = {}
         self._approval_seq = 0
+        # Single-writer send queue: stream events used to be fire-and-forget
+        # tasks, so deltas could interleave out of order and land AFTER
+        # turn_end (audit r4 S5). Every outbound message now flows through one
+        # ordered queue drained by one writer task.
+        self._send_q: asyncio.Queue = asyncio.Queue()
+        self._writer = asyncio.get_running_loop().create_task(self._drain())
+
+    async def _drain(self):
+        while True:
+            msg = await self._send_q.get()
+            if msg is None:
+                break
+            try:
+                await self.ws.send(json.dumps(msg, ensure_ascii=False))
+            except Exception:
+                break
+
+    async def close(self):
+        self._send_q.put_nowait(None)
+        try:
+            await asyncio.wait_for(self._writer, timeout=2)
+        except Exception:
+            self._writer.cancel()
 
     async def send(self, **msg):
         try:
-            await self.ws.send(json.dumps(msg, ensure_ascii=False))
+            self._send_q.put_nowait(msg)
         except Exception:
             pass
 
-    # engine -> client
+    # engine -> client (sync callback: enqueue, never block the engine loop)
     def stream_cb(self, kind: str, text: str):
-        asyncio.get_event_loop().create_task(self.send(event=kind, text=text))
+        self._send_q.put_nowait({"event": kind, "text": text})
 
     async def approve(self, desc: str, diff: str | None = None) -> bool:
         if self.auto_approve:
             return True
         self._approval_seq += 1
         aid = self._approval_seq
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._approvals[aid] = fut
         await self.send(event="approve_request", id=aid, desc=desc, diff=diff)
         return await fut
@@ -73,7 +96,13 @@ class Conn:
                       approve=self.approve, stream_cb=self.stream_cb)
 
     async def handle(self, msg: dict):
+        if not isinstance(msg, dict):
+            await self.send(event="error", error="message must be a JSON object")
+            return
         m = msg.get("method")
+        if not isinstance(m, str):
+            await self.send(event="error", error="missing or non-string 'method'")
+            return
         if m in ('new_session','rewind','fork') and self.turn and not self.turn.done():
             await self.send(event='error',error='interrupt the active turn before mutating session')
             return
@@ -103,7 +132,7 @@ class Conn:
             if self.turn and not self.turn.done():
                 self.turn.cancel()
         elif m == "model":
-            self.model = msg["model"]
+            self.model = str(msg.get("model") or self.model)
             await self.send(result={"model": self.model})
         elif m == "new_session":
             self.session = create_session(cwd=self.cwd)
@@ -119,7 +148,12 @@ class Conn:
         elif m == "context":
             await self.send(result=budget(self.session.events, self.session))
         elif m == "rewind":
-            restored = self.session.restore(int(msg.get("id", 0)))
+            try:
+                rid = int(msg.get("id", 0))
+            except (TypeError, ValueError):
+                await self.send(event="error", error="rewind needs a numeric id")
+                return
+            restored = self.session.restore(rid)
             await self.send(result={"restored": restored})
         elif m == "fork":
             child = self.session.fork(msg.get("at"))
@@ -150,6 +184,7 @@ async def handler(ws):
     finally:
         if conn.turn and not conn.turn.done():
             conn.turn.cancel()
+        await conn.close()          # drain/stop the ordered send writer
 
 
 def main():
