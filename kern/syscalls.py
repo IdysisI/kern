@@ -821,7 +821,22 @@ def tool_fetch(url: str, max_chars: int = 12000, cache: dict | None = None) -> t
 # ---- web search & scrape -----------------------------------------------------
 
 def _web_base() -> str:
-    return os.environ.get("KERN_WEB_BASE", "http://10.42.0.10:8000").rstrip("/")
+    # Resolution order:
+    #   1. KERN_WEB_BASE environment variable (allows override per launch)
+    #   2. ~/.kern/web_base file (persists across restarts without touching bashrc)
+    #   3. Built-in default that assumes the laptop is on the Pi's direct subnet
+    env_base = os.environ.get("KERN_WEB_BASE", "").strip()
+    if env_base:
+        return env_base.rstrip("/")
+    try:
+        cfg = Path.home() / ".kern" / "web_base"
+        if cfg.is_file():
+            txt = cfg.read_text(encoding="utf-8").strip()
+            if txt:
+                return txt.rstrip("/")
+    except OSError:
+        pass
+    return "http://10.42.0.10:8000"
 
 
 def tool_search(query: str, limit: int = 5) -> tuple[str, dict]:
