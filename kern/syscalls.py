@@ -28,6 +28,7 @@ import threading
 import weakref
 import time
 from pathlib import Path
+from . import auth
 from .auth import git_env
 from .storage import atomic_write, file_lock, path_key
 
@@ -703,6 +704,17 @@ def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False, *, 
     finally:
         PROCS.pop(hid, None)
     size = logfile.stat().st_size
+    # Scrub the ON-DISK log first: `proc(logs)` and `read()` can both surface it
+    # later, so leaving a secret in the file would defeat scrubbing the return value.
+    # Only rewrite when a secret is actually present (cheap membership test first).
+    secrets = auth.known_secrets()
+    if secrets:
+        try:
+            raw = logfile.read_bytes()
+            if any(s.encode() in raw for s in secrets):
+                logfile.write_bytes(auth.redact_secrets(raw, secrets))
+        except Exception:
+            pass
     with logfile.open('rb') as f:
         if size > 16000:
             head = f.read(8000)
@@ -711,6 +723,8 @@ def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False, *, 
         else:
             data = f.read()
     out = data.decode('utf-8', errors='replace') or '(no output)'
+    if secrets:
+        out = auth.redact_secrets(out, secrets)
     # Audit finding #2.2: cap large exec results so a stray `cat /etc/passwd`
     # or `head /var/log/secret` cannot dump the whole file into the model's
     # context. The constraint system's redact_py_file_reads only fires for

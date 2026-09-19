@@ -178,7 +178,15 @@ def test_git_env_suppresses_prompts_and_injects_credentials(home):
     assert env['SSH_ASKPASS'] == 'true'
     assert env['GIT_CONFIG_COUNT'] == '3'
     assert env['GIT_CONFIG_KEY_0'] == 'credential.https://github.com.helper'
-    assert 'gho_secret123' in env['GIT_CONFIG_VALUE_0']
+    # The helper is configured, but the raw token must NOT be inlined in the env:
+    # an `env`/`printenv` dump used to write it into ~/.kern/processes/*.log, which
+    # then leaked into model context when that log was read back. It now resolves
+    # the token by indirection at git-invocation time.
+    assert 'gho_secret123' not in env['GIT_CONFIG_VALUE_0']
+    assert not any('gho_secret123' in str(v) for v in env.values()), \
+        'raw token must never appear anywhere in the child environment'
+    assert 'get_token' in env['GIT_CONFIG_VALUE_0'], \
+        'helper must still resolve the token (indirectly), or git auth breaks'
     assert env['GIT_CONFIG_KEY_1'] == 'credential.https://github.com.useHttpPath'
     assert env['GIT_CONFIG_KEY_2'] == 'core.askPass'
     assert env['GIT_CONFIG_VALUE_2'] == ''
@@ -204,7 +212,9 @@ def test_git_env_appends_to_existing_config_count(home):
     # Kern's entries are appended at indices 2..4 and the count updated
     assert env['GIT_CONFIG_COUNT'] == '5'
     assert env['GIT_CONFIG_KEY_2'] == 'credential.https://github.com.helper'
-    assert 'gho_secret123' in env['GIT_CONFIG_VALUE_2']
+    # appended helper resolves the token indirectly; raw token nowhere in env
+    assert 'gho_secret123' not in env['GIT_CONFIG_VALUE_2']
+    assert 'get_token' in env['GIT_CONFIG_VALUE_2']
     assert env['GIT_CONFIG_KEY_3'] == 'credential.https://github.com.useHttpPath'
     assert env['GIT_CONFIG_KEY_4'] == 'core.askPass'
 

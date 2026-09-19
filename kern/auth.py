@@ -269,6 +269,19 @@ def login(scopes: str = DEFAULT_SCOPES, open_browser: bool = True, out=None) -> 
 
 # ---- git integration ---------------------------------------------------------
 
+def _token_indirection() -> str:
+    """Shell snippet that yields the token WITHOUT the token ever being in argv/env.
+
+    The value is read at git-invocation time by a short-lived Python that imports
+    this module. Keeping it indirect matters: the old form embedded the literal
+    token in GIT_CONFIG_VALUE_*, so any `env`/`printenv`/`set` a model ran dumped
+    the raw token into ~/.kern/processes/*.log — and reading that log back with
+    proc(logs) put the secret into MODEL CONTEXT, where it is sent to the provider.
+    """
+    py = sys.executable
+    return f'$({py} -c "from kern.auth import get_token; print(get_token() or \'\')" 2>/dev/null)'
+
+
 def git_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
     """Return an environment dict configured for safe, non-interactive git operations.
 
@@ -279,6 +292,10 @@ def git_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
       via GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_* scoped strictly to
       https://github.com. This requires zero disk writes, leaves ~/.gitconfig untouched,
       and works seamlessly even on read-only filesystems (e.g. btrfs ro).
+
+    SECURITY: the token itself is NEVER placed in the environment. The credential
+    helper resolves it by indirection (_token_indirection) so that dumping the
+    environment cannot disclose it. See also redact_secrets() for defence in depth.
     """
     env = dict(os.environ if base_env is None else base_env)
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -287,13 +304,39 @@ def git_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
 
     token = get_token()
     if token:
+        # Determine the append point. Trust GIT_CONFIG_COUNT when it is a valid
+        # integer, but never go below the highest ambient KEY_ index — otherwise we
+        # would silently overwrite ambient entries (a renumbering pass here once
+        # emitted KEY_0/KEY_2/... and dropped an ambient pair entirely).
         try:
             count = int(env.get("GIT_CONFIG_COUNT", "0"))
         except ValueError:
             count = 0
+        ambient = [int(k.rsplit("_", 1)[-1]) for k in env
+                   if k.startswith("GIT_CONFIG_KEY_") and k.rsplit("_", 1)[-1].isdigit()]
+        if ambient:
+            count = max(count, max(ambient) + 1)
 
-        # Inject URL-scoped credential helper and useHttpPath
-        helper_val = f"!f() {{ echo username=oauth2; echo password={token}; }}; f"
+        # An inherited environment may ALREADY carry a github credential helper with
+        # the token INLINED (older Kern baked it into GIT_CONFIG_VALUE_*, and a
+        # long-lived daemon inherits its own launch env). That stale pair would keep
+        # leaking the secret into any `env` dump. Neutralize it IN PLACE — preserving
+        # indices and ambient entries — with the same secret-free indirect helper.
+        # NOTE: an EMPTY helper value means "reset the helper list" to git, which
+        # would break auth, so we substitute the indirect helper, not "".
+        helper_val = (f"!f() {{ echo username=oauth2; "
+                      f"echo password={_token_indirection()}; }}; f")
+        for idx in ambient:
+            kname = f"GIT_CONFIG_KEY_{idx}"
+            vname = f"GIT_CONFIG_VALUE_{idx}"
+            key = str(env.get(kname, ""))
+            val = str(env.get(vname, ""))
+            is_github_cred = "credential." in key and "github.com" in key
+            if (is_github_cred and ("helper" in key)) or token in val or token in key:
+                env[vname] = helper_val
+
+        # Inject URL-scoped credential helper and useHttpPath. The helper echoes the
+        # token via indirection rather than inlining it.
         env[f"GIT_CONFIG_KEY_{count}"] = "credential.https://github.com.helper"
         env[f"GIT_CONFIG_VALUE_{count}"] = helper_val
         env[f"GIT_CONFIG_KEY_{count + 1}"] = "credential.https://github.com.useHttpPath"
@@ -303,6 +346,62 @@ def git_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
         env["GIT_CONFIG_COUNT"] = str(count + 3)
 
     return env
+
+
+# ---------------------------------------------------------------------------
+# Secret scrubbing (defence in depth)
+# ---------------------------------------------------------------------------
+
+_SECRET_ENV_VARS = ("KERN_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
+
+
+def known_secrets() -> list[str]:
+    """Every secret Kern currently holds, so output scrubbing stays automatic.
+
+    Includes the stored GitHub token and any environment override. Used to scrub
+    exec output / process logs so a secret can never reach model context."""
+    out: list[str] = []
+    for var in _SECRET_ENV_VARS:
+        v = os.environ.get(var)
+        if v and v.strip():
+            out.append(v.strip())
+    try:
+        p = _credentials_path()
+        if p.exists():
+            data = json.loads(p.read_text())
+            t = data.get("token")
+            if t and str(t).strip():
+                out.append(str(t).strip())
+    except Exception:
+        pass
+    # longest first so overlapping prefixes scrub fully
+    return sorted(set(out), key=len, reverse=True)
+
+
+def redact_secrets(text, secrets: list[str] | None = None):
+    """Replace any known secret with an explicit marker. Never returns the secret.
+
+    Explicit marker (not silent blanking) so the model — and the user — can tell
+    that something WAS redacted rather than the output being mysteriously empty.
+    Accepts str or bytes; passes through None unchanged."""
+    if text is None:
+        return None
+    if secrets is None:
+        secrets = known_secrets()
+    secrets = [s for s in (secrets or []) if s]
+    if not secrets:
+        return text
+    marker = "[redacted-by-kern]"
+    if isinstance(text, (bytes, bytearray)):
+        b = bytes(text)
+        for s in secrets:
+            b = b.replace(s.encode("utf-8", "replace"), marker.encode())
+        return b
+    t = str(text)
+    for s in secrets:
+        if s in t:
+            t = t.replace(s, marker)
+    return t
 
 
 def git_credential_helper_command() -> str:
@@ -325,13 +424,41 @@ def ensure_git_credentials(repo: str | None = None, out=None) -> tuple[bool, str
     GIT_CONFIG_* injection). It must never write to ~/.gitconfig (--global)
     or a repo's .git/config (--local) — the user asked for the login to belong
     to Kern alone and to leave the rest of the system untouched. This function
-    therefore only verifies a token exists and reports that in-memory auth is
-    active; it performs no disk writes.
+    therefore performs no disk writes.
 
-    Returns (ok, message). No-op if no token.
+    Returns (ok, message).
+
+    A stored token is not a WORKING token. This used to verify only that the
+    credentials file existed, so a revoked or expired token reported "git
+    credentials active" at every startup and then failed much later with a cryptic
+    `remote: Invalid username or token`. It now checks the token against the API
+    and tells the truth: success names the authenticated account, a dead token
+    says so and points at `kern login`, and an unreachable network says the check
+    could not be completed rather than claiming success.
     """
     out = out or (lambda s: None)
     if not get_token():
         return False, 'not logged in (run: kern login github)'
-    out('git credentials active in-memory (Kern-scoped; global config untouched)')
-    return True, 'git credentials active in-memory (Kern-scoped, no disk config)'
+
+    try:
+        me = whoami()
+    except Exception as e:
+        msg = (f'could not verify stored credentials ({type(e).__name__}: {e}). '
+               'Offline or GitHub unreachable — pushes may still work if the token '
+               'is valid; run `kern login` again if they fail.')
+        out(msg)
+        return False, msg
+
+    if isinstance(me, dict) and me.get("login"):
+        scopes = me.get("scopes")
+        detail = f' scopes=[{scopes}]' if scopes else ''
+        msg = (f"git credentials active in-memory (Kern-scoped, no disk config) "
+               f"as {me['login']}{detail}")
+        out(msg)
+        return True, msg
+
+    reason = (me or {}).get('error_description') or (me or {}).get('message') or 'token rejected'
+    msg = (f'stored GitHub credentials are no longer valid: {reason}. '
+           f'Run `kern login` again to re-authenticate.')
+    out(msg)
+    return False, msg
