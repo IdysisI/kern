@@ -293,12 +293,13 @@ def escalate_inspection(session: Any, rung: int, count: int,
 _PY_OPEN_PATH_RE = re.compile(
     r"""(?ix)
     (?:
-        open\(\s*['"](?P<path1>[^'"]+)['"] |
+        open\(\s*['"](?P<path1>[^'"]+)['"]\s*(?:,\s*['"](?P<mode>[^'"]*)['"])? |
         Path\(\s*['"](?P<path2>[^'"]+)['"]\s*\)\s*\.\s*read |
-        cat\s+(?P<path3>\S+)
+        cat\s+(?:-\S+\s+)*(?P<path3>\S+)
     )
     """
 )
+_WRITE_MODE = re.compile(r"^[wax]")
 
 
 def redact_py_file_reads(session: Any, name: str, code: str, text: str) -> tuple[str, dict]:
@@ -308,19 +309,45 @@ def redact_py_file_reads(session: Any, name: str, code: str, text: str) -> tuple
     m = _PY_OPEN_PATH_RE.search(str(code or ""))
     if not m:
         return text, {}
-    target = next((g for g in m.groupdict().values() if g), None)
+    mode = (m.group("mode") or "").strip()
+    if mode and _WRITE_MODE.match(mode):
+        # write/append/exclusive open: the output cannot contain the file's
+        # prior contents, so trimming would destroy a legit result (audit r3 F1)
+        return text, {}
+    target = next((g for k, g in m.groupdict().items() if g and k != "mode"), None)
     if not target:
         return text, {}
-    # Replace the file contents in the output with a redacted marker.
-    # We don't try to *find* the bytes — we just shorten the output and
-    # mark it so the pager knows to drop or summarize it.
     out = str(text)
+    # Verify the file's bytes actually appear in the output before destroying
+    # anything: piped cat (`cat f | grep x`) or failed opens produce output that
+    # does NOT contain the file content; trimming those deleted real results
+    # with no recoverable pointer (same class as the 2026-09-18 read incident).
+    probe = None
+    try:
+        from pathlib import Path as _P
+        p = _P(target)
+        if p.is_file() and p.stat().st_size < 5_000_000:
+            probe = p.read_text(errors="replace")[:200].strip()
+    except Exception:
+        probe = None
+    if probe is not None and probe and probe not in out:
+        return text, {}          # output carries no bytes of this file: nothing to redact
     if len(out) > 4000:
-        # Hard-trim: keep only the first 1000 chars + last 500 (the
-        # computation result is usually at one end).
-        out = out[:1000] + "\n\n[constraint:redact_py_file_reads] file contents "
-        out += f"from `{target}` redacted ({len(str(text))} chars truncated). "
-        out += "Use read() tool to inspect the file directly.\n\n" + out[-500:]
+        ptr = ""
+        if probe is not None:    # only trim a VERIFIED true positive
+            try:
+                ptr = session.offload("redact", str(text)) if session else ""
+            except Exception:
+                ptr = ""
+            out = out[:1000] + "\n\n[constraint:redact_py_file_reads] file contents "
+            out += f"from `{target}` redacted ({len(str(text))} chars truncated). "
+            if ptr:
+                out += f"Full original output preserved at: {ptr}. "
+            out += "Use read() tool to inspect the file directly.\n\n" + out[-500:]
+        else:
+            out = out + (f"\n\n[constraint:redact_py_file_reads] reading `{target}` via "
+                         + "py()/exec() bypasses the read() tool's truncation/limits. Use "
+                         + "the read() tool for file contents.")
     else:
         out = (
             out
