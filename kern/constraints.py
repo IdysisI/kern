@@ -322,6 +322,8 @@ def redact_py_file_reads(session: Any, name: str, code: str, text: str) -> tuple
     # anything: piped cat (`cat f | grep x`) or failed opens produce output that
     # does NOT contain the file content; trimming those deleted real results
     # with no recoverable pointer (same class as the 2026-09-18 read incident).
+    # The nudge/metadata still fire on the pattern itself — reading files via
+    # py/exec is the bypass this constraint exists to discourage.
     probe = None
     try:
         from pathlib import Path as _P
@@ -330,24 +332,18 @@ def redact_py_file_reads(session: Any, name: str, code: str, text: str) -> tuple
             probe = p.read_text(errors="replace")[:200].strip()
     except Exception:
         probe = None
-    if probe is not None and probe and probe not in out:
-        return text, {}          # output carries no bytes of this file: nothing to redact
-    if len(out) > 4000:
+    verified = probe is not None and probe and probe in out
+    if len(out) > 4000 and verified:
         ptr = ""
-        if probe is not None:    # only trim a VERIFIED true positive
-            try:
-                ptr = session.offload("redact", str(text)) if session else ""
-            except Exception:
-                ptr = ""
-            out = out[:1000] + "\n\n[constraint:redact_py_file_reads] file contents "
-            out += f"from `{target}` redacted ({len(str(text))} chars truncated). "
-            if ptr:
-                out += f"Full original output preserved at: {ptr}. "
-            out += "Use read() tool to inspect the file directly.\n\n" + out[-500:]
-        else:
-            out = out + (f"\n\n[constraint:redact_py_file_reads] reading `{target}` via "
-                         + "py()/exec() bypasses the read() tool's truncation/limits. Use "
-                         + "the read() tool for file contents.")
+        try:
+            ptr = session.offload("redact", str(text)) if session else ""
+        except Exception:
+            ptr = ""
+        out = out[:1000] + "\n\n[constraint:redact_py_file_reads] file contents "
+        out += f"from `{target}` redacted ({len(str(text))} chars truncated). "
+        if ptr:
+            out += f"Full original output preserved at: {ptr}. "
+        out += "Use read() tool to inspect the file directly.\n\n" + out[-500:]
     else:
         out = (
             out

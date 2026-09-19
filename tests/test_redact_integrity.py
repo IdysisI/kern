@@ -68,8 +68,11 @@ def test_short_output_with_real_bytes_gets_hint_only(tmp_path):
         "short true positive must get hint, not trim"
 
 
-def test_short_output_without_file_bytes_untouched():
+def test_short_output_without_file_bytes_gets_nudge_not_trim():
     s = _Sess()
     out, meta = redact_py_file_reads(s, "exec", "cat /etc/hostname", "unrelated\n")
-    assert out == "unrelated\n" and meta == {}, \
-        "false positive: hint fired although output has no file bytes"
+    assert out.startswith("unrelated\n"), "output mangled"
+    assert "read() tool" in out, "nudge missing"
+    assert "redacted (" not in out, "trimmed without verified bytes"
+    assert meta.get("constraint") == "redact_py_file_reads", \
+        "pattern match must still be reported (anti-bypass intent)"

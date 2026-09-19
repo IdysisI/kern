@@ -60,12 +60,46 @@ FENCED_RE = re.compile(r"```tool\s*\n(.*?)\s*```", re.S)
 
 _MUTATING_CMD_RE = re.compile(
     r"(?:^|\s)(?:sudo\s+)?(?:pip3?|uv\s+pip|uv\s+(?:add|remove|sync)|apt(?:-get)?|dpkg|npm|pnpm|yarn|bun|cargo|gem|brew|pacman|dnf|yum|zypper)\b"
-    r"|\b(?:cp|mv|rm|rmdir|mkdir|touch|chmod|chown|chgrp|ln|install|patch|truncate|dd|tee|kill|pkill|systemctl|service)\b"
+    r"|\b(?:cp|mv|rm|rmdir|mkdir|touch|chmod|chown|chgrp|ln|install|patch|truncate|dd|tee(?=\s+(?!/dev/null\b)\S)|kill|pkill|systemctl|service)\b"
     r"|\bgit\s+(?:add|commit|push|pull|checkout|restore|reset|merge|rebase|apply|am|clean|init|clone|stash|tag|cherry-pick)\b"
     r"|\b7z\s+[ex]\b|\btar\s+[xzj]|\bunzip\b"
     r"|\bsed\s+(?:-[^-\s]*\s+)*-i\b"
-    r"|(?<![->|])>>?(?!&)"
+    r"|(?<![->|])(?:>>|>)(?!&)(?!>?\s*/dev/null)"
 )
+
+
+def _strip_py_comments(code: str) -> str:
+    """Remove Python comments without touching string literals.
+
+    A naive `#...$` regex would eat the rest of any line containing '#' inside a
+    string (x = "#"; os.remove(f)) and hide real mutations. Mutating tokens in
+    COMMENTS are documentation, not code: '# rm -rf' or "# open(f,'w')" reset the
+    progress sensor although nothing changed (audit r3 F3).
+    """
+    out = []
+    i, n, q = 0, len(code), None
+    while i < n:
+        c = code[i]
+        if q:
+            if q in ('"""', "'''"):
+                if code.startswith(q, i):
+                    out.append(q); i += 3; q = None; continue
+                out.append(c); i += 1; continue
+            if c == '\\':
+                out.append(code[i:i + 2]); i += 2; continue
+            if c == q:
+                q = None
+            out.append(c); i += 1; continue
+        if code.startswith('"""', i) or code.startswith("'''", i):
+            q = code[i:i + 3]; out.append(q); i += 3; continue
+        if c in '"\'':
+            q = c; out.append(c); i += 1; continue
+        if c == '#':
+            j = code.find('\n', i)
+            i = n if j < 0 else j
+            continue
+        out.append(c); i += 1
+    return ''.join(out)
 
 _PY_MUTATING_RE = re.compile(
     r"open\([^)]*['\"][wax]\+?['\"]"
@@ -168,7 +202,7 @@ def _is_read_only(name: str, args: dict) -> bool:
     if name == "exec":
         return not _MUTATING_CMD_RE.search(_exec_surface(args.get("cmd", "")))
     if name == "py":
-        return not _PY_MUTATING_RE.search(str(args.get("code", "")))
+        return not _PY_MUTATING_RE.search(_strip_py_comments(str(args.get("code", ""))))
     return False
 
 
@@ -248,7 +282,7 @@ def _step_is_progress(name: str, args: dict) -> bool:
     if name == "exec":
         return bool(_MUTATING_CMD_RE.search(_exec_surface(args.get("cmd", ""))))
     if name == "py":
-        return bool(_PY_MUTATING_RE.search(str(args.get("code", ""))))
+        return bool(_PY_MUTATING_RE.search(_strip_py_comments(str(args.get("code", "")))))
     return False
 
 
