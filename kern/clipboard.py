@@ -150,3 +150,17 @@ def grab_image() -> tuple[dict | None, str]:
     if shutil.which("xclip"):
         return _xclip()
     return None, "no clipboard tool found (install wl-clipboard or xclip)"
+
+
+async def has_image_async() -> bool:
+    """Non-blocking has_image(): the probe spawns subprocesses (clipboard
+    daemons can stall for seconds); running it on the TUI event loop froze
+    the whole UI (audit r3 F1)."""
+    import asyncio
+    return await asyncio.to_thread(has_image)
+
+
+async def grab_image_async() -> tuple[dict | None, str]:
+    """Non-blocking grab_image() for the same reason."""
+    import asyncio
+    return await asyncio.to_thread(grab_image)

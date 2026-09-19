@@ -469,16 +469,18 @@ class PromptArea(TextArea):
         self.placeholder = "ask, plan, build…"
         self.compact = True
 
-    def on_key(self, event):
+    async def on_key(self, event):
         if event.key in ("ctrl+v", "ctrl+shift+v"):
             # Clipboard paste: if an image is on the clipboard, attach it to
-            # the prompt (grab is fast/local) — otherwise DON'T prevent the
-            # default so TextArea pastes text normally.
+            # the prompt — otherwise DON'T prevent the default so TextArea
+            # pastes text normally. The probe/grab spawn subprocesses
+            # (clipboard daemons can stall), so they run in a worker thread;
+            # doing them inline froze the whole TUI event loop (audit r3 F1).
             from . import clipboard as _clip
-            if _clip.has_image():
+            if await _clip.has_image_async():
                 event.prevent_default()
                 event.stop()
-                self.app.attach_clipboard_image()
+                await self.app.attach_clipboard_image()
             return
         if event.key == "escape" and getattr(self.app, "_clip_image", None):
             event.prevent_default()
@@ -1348,12 +1350,13 @@ class KernApp(App):
 
     # ---- turn lifecycle ------------------------------------------------------
 
-    def attach_clipboard_image(self):
+    async def attach_clipboard_image(self):
         """Ctrl+V handler: attach the clipboard image (if any) to the pending
         prompt. Returns True when an image was attached — plain-text clipboards
-        fall through to TextArea's native paste."""
+        fall through to TextArea's native paste. The grab runs in a worker
+        thread so a stalled clipboard daemon cannot freeze the UI."""
         from . import clipboard as _clip
-        img, reason = _clip.grab_image()
+        img, reason = await _clip.grab_image_async()
         if img is None:
             return False  # let textual paste text normally
         self._clip_image = img  # replace any previous attachment
