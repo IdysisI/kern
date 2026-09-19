@@ -108,6 +108,54 @@ def _looks_like_error(text) -> bool:
             or head.startswith("error:") or "http status=5" in head)
 
 
+# Salvage inlining budget (audit R1, sub_12 F2). The child's scratch files are real
+# work worth preserving, but inlining every byte of every file flooded the PARENT's
+# context when a subagent died (observed live: whole 100KB+ files dumped into
+# entry['result']). Full text always stays on disk; only the inline rendering is capped.
+_SALVAGE_PER_FILE = 20_000   # chars inlined per artifact
+_SALVAGE_TOTAL = 40_000      # chars inlined across all artifacts
+
+
+def _salvage_text(paths: list[str], per_file: int = _SALVAGE_PER_FILE,
+                  total: int = _SALVAGE_TOTAL) -> tuple[str, list[str]]:
+    """Render artifact paths into a BOUNDED salvage block. Every non-empty file is
+    still LISTED (path is the durable pointer); bodies are capped per-file and by a
+    total budget — once spent, remaining files degrade to path-only entries.
+    Returns (text, [artifact_paths that had content]). Module-level for unit tests."""
+    parts: list[str] = []
+    artifacts: list[str] = []
+    used = 0
+    exhausted = False
+    for a in paths:
+        try:
+            body = Path(a).read_text(errors="replace")
+        except Exception:
+            parts.append(f"### `{a}` (unreadable)\n")
+            continue
+        if not body.strip():
+            continue
+        artifacts.append(a)
+        cap = min(per_file, total - used) if not exhausted else 0
+        if cap <= 0:
+            exhausted = True
+            parts.append(f"### `{a}` (full text on disk — salvage budget spent)\n")
+            continue
+        if len(body) > cap:
+            parts.append(f"### `{a}` (truncated to {cap} chars — full text on disk)\n\n"
+                         f"{body[:cap]}\n…[truncated]\n")
+            used += cap
+        else:
+            parts.append(f"### `{a}`\n\n{body}\n")
+            used += len(body)
+        if used >= total:
+            exhausted = True
+    text = "\n".join(parts)
+    if artifacts and text.strip():
+        text = ("## Salvaged artifacts (recovered after the run did not produce a "
+                "clean final report)\n\n" + text)
+    return text, artifacts
+
+
 def _is_read_only(name: str, args: dict) -> bool:
     """True for ops with no side effects. Used to (a) exempt them from replay
     warnings and (b) let the circuit breaker treat a *diverse* read run as progress."""
@@ -838,9 +886,10 @@ class Engine:
         sem = _get_subagent_semaphore()
 
         async def _salvage_artifacts() -> tuple[str, list[str]]:
-            """Collect the child's durable work (scratch files, journal steps) so a
-            crash mid-report never reduces 15 minutes of work to an error string (F2).
-            Returns (salvaged_text, [artifact_paths])."""
+            """Collect the child's durable work (scratch files) so a crash mid-report
+            never reduces 15 minutes of work to an error string (F2). Rendering is
+            BOUNDED via _salvage_text (audit R1 sub_12 F2: unbounded inlining flooded
+            the parent context). Returns (salvaged_text, [artifact_paths])."""
             artifacts: list[str] = []
             try:
                 scratch = child_session.scratch
@@ -850,17 +899,7 @@ class Engine:
                             artifacts.append(str(p))
             except Exception:
                 pass
-            parts: list[str] = []
-            if artifacts:
-                parts.append("## Salvaged artifacts (recovered after the run did not "
-                             "produce a clean final report)\n")
-                for a in artifacts:
-                    try:
-                        body = Path(a).read_text(errors="replace")
-                        parts.append(f"### `{a}`\n\n{body}\n")
-                    except Exception:
-                        parts.append(f"### `{a}` (unreadable)\n")
-            return "\n".join(parts), artifacts
+            return _salvage_text(artifacts)
 
         async def run_subagent():
             hb = asyncio.create_task(_heartbeat())
@@ -916,13 +955,15 @@ class Engine:
                     # Verify the result is real before accepting it (P6). A 502 mid-
                     # generation must not become the deliverable — salvage instead (F2).
                     if _looks_like_error(reply):
+                        # F3 (audit R1 sub_12): keep the ORIGINAL error for the event /
+                        # entry; the salvage wrapper must not replace the diagnosis.
+                        entry["error"] = str(reply).strip()[:200]
                         salvaged, artifacts = await _salvage_artifacts()
                         if salvaged.strip():
                             reply = (f"⚠ subagent ended without a clean final report "
                                      f"(last output looked like an error). Salvaged work:\n\n"
                                      f"{salvaged}")
                             entry["salvaged"] = True
-                        entry["error"] = reply.strip()[:200]
                     entry["result"] = reply
                     report_file = self.session.scratch / f"{hid}_report.md"
                     self.session.scratch.mkdir(parents=True, exist_ok=True)
