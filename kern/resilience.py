@@ -181,3 +181,33 @@ class CostMeter:
     def summary(self) -> str:
         return (f"{self.model_calls} model calls "
                 f"(+{self.retries_billed} billed retries, {self.retries_free} free)")
+
+
+_URL_USERINFO_RE = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<user>[^/@\s:]+)(?::(?P<pw>[^@\s]*))?@")
+_CRED_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|authorization|x-api-key|password|passwd)"
+    r"(\s*[:=]\s*)([\"']?)(?P<val>[A-Za-z0-9_\-\.~+/=]{8,})(\3)")
+_ALREADY = ("[redacted-by-kern]", "***")
+
+
+def sanitize_error(text: str, limit: int = 600) -> str:
+    """Strip embedded credentials from transport error text before it reaches
+    the journal/TUI/model context.
+
+    httpx error strings include the full request URL; proxy base URLs sometimes
+    carry userinfo (https://user:token@host). Exec output is already redacted
+    (syscalls), but stream errors were not — a leaked proxy token would land in
+    events.jsonl and be re-injected into future prompts.
+    """
+    if not text:
+        return text
+    out = _URL_USERINFO_RE.sub(lambda m: f"{m.group('scheme')}***:***@", text)
+
+    def _kv(m):
+        val = m.group('val').strip('[](){}"\'')
+        if 'redacted' in val.lower() or val in ('***',):
+            return m.group(0)          # already a redaction marker: keep it
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}***{m.group(5)}"
+
+    out = _CRED_RE.sub(_kv, out)
+    return out[:limit]

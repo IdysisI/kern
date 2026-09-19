@@ -153,3 +153,17 @@ class TestCostMeter(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_sanitize_error_strips_url_userinfo_and_preserves_markers():
+    from kern.resilience import sanitize_error as S
+    out = S('stage=transport ConnectError: https://svc:sk-abc123def456@proxy.example.com/v1 fail')
+    assert 'sk-abc123def456' not in out and '***:***@proxy.example.com' in out
+    # existing redaction markers must survive (they are not secrets)
+    m = S('http status=401: authorization: Bearer [redacted-by-kern]')
+    assert '[redacted-by-kern]' in m
+    # genuine kv secrets are masked
+    k = S('real leak token=abcdefgh12345678 in body')
+    assert 'abcdefgh12345678' not in k and 'token=***' in k
+    # benign text untouched
+    assert S('plain error stays intact') == 'plain error stays intact'

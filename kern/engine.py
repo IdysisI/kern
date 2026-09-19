@@ -1260,7 +1260,8 @@ class Engine:
                 if chunk.kind=='text':
                     answer += chunk.text
                 elif chunk.kind=='error':
-                    raise RuntimeError(chunk.error)
+                    from .resilience import sanitize_error
+                    raise RuntimeError(sanitize_error(chunk.error))
                 elif chunk.kind=='usage':
                     self.usage_in += chunk.usage.get('prompt_tokens',chunk.usage.get('input_tokens',0))
                     self.usage_out += chunk.usage.get('completion_tokens',chunk.usage.get('output_tokens',0))
@@ -1334,6 +1335,9 @@ class Engine:
                         self.usage_out += ev.usage.get("completion_tokens", ev.usage.get("output_tokens", 0))
                     elif ev.kind == "error":
                         error = ev.error
+                        if error:
+                            from .resilience import sanitize_error
+                            error = sanitize_error(error)
                         # never silent: a stream error in a MIXED turn (text and/or
                         # valid calls present) must still be journaled and shown.
                         self.stream_cb("note", f"⚠ {error}")
