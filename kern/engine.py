@@ -864,7 +864,7 @@ class Engine:
                     child_state["last"] = time.monotonic()
                     continue
                 idle_for = time.monotonic() - child_state["last"]
-                reqs = getattr(child_engine, "requests", 0)
+                reqs = child_engine.live_requests() if child_engine else 0
                 prev_reqs = child_state.get("reqs", -1)
                 if reqs != prev_reqs:
                     # made progress (an API call) even if it streamed nothing
@@ -1073,7 +1073,7 @@ class Engine:
             if entry["completed"]:
                 if entry["error"]:
                     return f"subagent {handle}: failed with error: {entry['error']}", {}
-                reqs = entry["engine"].requests if entry["engine"] else "?"
+                reqs = entry["engine"].live_requests() if entry["engine"] else "?"
                 dt = round(time.time() - entry["started"], 1)
                 return f"subagent {handle}: completed in {dt}s ({reqs} requests). Report: {entry['report_path']}", {}
             elif not entry.get("acquired"):
@@ -1084,7 +1084,7 @@ class Engine:
                         f"stalled, and queue time does not count toward its stall budget.", {})
             else:
                 dt = round(time.time() - entry["started"], 1)
-                reqs = entry["engine"].requests if entry["engine"] else "?"
+                reqs = entry["engine"].live_requests() if entry["engine"] else "?"
                 return f"subagent {handle}: still running ({dt}s elapsed, {reqs} requests so far)", {}
 
         elif action == "logs":
@@ -1205,6 +1205,14 @@ class Engine:
                     self.session.emit("turn_end", reason=reason)
                 except Exception:
                     pass   # a dead journal must not mask the real error
+
+    def live_requests(self) -> int:
+        """Paid model calls this engine made SO FAR (live, mid-turn).
+
+        self.requests is only synced in chat()'s finally-block, so status/stall
+        paths reading it mid-turn saw a stale 0 ("0 requests" lie, audit C F6).
+        """
+        return max(0, getattr(self.client, "requests", 0) - getattr(self, "_req0", 0))
 
     def _build_facts(self, events):
         from .context import evidence_block

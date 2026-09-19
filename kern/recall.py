@@ -102,6 +102,7 @@ class LedgerEntry:
     n: int                      # event number (provenance)
     kind: str                   # event kind
     decisions: list[str] = field(default_factory=list)
+    claims: list[str] = field(default_factory=list)   # assistant/tool-origin markers (episode-only)
     artifacts: list[str] = field(default_factory=list)
     open_threads: list[str] = field(default_factory=list)
     errors: int = 0
@@ -110,6 +111,7 @@ class LedgerEntry:
 
     def to_dict(self) -> dict:
         return {"n": self.n, "kind": self.kind, "decisions": self.decisions,
+                "claims": self.claims,
                 "artifacts": self.artifacts, "open_threads": self.open_threads,
                 "errors": self.errors, "requests": self.requests, "text": self.text}
 
@@ -129,13 +131,19 @@ def extract_ledger(events, cap_text: int = 600) -> list[LedgerEntry]:
         # decisions: sentences with a decision marker. USER constraints/preferences
         # (esp. those carrying numbers/limits) are decisions too — they are exactly
         # the facts a lossy summary drops (M1).
+        # ORIGIN GATE (audit F4): decision markers found in ASSISTANT or TOOL_RESULT
+        # text are model CLAIMS, not established facts. They stay in `claims`
+        # (episode navigation aid only) and are never promoted to durable memory;
+        # otherwise a wrong "I fixed X" statement becomes a pinned atom that
+        # poisons every future session.
+        promoted = kind in ("user", "objective", "note")
         for sent in re.split(r"(?<=[.!?])\s+|\n", text):
             s = sent.strip()
             if not (8 < len(s) <= 400):
                 continue
             has_number = bool(re.search(r"\d", s))
             if _DECISION_RE.search(sent) or (kind in ("user", "objective") and has_number):
-                ent.decisions.append(s[:400])
+                (ent.decisions if promoted else ent.claims).append(s[:400])
         # artifacts (file paths)
         for m in _ARTIFACT_RE.finditer(text):
             path = m.group(1) or m.group(2)
@@ -149,7 +157,7 @@ def extract_ledger(events, cap_text: int = 600) -> list[LedgerEntry]:
             ent.errors = 1
         ent.text = text[:cap_text]
         # keep only entries that carry signal
-        if ent.decisions or ent.artifacts or ent.open_threads or ent.errors:
+        if ent.decisions or ent.claims or ent.artifacts or ent.open_threads or ent.errors:
             entries.append(ent)
     return entries
 

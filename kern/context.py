@@ -401,7 +401,11 @@ class ContextManager:
                 text = (r.get('text') or '').strip()
                 if not text:
                     continue
-                out.append({'id': r.get('id', ''), 'text': text, 'pinned': True,
+                # pinned is an EXPLICIT user/agent flag (memory.py schema doc);
+                # hardcoding True floated every recalled atom above working
+                # memory and contradicted the ranking contract (audit F4).
+                out.append({'id': r.get('id', ''), 'text': text,
+                            'pinned': bool(r.get('pinned')),
                             'ts': float(r.get('ts') or r.get('created') or 0.0),
                             'source': r.get('source') or f"note:{r.get('id','')}"})
             return out
@@ -650,9 +654,14 @@ class ContextManager:
             led = extract_ledger(list(span))
             for ent in led:
                 structured['decisions'].extend(ent.decisions)
+                structured.setdefault('claims', []).extend(ent.claims)
                 structured['artifacts'].extend(ent.artifacts)
                 structured['open_threads'].extend(ent.open_threads)
             structured['decisions'] = list(dict.fromkeys(structured['decisions']))[:40]
+            # claims = assistant/tool-origin decision markers: navigation aid for
+            # episode recall ONLY. _consolidate_fold_atoms must never promote them
+            # to durable memory (audit F4: model claims poisoning pinned atoms).
+            structured['claims'] = list(dict.fromkeys(structured.get('claims', [])))[:40]
             structured['artifacts'] = list(dict.fromkeys(structured['artifacts']))[:40]
             structured['open_threads'] = list(dict.fromkeys(structured['open_threads']))[:40]
             errs = {}
