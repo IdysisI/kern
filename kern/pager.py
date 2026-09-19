@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 
 HEAD = 1500
 TAIL = 1500
@@ -261,6 +262,7 @@ def materialize(events: list[dict], session) -> list[dict]:
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
                              "text": f"[old tool result cleared: {ev.get('name', '?')} — "
                                      f"{len(text):,} bytes -> {path}. "
+                                     f"Head: {re.sub(r'\s+', ' ', text[:140]).strip()!r}. "
                                      f"Use read(path) if you need it again.]"})
                 # Deliberately NOT registered: the body is gone from this view,
                 # so it is not a valid dedup target.
