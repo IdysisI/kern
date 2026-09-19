@@ -514,6 +514,7 @@ class Engine:
             bool(os.environ.get("KERN_FORCE_PY")),
             getattr(self, "depth", 0),
             getattr(self.mounts, "version", 0),
+            bool(getattr(self, "_repeat_seen", False)),
         )
         cached = getattr(self, "_tools_cache", None)
         if cached is not None and cached[0] == cache_key and not include_fenced:
@@ -523,12 +524,17 @@ class Engine:
         # A repeated effect needs an explicit rationale; reads remain freely
         # repeatable. The field belongs to the harness, not the remote tool.
         tools = json.loads(json.dumps(tools))
-        for tool in tools:
-            fn = tool['function']
-            if fn['name'] in ('write', 'edit', 'exec', 'py') or '__' in fn['name']:
-                fn['parameters'].setdefault('properties', {})['_kern_repeat_reason'] = {
-                    'type':'string',
-                    'description':'Only for an intentional repeat: explain new evidence or changed state justifying repeating an already successful/uncertain effect.'}
+        # The repeat-rationale field costs ~180 tokens/turn on every mutating
+        # tool (audit r3-smallmodel #5). Inject it only after a repeat was
+        # actually blocked once; the block message itself teaches the field,
+        # so the escape hatch is never missing when needed.
+        if getattr(self, "_repeat_seen", False):
+            for tool in tools:
+                fn = tool['function']
+                if fn['name'] in ('write', 'edit', 'exec', 'py') or '__' in fn['name']:
+                    fn['parameters'].setdefault('properties', {})['_kern_repeat_reason'] = {
+                        'type':'string',
+                        'description':'Only for an intentional repeat: explain new evidence or changed state justifying repeating an already successful/uncertain effect.'}
         # py REPL is CAPABILITY-GATED: the probe measures whether this model
         # actually uses it correctly; models that never proved it do not even
         # see the schema. KERN_FORCE_PY overrides.
@@ -722,6 +728,7 @@ class Engine:
             if row['name'] != name or canonical(row['arguments']) != args:
                 continue
             if row['status'] == 'uncertain' or (row['event'] >= self._turn_start_n and row['status'] in ('succeeded','running')):
+                self._repeat_seen = True   # schema now includes the rationale field
                 return (f"error: repeated effect blocked before execution. {row['id']} at event {row['event']} "
                         f"is {row['status']}. Inspect the existing result/current state with read, proc or memory history. "
                         "If repetition is intentional, set _kern_repeat_reason to the concrete reason/new evidence.")

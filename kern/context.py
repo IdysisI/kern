@@ -170,7 +170,16 @@ def evidence_block(events, session):
     for r in unresolved[-12:] + recent:
         args = r['arguments']
         target = args.get('path') or args.get('cmd') or args.get('url') or args.get('task') or ''
-        lines.append(f"{r['id']} {r['name']} {_scrub_compact_text(str(target))[:220]} -> {r['status']} (event {r.get('result_event',r['event'])}) {_scrub_compact_text(r.get('result',''))[:180]}")
+        res = _scrub_compact_text(r.get('result', ''))
+        if r['status'] in ('uncertain', 'failed'):
+            # failures need the full picture: what was attempted and what came back
+            lines.append(f"{r['id']} {r['name']} {_scrub_compact_text(str(target))[:220]} -> {r['status']} (event {r.get('result_event',r['event'])}) {res[:180]}")
+        else:
+            # succeeded rows: the target echo restated the command the model wrote
+            # and the tool result already confirmed in-turn (audit r3-smallmodel
+            # F8, ~220 chars/row of noise). Keep id, tool, status, event and a
+            # short result snippet (exit codes / test tallies live there).
+            lines.append(f"{r['id']} {r['name']} -> {r['status']} (event {r.get('result_event',r['event'])}) {res[:120]}")
     lines.append('Older operations: memory(action="history", pattern="..."). Never repeat uncertain effects without checking actual state.')
     return '\n'.join(lines) + '\n</execution-evidence>'
 
