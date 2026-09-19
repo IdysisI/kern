@@ -711,7 +711,7 @@ class Engine:
             "scrape": lambda: syscalls.tool_scrape(**args),
             "memory": lambda: syscalls.tool_memory(self.session, self.cwd, **args),
             "map": lambda: syscalls.tool_map(self.cwd, **args),
-            "py": lambda: syscalls.tool_py(self.session, **args, _cancel=cancel),
+            "py": lambda: syscalls.tool_py(self.session, **args, _cancel=cancel, _fs=self.fs),
             "todo": lambda: syscalls.tool_todo(**args),
             "note": lambda: syscalls.tool_note(self._current_notes(), **args),
         }
@@ -1521,7 +1521,14 @@ class Engine:
                             # short, structural pointer + meta marker so the
                             # pager/UI can decide how to render. The full
                             # cached result is still journaled for replay.
-                            tgt = str(_inspection_target(name, args))[:60]
+                            # `tgt` here feeds MODEL-VISIBLE prose, so it must read as a
+                            # real target, not the internal loop-detection identity
+                            # ("read:<path>@<off>-<lim>") which renders as
+                            # "read read:/tmp/x@100-50". Use the plain path/url for
+                            # display; the identity is still what keys the cache.
+                            disp = ((args or {}).get("path") or (args or {}).get("url")
+                                    or str(_inspection_target(name, args)))
+                            tgt = str(disp)[:60]
                             text, meta = constraints.mark_dedup(
                                 self.session, name, tgt, text, meta
                             )
@@ -1644,8 +1651,15 @@ class Engine:
                         hdr = re.search(r"\((\d+) lines,", str(text))
                         if hdr and int(hdr.group(1)) > 200:
                             self._read_limit_hinted.add(tgt)
+                            # NOTE: `tgt` is an internal loop-detection identity
+                            # ("read:<path>@<off>-<lim>") — it is NOT a filesystem
+                            # path. auto_paginate renders it into an executable
+                            # read(path=...) hint, so it must get the REAL path.
+                            # (Regression introduced when read targets became
+                            # slice-aware; it produced path='read:/tmp/big.py'.)
+                            real_path = (args or {}).get("path") or tgt
                             text, _ameta = constraints.auto_paginate(
-                                self.session, tgt, int(hdr.group(1)), text, args
+                                self.session, real_path, int(hdr.group(1)), text, args
                             )
                             meta = {**(meta or {}), **_ameta}
 

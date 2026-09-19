@@ -612,7 +612,15 @@ async def test_identical_readonly_call_is_deduped(tmp_path, monkeypatch):
     assert len(reads) == 3
     assert reads[0].get('status') != 'cached'
     assert reads[1].get('status') == 'cached', "2nd identical read must be served from cache"
-    assert 'cached result' in reads[1]['text']
+    assert reads[1].get('constraint') == 'dedup'
+    # Structural contract (post a83750f): no English hint prose, but the stub must be
+    # self-contained — audit R1 sub_13 F1: it used to say "full result above", which
+    # dangles once the pager clears the original to an artifact. It now inlines a
+    # bounded excerpt, and must name a REAL path (not the internal "read:<path>@…"
+    # loop-detection identity, which is not a file).
+    assert 'cached from earlier this turn' in reads[1]['text']
+    assert 'read:' not in reads[1]['text'], "internal target identity must not leak"
+    assert 'original content' in reads[1]['text'], "dedup stub must carry a usable excerpt"
     assert 'new content' in reads[2]['text'], "read after write must see the new content"
 
 
@@ -664,8 +672,8 @@ async def test_py_file_read_triggers_nudge(tmp_path):
 
 @pytest.mark.asyncio
 async def test_unlimited_read_of_large_file_nudges_once(tmp_path):
-    """An unlimited read() of a >200-line file must append a one-time nudge toward
-    offset/limit reads; a limited read must not."""
+    """An unlimited read() of a >200-line file must trigger auto_paginate exactly ONCE
+    (per file); an explicit-slice read must not, and the hint must be executable."""
     big = tmp_path / 'big.py'
     big.write_text('\n'.join(f'# line {i}' for i in range(400)))
     calls = iter([
@@ -688,8 +696,19 @@ async def test_unlimited_read_of_large_file_nudges_once(tmp_path):
     e = Engine(ReadModel(), 'test', s, str(tmp_path))
     await e.chat('inspect big file', max_steps=8)
     results = [ev for ev in s.events if ev['kind'] == 'tool_result']
-    nudged = [ev for ev in results if 'pass offset/limit' in ev.get('text', '')]
-    assert len(nudged) == 1, f'expected exactly one limit nudge, got {len(nudged)}'
+    # Structural contract (post a83750f): the old "pass offset/limit" prose hint is
+    # gone; an unlimited read of a big file now triggers auto_paginate ONCE per file
+    # (tracked by _read_limit_hinted). The hint must be an executable read(path=...)
+    # pointing at a REAL path — audit R1 caught the internal "read:<path>@…" identity
+    # leaking here and producing an unexecutable read(path='read:/tmp/big.py').
+    paged = [ev for ev in results if ev.get('constraint') == 'auto_paginate']
+    assert len(paged) == 1, f'expected exactly one auto_paginate hint, got {len(paged)}'
+    assert 'read:' not in paged[0]['text'], "internal target identity must not leak into hints"
+    assert f'read(path=\'{str(big)}\'' in paged[0]['text'], \
+        f"pagination hint must suggest the real, executable path: {paged[0]['text'][-160:]!r}"
+    # and the explicit-slice reads (calls 2 and 3) must NOT re-trigger it
+    explicit = [ev for ev in results if ev.get('constraint') == 'auto_paginate']
+    assert len(explicit) == 1
 
 
 def test_tui_flush_records_last_flushed_and_turn_end_fallback():

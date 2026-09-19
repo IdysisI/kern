@@ -60,6 +60,44 @@ def test_unpaged_read_defaults_are_stable():
             == _inspection_target("read", {"path": "x.py"}))
 
 
+@pytest.mark.asyncio
+async def test_target_identity_is_not_rendered_as_a_path(tmp_path, monkeypatch):
+    """Regression for the slice-aware target fix: `tgt` is an INTERNAL loop-detection
+    identity ("read:<path>@<off>-<lim>"), not a filesystem path. It used to be passed
+    straight into auto_paginate, which renders it into an executable hint — so the
+    model was told to call read(path='read:/tmp/big.py'), a path that does not exist.
+
+    Any model-visible suggestion must contain the REAL path only."""
+    monkeypatch.setenv("KERN_INSPECTION_BREAK", "20")
+    big = tmp_path / "big.py"
+    big.write_text("\n".join(f"# line {i}" for i in range(400)))
+
+    class PagingModel:
+        n = 0
+
+        async def probe(self, model):
+            pass
+
+        async def stream_chat(self, model, messages, **kwargs):
+            PagingModel.n += 1
+            if PagingModel.n == 1:
+                yield StreamEvent("tool_call", tool_call={
+                    "id": "c1", "name": "read", "arguments": {"path": str(big)}})
+            else:
+                yield StreamEvent("text", text="done")
+
+    s = create_session(str(tmp_path))
+    e = Engine(PagingModel(), "test", s, str(tmp_path))
+    await e.chat("inspect big file", max_steps=3)
+    results = [x for x in s.events if x['kind'] == 'tool_result']
+    joined = " ".join(r.get("text", "") for r in results)
+    assert "read:" not in joined, \
+        "internal target identity must never leak into model-visible text"
+    if "auto_paginate" in joined:
+        assert f"read(path='{big}'" in joined, \
+            "pagination hint must suggest the real, executable path"
+
+
 # --------------------------------------------------- bug 1 end-to-end: no false trip
 
 class PagingModel:

@@ -964,15 +964,41 @@ def tool_map(cwd: str, action: str = "map", path: str = "", name: str = "") -> t
         return f"error: {type(e).__name__}: {e}", {}
 
 
-def tool_py(session, code: str, timeout: int = 60, *, _cancel=None) -> tuple[str, dict]:
+def tool_py(session, code: str, timeout: int = 60, *, _cancel=None, _fs=None) -> tuple[str, dict]:
+    """Run code in the persistent Python interpreter.
+
+    `_fs` carries the SESSION's cwd. Without it the worker ran in whatever
+    directory the Kern daemon happened to be launched from — so relative paths in
+    py() silently resolved against the wrong tree, and an isolate=true subagent
+    (git worktree) kept running py() in the PARENT cwd, defeating the isolation
+    that exec/read/write all honor. The worker is long-lived, so a cwd change
+    respawns it (cheap, and correctness beats interpreter warmth).
+    """
+    want_cwd = None
+    if _fs is not None:
+        try:
+            want_cwd = str(Path(getattr(_fs, 'cwd')).resolve())
+        except Exception:
+            want_cwd = None
     proc = getattr(session, '_py_proc', None)
+    have_cwd = getattr(session, '_py_cwd', None)
+    if proc is not None and proc.poll() is None and want_cwd is not None and have_cwd != want_cwd:
+        # cwd drifted (e.g. a subagent switched to its worktree) -> restart cleanly
+        _stop_process(proc)
+        _PY_PROCS.discard(proc)
+        session._py_proc = None
+        proc = None
     if proc is None or proc.poll() is not None:
         kwargs = {"start_new_session": True} if os.name != "nt" else {
             "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+        if want_cwd:
+            kwargs["cwd"] = want_cwd
+            Path(want_cwd).mkdir(parents=True, exist_ok=True)
         proc = subprocess.Popen([sys.executable, '-u', '-m', 'kern.repl_worker'],
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL, text=True, encoding='utf-8', **kwargs)
         session._py_proc = proc
+        session._py_cwd = want_cwd
         _PY_PROCS.add(proc)
     proc.stdin.write(json.dumps({'code': code}) + '\n')
     proc.stdin.flush()

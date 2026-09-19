@@ -20,6 +20,11 @@ import os
 import re
 from typing import Any
 
+# Bounded excerpt inlined into dedup stubs (audit R1, sub_13 F1). Keeps the stub
+# self-contained without re-inflating the context we just saved: a duplicate
+# read rarely needs more than its head to re-orient.
+_DEDUP_EXCERPT = 2000
+
 
 # ---------------------------------------------------------------------------
 # Debug logging — on by default, off when KERN_QUIET=1 or --quiet is set.
@@ -70,14 +75,25 @@ def _log(session: Any, site: str, **fields: Any) -> None:
 
 
 def mark_dedup(session: Any, tool: str, target: str, text: str, meta: dict) -> tuple[str, dict]:
-    """In-turn read-only duplicate. Cache hit. Mark it and shorten."""
+    """In-turn read-only duplicate. Cache hit. Mark it and shorten.
+
+    Audit R1 (sub_13 F1): the stub used to say "full result above" and drop the
+    cached body entirely. But the pager can CLEAR the original result to an
+    artifact mid-turn — then the stub points at nothing (dangling pointer; the
+    same class as the 2026-09-18 read-tool incident). We already HOLD the full
+    text here, so inline a bounded excerpt: the stub is now self-contained no
+    matter what the pager did to the original."""
     meta = dict(meta or {})
     meta["constraint"] = "dedup"
     meta["dedup_tool"] = tool
     meta["dedup_target"] = target
     # Strip prior hint pollution if any.
-    cleaned = re.sub(r"\n*\[harness hint:[^\]]+\]\s*$", "", str(text))
-    new_text = f"(cached from earlier this turn — {tool} {target}; full result above)"
+    cleaned = re.sub(r"\n*\[harness hint:[^\]]+\]\s*$", "", str(text)).strip()
+    excerpt = cleaned[:_DEDUP_EXCERPT]
+    truncated = " …[truncated]" if len(cleaned) > _DEDUP_EXCERPT else ""
+    new_text = (f"(cached from earlier this turn — {tool} {target}; "
+                f"excerpt follows so this stays usable even if the original was paged out)\n"
+                f"{excerpt}{truncated}")
     _log(session, "dedup.hit", tool=tool, target=target[:80])
     return new_text, meta
 
