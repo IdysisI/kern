@@ -1156,10 +1156,26 @@ class Engine:
             return f"--- subagent {handle} activity (last {min(n, len(lines))} steps) ---\n{body}", {}
 
         elif action == "wait":
+            def _report_reply(result: str, path: str = "") -> str:
+                # Cap the inline report: a 100KB final report inlined into the
+                # parent context floods it (audit r3-smallmodel #7). The head
+                # carries the summary; the tail the conclusions; the full text
+                # stays on disk behind a read()-able pointer.
+                CAP = 20000
+                if len(result) <= CAP:
+                    body = result
+                else:
+                    body = (result[:CAP // 2]
+                            + f"\n\n[report truncated: {len(result):,} chars total; "
+                            + f"{len(result) - CAP:,} middle chars elided]\n\n"
+                            + result[-CAP // 2:])
+                return (f"subagent {handle} completed report:\n{body}"
+                        + (f"\n(Full report: {path})" if path else ""))
+
             if entry["completed"]:
                 if entry["error"]:
                     return f"subagent {handle}: failed with error: {entry['error']}", {}
-                return f"subagent {handle} completed report:\n{entry['result']}\n(Full report: {entry['report_path']})", {}
+                return _report_reply(entry["result"], entry.get("report_path", "")), {}
             task_obj = entry.get("async_task")
             if not task_obj:
                 # If restored from journal after a daemon restart: check if child session has turn_end
@@ -1167,11 +1183,11 @@ class Engine:
                 if sess and not sess.turn_is_open():
                     report_file = self.session.scratch / f"{handle}_report.md"
                     content = report_file.read_text(errors="replace") if report_file.is_file() else "(report on disk)"
-                    return f"subagent {handle} completed report:\n{content}", {}
+                    return _report_reply(content, str(report_file)), {}
                 return f"subagent {handle}: not running as in-memory background task", {}
             try:
                 reply = await asyncio.wait_for(asyncio.shield(task_obj), timeout=float(timeout or 120))
-                return f"subagent {handle} completed report:\n{entry['result']}\n(Full report: {entry['report_path']})", {}
+                return _report_reply(entry["result"], entry.get("report_path", "")), {}
             except asyncio.TimeoutError:
                 dt = round(time.time() - entry["started"], 1)
                 return f"subagent {handle}: still running after {timeout}s wait ({dt}s total). Continue working or wait again.", {}
