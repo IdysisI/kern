@@ -75,7 +75,15 @@ def _slate(events: list[dict], session=None) -> str:
 
     lines = ["<work-state>"]
     if objective:
-        lines.append(f"objective: {objective}")
+        # The verbatim objective also lives in the dialogue as the user turn;
+        # re-emitting it uncapped cost ~300 tokens/turn of pure duplication
+        # (audit r3 F1, measured 1,269 chars). Cap + pointer keeps navigation
+        # value if the original turn was compacted out of the visible window.
+        if len(objective) > 400:
+            lines.append(f"objective: {objective[:400].rstrip()}… "
+                         f"(full text: latest user turn / journal)")
+        else:
+            lines.append(f"objective: {objective}")
     if todo:
         lines.append("todo:")
         for i, item in enumerate(todo, 1):

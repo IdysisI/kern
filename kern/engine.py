@@ -166,7 +166,7 @@ def _is_read_only(name: str, args: dict) -> bool:
     if name == "subagent":
         return args.get("action") in _READ_ONLY_SUBAGENT_ACTIONS
     if name == "exec":
-        return not _MUTATING_CMD_RE.search(str(args.get("cmd", "")))
+        return not _MUTATING_CMD_RE.search(_exec_surface(args.get("cmd", "")))
     if name == "py":
         return not _PY_MUTATING_RE.search(str(args.get("code", "")))
     return False
@@ -175,6 +175,16 @@ def _is_read_only(name: str, args: dict) -> bool:
 # File-path-ish literals a model might open() / read / cat inside a py/exec payload.
 _PY_PATH_RE = re.compile(r"""(?:open|read_text|read_bytes|Path|cat|head|tail|less)\s*\(?\s*['"]([^'"]+)['"]""")
 _SH_TARGET_RE = re.compile(r"""(?:^|[\s|>&])(?:cat|head|tail|less|grep|rg|sed|awk|file|stat|wc|ls|diff)\s+(?:-\S+\s+)*['"]?([^\s'";|&>]+)""")
+
+# Quoted strings and shell comments: mutating tokens inside them are data, not
+# commands (grep 'open(' x.py, echo "rm -rf", # mv note). Matching the raw line
+# over-fired the progress sensor on pure reads, which both reset the inspection
+# breaker and defeated the error-loop sensor (audit r3 F2/F3).
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"|#[^\n]*")
+
+
+def _exec_surface(cmd: str) -> str:
+    return _QUOTED_RE.sub(" ", str(cmd))
 
 
 def _inspection_target(name: str, args: dict) -> str:
@@ -236,7 +246,7 @@ def _step_is_progress(name: str, args: dict) -> bool:
     if "__" in name:
         return True   # mounted MCP tools may have effects; never stall-break on them
     if name == "exec":
-        return bool(_MUTATING_CMD_RE.search(str(args.get("cmd", ""))))
+        return bool(_MUTATING_CMD_RE.search(_exec_surface(args.get("cmd", ""))))
     if name == "py":
         return bool(_PY_MUTATING_RE.search(str(args.get("code", ""))))
     return False

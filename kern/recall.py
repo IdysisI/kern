@@ -131,12 +131,14 @@ def extract_ledger(events, cap_text: int = 600) -> list[LedgerEntry]:
         # decisions: sentences with a decision marker. USER constraints/preferences
         # (esp. those carrying numbers/limits) are decisions too — they are exactly
         # the facts a lossy summary drops (M1).
-        # ORIGIN GATE (audit F4): decision markers found in ASSISTANT or TOOL_RESULT
-        # text are model CLAIMS, not established facts. They stay in `claims`
-        # (episode navigation aid only) and are never promoted to durable memory;
+        # ORIGIN GATE (audit F4): decision markers found in ASSISTANT text are
+        # model CLAIMS, not established facts. They stay in `claims` (episode
+        # navigation aid only) and are never promoted to durable memory;
         # otherwise a wrong "I fixed X" statement becomes a pinned atom that
-        # poisons every future session.
-        promoted = kind in ("user", "objective", "note")
+        # poisons every future session. TOOL_RESULT text is a receipt (the
+        # harness's record of what actually ran) and user/objective/note are
+        # user-origin truth — both stay promotion-eligible.
+        promoted = kind in ("user", "objective", "note", "tool_result")
         for sent in re.split(r"(?<=[.!?])\s+|\n", text):
             s = sent.strip()
             if not (8 < len(s) <= 400):

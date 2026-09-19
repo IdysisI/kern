@@ -33,13 +33,22 @@ def _ev(n, kind, text):
 def test_assistant_decision_markers_are_claims_not_decisions():
     span = [
         _ev(1, 'assistant', 'I decided to rewrite the parser and I fixed the tokenizer.'),
-        _ev(2, 'tool_result', 'The deploy succeeded; I chose the blue-green strategy.'),
     ]
     led = extract_ledger(span)
     dec = [d for e in led for d in e.decisions]
     clm = [c for e in led for c in e.claims]
-    assert dec == [], f'assistant/tool-origin text promoted to decisions: {dec}'
+    assert dec == [], f'assistant-origin text promoted to decisions: {dec}'
     assert clm, 'assistant claims lost entirely (should stay as navigation aid)'
+
+
+def test_tool_result_receipts_remain_decisions():
+    """Tool receipts are the harness's record of what ran — promotion-eligible
+    (regression: test_recall_injection relies on receipt facts being recalled)."""
+    span = [_ev(1, 'tool_result',
+                'decided to write the artifact to build/kern-9.9.9.py and it succeeded')]
+    led = extract_ledger(span)
+    dec = [d for e in led for d in e.decisions]
+    assert any('kern-9.9.9.py' in d for d in dec), f'receipt fact lost: {dec}'
 
 
 def test_user_constraints_remain_decisions():
