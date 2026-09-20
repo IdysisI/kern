@@ -256,7 +256,11 @@ class FileSlate:
             return None
 
     def _evict_if_needed(self) -> None:
-        total = sum(len(l) * 60 for e in self._entries.values() for l in e.lines)
+        # Accurate char accounting: sum the real length of held lines.
+        # (Previously len(lines)*60 wildly OVER-estimated long-line files —
+        # minified JS / JSON — causing premature eviction of useful held
+        # state. audit 2026-09-20 R7)
+        total = sum(len(l) for e in self._entries.values() for l in e.lines.values())
         if total <= _MAX_HELD_CHARS:
             return
         # LRU eviction until under budget
@@ -264,7 +268,7 @@ class FileSlate:
         for p, e in ordered:
             if total <= _MAX_HELD_CHARS:
                 break
-            total -= len(e.lines) * 60
+            total -= sum(len(l) for l in e.lines.values())
             del self._entries[p]
 
 

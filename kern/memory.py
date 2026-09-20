@@ -167,8 +167,14 @@ class MemoryTree:
                 '\n'.join(x[:1200] for x in lines))
 
     def _norm_text(self, text: str) -> str:
-        """Normalize a note body for dedupe: lowercase, collapse whitespace."""
-        return ' '.join(text.casefold().split())
+        """Normalize a note body for dedupe: lowercase, collapse whitespace,
+        and strip punctuation so near-identical notes (trailing period,
+        semicolon vs colon, stray commas) map to one canonical form —
+        otherwise contradictory/duplicate notes silently accumulate
+        (audit 2026-09-20 R6)."""
+        import re
+        t = re.sub(r'[^\w\s]', '', text.casefold(), flags=re.UNICODE)
+        return ' '.join(t.split())
 
     def _source_rank(self, source: str) -> int:
         """Higher = more authoritative. Verified receipts outrank model claims."""
@@ -239,10 +245,34 @@ class MemoryTree:
                        (nid, topic, key or None, redact(text.strip()), source, time.time(), json.dumps(old)))
         return f'remembered note:{nid} [source:{source}]' + (f'; superseded {len(old)} explicitly keyed notes' if old else '')
 
-    def forget(self, pattern):
+    def forget(self, pattern, dry_run=False):
+        """Tombstone notes matching `pattern` (case-insensitive substring).
+
+        dry_run=True: only REPORT what would be tombstoned (note count, text
+        previews, legacy lines) without changing anything — lets a model
+        verify a broad substring won't over-delete before committing (audit R7).
+        """
         if not pattern.strip():
             raise ValueError('nonempty forget pattern required')
         rows = [r for r in self._rows() if pattern.casefold() in r['text'].casefold()]
+        if dry_run:
+            legacy_hits = 0
+            for path in self.root.rglob('*.md'):
+                try:
+                    if not path.resolve().is_relative_to(self.root.resolve()):
+                        continue
+                    legacy_hits += sum(
+                        1 for line in path.read_text(encoding='utf-8').splitlines()
+                        if pattern.casefold() in line.casefold() and '<!-- deleted' not in line)
+                except OSError:
+                    continue
+            if not rows and not legacy_hits:
+                return f"would tombstone 0 notes / 0 legacy lines matching '{pattern}'"
+            preview = '\n'.join(f"  - note:{r['id']} {r['text'][:120]}" for r in rows[:10])
+            more = f"  … and {len(rows) - 10} more\n" if len(rows) > 10 else ''
+            return (f"would tombstone {len(rows)} note(s) and {legacy_hits} legacy line(s) "
+                    f"matching '{pattern}':\n{preview}\n{more}"
+                    f"Run again with dry_run=False to apply.")
         with self.connect() as db:
             db.executemany("UPDATE notes SET status='deleted' WHERE id=?", [(r['id'],) for r in rows])
         legacy_count = 0

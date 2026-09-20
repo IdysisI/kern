@@ -98,14 +98,15 @@ SCHEMAS = [
             "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "memory",
-        "description": "Query/annotate this project's persistent memory. QUERY-ONLY design: nothing is ever auto-injected — call it ONLY when the current task plausibly benefits from a past session on this same project. Actions: outline (index), search(pattern), read(path), remember(text, topic) for durable facts, write(path, content) for project.md/atoms/scenarios, forget(pattern) to tombstone stale facts.",
+        "description": "Query/annotate this project's persistent memory. Query it ONLY when the current task plausibly benefits from a past session on this same project (a small auto-surfaced recall block is already injected per turn; this tool is for deeper lookups). Actions: outline (index), search(pattern), read(path=note:<id>), remember(text, topic, key) for durable facts, write(path, content) for project.md/atoms/scenarios, forget(pattern) to tombstone stale facts (use dry_run=true first to preview matches), reconcile(topic) to get active ground truth (drops superseded/deleted), history(pattern) for exact prior events.",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["outline", "search", "read", "remember", "write", "forget", "reconcile", "history"],
                        "description": "reconcile: return active ground truth for a topic without superseded or deleted facts"},
             "pattern": {"type": "string"},
             "path": {"type": "string", "description": "read a SQLite note using note:<id> returned by search/outline; these are not files. Legacy Markdown: project.md, atoms/topic.md, scenarios/<name>.md"},
             "text": {"type": "string"},
-            "topic": {"type": "string", "description": "topic slug for remember()"}, "key": {"type":"string", "description":"Explicit key to supersede an older note; omit to retain both"}},
+            "topic": {"type": "string", "description": "topic slug for remember()"}, "key": {"type":"string", "description":"Explicit key to supersede an older note; omit to retain both"},
+            "dry_run": {"type": "boolean", "description": "for forget: only preview what would be tombstoned (count + text), change nothing. Use before a broad pattern to avoid over-deleting."}},
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "map",
@@ -978,7 +979,8 @@ def tool_scrape(url: str, max_chars: int = 12000) -> tuple[str, dict]:
 
 
 def tool_memory(session, cwd: str, action: str, pattern: str = "",
-                path: str = "", text: str = "", topic: str = "general", key: str = "") -> tuple[str, dict]:
+                path: str = "", text: str = "", topic: str = "general", key: str = "",
+                dry_run: bool = False) -> tuple[str, dict]:
     """Project-scoped, query-only memory (kern.memory.MemoryTree)."""
     if action == 'history':
         from .context import history
@@ -1013,7 +1015,7 @@ def tool_memory(session, cwd: str, action: str, pattern: str = "",
         if action == "forget":
             if not pattern:
                 return "error: forget needs pattern", {}
-            return tree.forget(pattern), {}
+            return tree.forget(pattern, dry_run=dry_run), {}
         return f"error: unknown memory action {action!r}", {}
     except Exception as e:
         return f"error: {type(e).__name__}: {e}", {}
