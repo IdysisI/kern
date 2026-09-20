@@ -76,3 +76,28 @@ def test_tool_py_relative_paths_hit_session_cwd(isolated_cwd, tmp_path):
     assert (isolated_cwd / "marker.txt").exists(), (
         "relative write from py() must land in the session cwd")
     assert "hello" in text
+
+
+def test_tool_py_survives_stray_fd1_output(tmp_path):
+    """W1 regression: a C-level os.write(1, ...) bypasses redirect_stdout and
+    lands BEFORE the JSON reply. The parent must skip non-sentinel lines, not
+    crash on json.loads / desync the protocol."""
+    fs = FS(str(tmp_path))
+
+    class FakeSession:
+        scratch = tmp_path / "scratch"
+        _py_proc = None
+
+    s = FakeSession()
+    # garbage straight to fd 1, then the real printed result
+    evil = ('import os; os.write(1, b"GARBAGE-LINE\\nMORE GARBAGE\\n"); '
+            'print("real result 42")')
+    text, meta = tool_py(s, evil, _fs=fs)
+    # second call proves the stream did NOT desync (still reads a valid reply)
+    text2, _ = tool_py(s, "print(6 * 7)", _fs=fs)
+    proc = getattr(s, "_py_proc", None)
+    if proc is not None:
+        proc.kill()
+    assert meta.get("status") in (None, "succeeded"), f"garbage desynced py(): {text!r}"
+    assert "real result 42" in text, f"expected the real output, got: {text!r}"
+    assert "42" in text2, f"protocol desynced on the next call: {text2!r}"

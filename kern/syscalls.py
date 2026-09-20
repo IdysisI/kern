@@ -1043,8 +1043,20 @@ def tool_py(session, code: str, timeout: int = 60, *, _cancel=None, _fs=None) ->
     proc.stdin.flush()
     import queue
     result = queue.Queue()
+    from .repl_worker import SENTINEL_FMT
+    sentinel = SENTINEL_FMT % proc.pid   # the WORKER's pid, not ours
     def receive():
-        result.put(proc.stdout.readline())
+        # Scan for the sentinel-framed reply line, skipping any stray output
+        # written straight to fd 1 (C extensions bypass redirect_stdout);
+        # json.loads on such a line used to desync the whole protocol (W1).
+        while True:
+            ln = proc.stdout.readline()
+            if not ln:
+                result.put('')
+                return
+            if ln.startswith(sentinel):
+                result.put(ln[len(sentinel):])
+                return
     reader = threading.Thread(target=receive, daemon=True)
     reader.start()
     try:

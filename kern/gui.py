@@ -1405,7 +1405,18 @@ class Composer(QFrame):
                     return _clip._finish(data, "image/png")
         except Exception:
             pass
+        # Subprocess fallback (wl-paste/xclip/powershell) — but ONLY when Qt
+        # reports an image is actually offered. Otherwise every plain-text
+        # Ctrl+V (the common case) spawned a clipboard daemon subprocess and
+        # froze the whole UI thread for up to seconds (audit r4-gui G1).
         from . import clipboard as _clip
+        try:
+            cb = QApplication.clipboard()
+            md = cb.mimeData() if cb is not None else None
+            if md is None or not md.hasImage():
+                return None, ""       # no image offered: let Qt paste text
+        except Exception:
+            pass
         return _clip.grab_image()
 
     def paste_image(self):
