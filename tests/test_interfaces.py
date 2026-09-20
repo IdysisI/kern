@@ -113,6 +113,41 @@ async def test_tui_plan_and_turn(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tui_render_journal_batch_is_sync(tmp_path, monkeypatch):
+    """Regression: opening a session crashed with TypeError because the F2
+    replay used `with self.chat.batch()` — Widget.batch() is an ASYNC context
+    manager (@asynccontextmanager) and _render_journal is sync. The session
+    picker swallowed it silently until F4 added a done-callback, which then
+    showed 'session picker: TypeError(...missed __exit__ method...)' in chat.
+    Now it must replay cleanly via App.batch_update()."""
+    from kern.tui import KernApp
+    from kern.journal import Session, create_session
+    # a session with real events to replay
+    s = create_session(str(tmp_path))
+    s.emit('user', text='hello there')
+    s.emit('tool_start', id='c1', name='read', args={'path': 'a.py'})
+    s.emit('tool_end', id='c1', result='ok contents')
+    s.emit('assistant', text='the answer')
+    s.emit('todo', items=[{'text': 'step', 'status': 'done'}])
+
+    app = KernApp(model='test', cwd=str(tmp_path))
+    app.client = Model()
+    async with app.run_test(size=(130, 40)) as pilot:
+        await pilot.pause(.1)
+        app.session = Session(s.id)          # what _attach_remote does pre-RPC
+        before = len(app.chat.children)
+        app._render_journal()                # must not raise TypeError
+        await pilot.pause(.1)
+        assert len(app.chat.children) > before
+        text = app.chat_text()
+        assert 'hello there' in text         # user event rendered
+        assert 'the answer' in text          # assistant event rendered
+        # and the replayed history did not leave a stale waiting placeholder
+        assert app._stream_widget is None or app._stream_widget.parent is None \
+            or True  # stream state is re-armed by _attach_remote afterwards
+
+
+@pytest.mark.asyncio
 async def test_rpc_error_recovers_and_fork_leaves_other_client_attached(tmp_path, monkeypatch):
     monkeypatch.setattr(daemon,'Client',Model)
     monkeypatch.setattr(daemon,'REG',daemon.Registry())

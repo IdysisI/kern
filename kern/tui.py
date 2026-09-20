@@ -1696,9 +1696,12 @@ class KernApp(App):
             active_events = active_events[-REPLAY_CAP:]
 
         # Mount in ONE batch: every individual mount otherwise triggers a
-        # full layout pass of the chat column → O(n²) on resume (r3-tui F2).
-        # batch() defers refresh/layout until the whole replay is built.
-        with self.chat.batch():
+        # repaint of the chat column → O(n²) on resume (r3-tui F2).
+        # NOTE: Widget.batch() is ASYNC-only (@asynccontextmanager) and this
+        # method is sync — using it here raised TypeError on every session
+        # open. App.batch_update() is the sync equivalent (suspends all
+        # repaints until the block exits).
+        with self.batch_update():
             for ev in active_events:
                 self._render_one(ev, calls_by_id)
 
