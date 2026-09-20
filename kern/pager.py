@@ -110,17 +110,22 @@ def _slate(events: list[dict], session=None) -> str:
     if session is not None and objective:
         try:
             from .memory import MemoryTree as _MT
-            cwd = getattr(session, 'cwd', None) or '.'
-            mt = _MT(cwd)
-            seen_keys = {str(n.get('text', ''))[:80] for n in notes}
-            block = mt.search(objective, max_results=3) or ''
-            # BM25 block is newline-separated lines; filter anything already
-            # visible in <notes> so we don't double-inject.
-            fresh_lines = [ln for ln in block.splitlines()
-                           if ln.strip() and ln.strip()[:80] not in seen_keys]
-            if fresh_lines:
-                lines.append("memory-recall (auto-surfaced, BM25, capped at 3):")
-                lines.extend(f" {ln}" for ln in fresh_lines[:3])
+            # Session has no `cwd` attribute — cwd lives in events[0]['cwd'].
+            cwd = None
+            for ev in events:
+                if ev.get("kind") in ("meta", "user") and ev.get("cwd"):
+                    cwd = ev["cwd"]; break
+            if cwd:
+                mt = _MT(cwd)
+                seen_keys = {str(n.get('text', ''))[:80] for n in notes}
+                block = mt.search(objective, max_results=3) or ''
+                # BM25 block is newline-separated lines; filter anything already
+                # visible in <notes> so we don't double-inject.
+                fresh_lines = [ln for ln in block.splitlines()
+                               if ln.strip() and ln.strip()[:80] not in seen_keys]
+                if fresh_lines:
+                    lines.append("memory-recall (auto-surfaced, BM25, capped at 3):")
+                    lines.extend(f" {ln}" for ln in fresh_lines[:3])
         except Exception:
             pass  # never let memory plumbing break the slate
 

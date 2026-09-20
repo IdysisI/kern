@@ -134,18 +134,13 @@ class TestAutoMemoryRecall(unittest.TestCase):
                         "so the model never re-reads held content",
                         topic="fileslate", key="fileslate-intro")
             sess = _FakeSession()
-            sess.cwd = td
-            # _slate doesn't currently receive objective as a kw; the actual
-            # slate-build path in engine.py passes objective separately. We
-            # test the auto-injection helper directly by calling the pager
-            # entry point that the engine uses.
             from kern import pager
             events = []
-            # Inject an objective via a user event so the slate sees it
+            # Realistic: cwd rides in the 'meta' event, not on session.
+            # The pager reads it from events[0]['cwd'].
+            events.append({"kind": "meta", "cwd": td})
             events.append({"kind": "user", "text": "investigate the fileslate ledger"})
             slate = pager._slate(events, session=sess)
-            # The auto-surfaced block should appear because the objective
-            # mentions fileslate and the atom is about fileslate.
             self.assertIn("memory-recall", slate,
                           f"slate did not auto-surface memory; got:\n{slate}")
 
