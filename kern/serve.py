@@ -53,6 +53,10 @@ class Conn:
         # ordered queue drained by one writer task.
         self._send_q: asyncio.Queue = asyncio.Queue()
         self._writer = asyncio.get_running_loop().create_task(self._drain())
+        # S3: serialized dispatch tail — the read loop never awaits a slow
+        # handler; each queued step awaits the previous one (order preserved).
+        self._serial_tail: asyncio.Task | None = None
+        self._closed = False
 
     async def _drain(self):
         while True:
@@ -65,6 +69,7 @@ class Conn:
                 break
 
     async def close(self):
+        self._closed = True
         self._send_q.put_nowait(None)
         try:
             await asyncio.wait_for(self._writer, timeout=2)
@@ -72,10 +77,49 @@ class Conn:
             self._writer.cancel()
 
     async def send(self, **msg):
+        # S2: after the connection closed, the writer task is gone — enqueue
+        # would leak memory for a detached turn's remaining events. Drop.
+        if self._writer.done():
+            return
         try:
             self._send_q.put_nowait(msg)
         except Exception:
             pass
+
+    # ---- S3: control plane -------------------------------------------
+    def handle_control(self, msg: dict) -> None:
+        """Synchronous, instant methods: cancel a turn, resolve an approval.
+        These must never wait behind a slow handler (network `models` fetch,
+        disk `attach`) — ESC and Approve have to stay responsive."""
+        m = msg.get("method")
+        if m == "interrupt":
+            if self.turn and not self.turn.done():
+                self.turn.cancel()
+        elif m == "approve":
+            try:
+                fut = self._approvals.pop(int(msg.get("id", 0)), None)
+            except (TypeError, ValueError):
+                return
+            if fut and not fut.done():
+                fut.set_result(bool(msg.get("allow")))
+
+    def enqueue(self, msg: dict) -> None:
+        """Dispatch a message WITHOUT blocking the read loop, preserving
+        order: each step awaits its PREDECESSOR (captured at enqueue time —
+        reading the attribute later would race with subsequent enqueues)."""
+        prev = self._serial_tail
+
+        async def _step():
+            if prev is not None:
+                try:
+                    await asyncio.shield(prev)
+                except Exception:
+                    pass
+            try:
+                await self.handle(msg)
+            except Exception as e:
+                await self.send(event="error", error=f"{type(e).__name__}: {e}")
+        self._serial_tail = asyncio.ensure_future(_step())
 
     # engine -> client (sync callback: enqueue, never block the engine loop)
     def stream_cb(self, kind: str, text: str):
@@ -129,13 +173,11 @@ class Conn:
                 except Exception as e:
                     await self.send(event="error", error=f"{type(e).__name__}: {e}")
             self.turn = asyncio.ensure_future(run())
-        elif m == "approve":
-            fut = self._approvals.pop(int(msg.get("id", 0)), None)
-            if fut and not fut.done():
-                fut.set_result(bool(msg.get("allow")))
-        elif m == "interrupt":
-            if self.turn and not self.turn.done():
-                self.turn.cancel()
+        elif m in ("approve", "interrupt"):
+            # Normally the handler fast-paths these (S3) — this branch only
+            # covers direct handle() calls (tests, future callers). Delegate
+            # so the semantics live in exactly one place.
+            self.handle_control(msg)
         elif m == "model":
             self.model = str(msg.get("model") or self.model)
             await self.send(result={"model": self.model})
@@ -203,13 +245,34 @@ async def handler(ws):
             except json.JSONDecodeError:
                 await conn.send(event="error", error="bad json")
                 continue
-            await conn.handle(msg)
+            # S3: interrupt/approve take a synchronous fast path — they must
+            # never queue behind a slow handler (network `models`, disk
+            # `attach`). Everything else is dispatched without blocking the
+            # read loop, serialized so order is preserved.
+            if msg.get("method") in ("interrupt", "approve"):
+                conn.handle_control(msg)
+            else:
+                conn.enqueue(msg)
     except websockets.ConnectionClosed:
         pass
     finally:
+        # S2: a disconnect must NOT kill the in-flight turn — a transient
+        # network blip would cancel the engine mid-tool and leave partial
+        # work only in the journal with no turn_end. Let it run detached:
+        # the engine journals every event, sends() drop once the writer is
+        # stopped, and a reconnecting client attaches (S1) to the same
+        # session and replays the finished turn. asyncio keeps a reference
+        # to the running task, so it cannot be GC'd mid-flight.
         if conn.turn and not conn.turn.done():
-            conn.turn.cancel()
+            conn.turn.add_done_callback(_detached_turn_done)
         await conn.close()          # drain/stop the ordered send writer
+
+
+def _detached_turn_done(task: asyncio.Task) -> None:
+    """Reap exceptions from a detached turn so they don't go unobserved."""
+    if not task.cancelled() and task.exception() is not None:
+        # Journaling already captured what happened; only log the surprise.
+        print(f"[serve] detached turn failed: {task.exception()!r}", flush=True)
 
 
 def main():

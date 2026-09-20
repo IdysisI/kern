@@ -255,7 +255,17 @@ def test_py_timeout_stops_effect(tmp_path):
     code = f'import time; time.sleep(3); open({str(target)!r},"w").write("late")'
     text, meta = syscalls.tool_py(s, code, timeout=1)
     assert meta['status'] == 'uncertain'
-    assert s._py_proc is None
+    # W2 contract (35f964b): on POSIX the parent SIGINTs the running cell —
+    # the effect is stopped, but the worker survives with its namespace
+    # intact (graceful interrupt). Only if it fails to answer within the 3s
+    # grace window (or on Windows) is the worker killed and state reset.
+    if os.name != 'nt':
+        assert s._py_proc is not None and s._py_proc.poll() is None
+        assert 'namespace kept' in text
+        # state really survived: x=21 is still visible to the next cell
+        assert '22' in syscalls.tool_py(s, 'print(x+1)')[0]
+    else:
+        assert s._py_proc is None
     assert not target.exists()
 
 

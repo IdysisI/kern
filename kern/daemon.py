@@ -227,7 +227,16 @@ class Worker:
                 self.context = getattr(eng,'context_stats',{})
                 await self.broadcast(event="turn_end", reply=reply, usage=self.usage, stop_reason=eng.stop_reason)
             except asyncio.CancelledError:
-                await self.broadcast(event="turn_end", reply="", interrupted=True)
+                # D4: abort() (hot reload) cancels the turn WITHOUT journaling
+                # turn_end so boot_resume() picks it up in the fresh daemon. A
+                # broadcast turn_end here would clear the client's busy state
+                # even though the turn is about to be RESUMED — advertise
+                # suspension instead (clients that don't know it ignore it;
+                # the post-exec boot_resume replays the real turn).
+                if getattr(eng, 'aborting', False):
+                    await self.broadcast(event="turn_suspend")
+                else:
+                    await self.broadcast(event="turn_end", reply="", interrupted=True)
             except Exception as e:
                 await self.broadcast(event="error", error=f"{type(e).__name__}: {e}")
 

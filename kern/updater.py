@@ -203,8 +203,11 @@ def exec_restart() -> None:
     # it was JUST restarted. If restarts cannot converge on the current code
     # (e.g. the repo is unimportable), the watcher stops instead of bouncing the
     # daemon forever — a restart loop is far worse than running slightly old code.
+    # NOTE: child_env() above deliberately strips these vars from the COPY (so
+    # unrelated children never inherit phantom state) — so read the count from
+    # our OWN os.environ, which the dying process still has intact.
     try:
-        env['KERN_RESTART_COUNT'] = str(_restart_count(env) + 1)
+        env['KERN_RESTART_COUNT'] = str(_restart_count(os.environ) + 1)
         env['KERN_RESTART_TS'] = str(int(time.time()))
     except Exception:
         pass

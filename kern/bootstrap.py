@@ -240,6 +240,12 @@ def child_env(root: Path | None = None, base: dict | None = None) -> dict:
     with `-m kern.daemon` from a frozen tool env imports the current source.
     """
     env = dict(os.environ if base is None else base)
+    # U3: the restart-loop breaker vars are DAEMON-internal state. Children
+    # must not inherit them — an unrelated tool process would otherwise see a
+    # phantom restart count. exec_restart() re-adds them explicitly AFTER
+    # calling child_env, so the breaker itself is unaffected.
+    env.pop("KERN_RESTART_COUNT", None)
+    env.pop("KERN_RESTART_TS", None)
     root = root or repo_path(persist=False)
     if root is not None:
         env["KERN_REPO"] = str(root)

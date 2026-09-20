@@ -1,6 +1,7 @@
 """Local browser UI and persistent WebSocket runtime on the same origin."""
 from __future__ import annotations
 import asyncio
+import os
 from pathlib import Path
 from urllib.parse import urlsplit
 from websockets.asyncio.server import serve
@@ -77,6 +78,23 @@ async def run_server():
                           + ", ".join(resumed[:6]), flush=True)
             except Exception as e:
                 print(f'kern: boot_resume failed (non-fatal): {e!r}', flush=True)
+
+            # U3: this process came up (and stayed up) — the restart counter
+            # in our env is now STALE. Clear it so a legitimate restart hours
+            # or days from now isn't judged part of an old crash loop. A real
+            # crash loop reboots in <60s and never reaches this point in a
+            # way that survives: exec_restart increments from whatever the
+            # dying process's env held, and the dying process never ran this.
+            async def _settle_restart_counter():
+                await asyncio.sleep(60)
+                os.environ.pop('KERN_RESTART_COUNT', None)
+                os.environ.pop('KERN_RESTART_TS', None)
+            settle_task = asyncio.create_task(_settle_restart_counter())
+            # swallow result/cancel — nothing to propagate (t.exception() on a
+            # cancelled task would raise, so check cancelled() first)
+            settle_task.add_done_callback(
+                lambda t: None if t.cancelled() else t.exception())
+
             await daemon.SHUTDOWN.wait()
     finally:
         watcher.cancel()
@@ -85,21 +103,34 @@ async def run_server():
         # WITHOUT journaling turn_end, leaving it open so the fresh process's
         # boot_resume() picks it back up. A plain shutdown uses interrupt()
         # which closes the turn so it is not resurrected.
+        # D3: the drain runs AFTER websockets removed its signal handlers, and
+        # any wedged worker/MCP would hang shutdown forever. Bound it.
         is_restart = daemon.RESTART
-        for worker in daemon.REG.workers.values():
-            if is_restart:
-                await worker.abort()
-            else:
-                await worker.interrupt()
-            runtime = getattr(worker.session,'_runtime',{})
-            for entry in runtime.get('subagents',{}).values():
-                task = entry.get('async_task')
-                if task and not task.done():
-                    task.cancel()
-                    await asyncio.gather(task,return_exceptions=True)
-            mounts = runtime.get('mounts')
-            if mounts:
-                await asyncio.gather(*(c.stop() for c in mounts.mcps.values()),return_exceptions=True)
+
+        async def _drain():
+            for worker in daemon.REG.workers.values():
+                if is_restart:
+                    await worker.abort()
+                else:
+                    await worker.interrupt()
+                runtime = getattr(worker.session,'_runtime',{})
+                for entry in runtime.get('subagents',{}).values():
+                    task = entry.get('async_task')
+                    if task and not task.done():
+                        task.cancel()
+                        await asyncio.gather(task,return_exceptions=True)
+                mounts = runtime.get('mounts')
+                if mounts:
+                    await asyncio.gather(*(c.stop() for c in mounts.mcps.values()),return_exceptions=True)
+
+        drain_timeout = float(os.environ.get('KERN_SHUTDOWN_TIMEOUT', '10'))
+        try:
+            await asyncio.wait_for(_drain(), drain_timeout)
+        except (asyncio.TimeoutError, Exception):
+            # On timeout/any drain failure: proceed anyway so exec_restart
+            # still runs — a wedged MCP must not silently kill hot reload.
+            print(f'[shutdown] drain exceeded {drain_timeout:.0f}s; '
+                  f'continuing (restart={is_restart})', flush=True)
     # Graceful shutdown complete. If a restart was requested (hot-update or
     # explicit), re-exec into the current working-tree code. Never returns.
     if getattr(daemon,'RESTART',False):
