@@ -172,3 +172,43 @@ async def test_productive_subagent_not_killed(tmp_path, monkeypatch):
     reply = await e.chat("do a slow but productive thing")
     assert "final answer" in reply or "working" in reply, \
         f"productive subagent was wrongly killed: {reply!r}"
+
+
+@pytest.mark.asyncio
+async def test_stall_watchdog_salvages_partial_report(tmp_path, monkeypatch):
+    """When the watchdog kills a stalled subagent, the engine must NOT raise
+    TimeoutError and lose the work — it salvages any scratch artefacts into
+    a partial report file the parent can read. (Audit R5 fix: this is the
+    structural answer to subagent drowning — graceful partial delivery,
+    not a text wall telling the model to hurry up.)"""
+    monkeypatch.setenv("KERN_SUBAGENT_STALL_S", "0.2")
+    import importlib
+    import kern.engine as eng_mod
+    importlib.reload(eng_mod)
+
+    sess = create_session(str(tmp_path))
+    e = eng_mod.Engine(_StubClient(), "m", sess, str(tmp_path))
+    e.stream_cb = lambda *a, **k: None
+    e.approve = lambda *a, **k: True
+
+    # background subagent whose model hangs forever
+    text, _ = await e._tool_spawn("audit subagent", background=True)
+    assert "sub_1" in text
+
+    entry = e.subagents["sub_1"]
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if entry["completed"]:
+            break
+        await asyncio.sleep(0.1)
+    assert entry["completed"], "stall watchdog never fired"
+    # the watchdog still records an error, but a salvage report must also exist
+    assert entry.get("error") and "stall" in entry["error"].lower()
+    # the parent must have a usable path forward — either a report file or
+    # an inline salvage blob — never just a bare TimeoutError.
+    assert entry.get("report_path"), (
+        f"no salvage report produced; the parent would have nothing to read. "
+        f"entry={entry!r}"
+    )
+    rp = entry["report_path"]
+    assert os.path.exists(rp), f"report_path set but file missing: {rp}"

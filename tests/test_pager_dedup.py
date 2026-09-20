@@ -117,5 +117,38 @@ class TestDedupDoesNotLivelock(unittest.TestCase):
         self.assertIn(SENTINEL, tool_texts[-1])
 
 
+class TestAutoMemoryRecall(unittest.TestCase):
+    """F3 (audit R5): the pager auto-surfaces relevant memory in the slate so
+    a small model never has to remember to call memory_search."""
+
+    def test_slate_includes_memory_recall_block_when_atoms_match_objective(self):
+        import tempfile, types
+        from kern import memory
+
+        # write a temporary atom about fileslate, then build the slate with
+        # an objective that should match it via BM25.
+        with tempfile.TemporaryDirectory() as td:
+            mt = memory.MemoryTree(td)
+            mt.remember("fileslate is the session file-knowledge ledger: "
+                        "it remembers what range of which file the model has read, "
+                        "so the model never re-reads held content",
+                        topic="fileslate", key="fileslate-intro")
+            sess = _FakeSession()
+            sess.cwd = td
+            # _slate doesn't currently receive objective as a kw; the actual
+            # slate-build path in engine.py passes objective separately. We
+            # test the auto-injection helper directly by calling the pager
+            # entry point that the engine uses.
+            from kern import pager
+            events = []
+            # Inject an objective via a user event so the slate sees it
+            events.append({"kind": "user", "text": "investigate the fileslate ledger"})
+            slate = pager._slate(events, session=sess)
+            # The auto-surfaced block should appear because the objective
+            # mentions fileslate and the atom is about fileslate.
+            self.assertIn("memory-recall", slate,
+                          f"slate did not auto-surface memory; got:\n{slate}")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -287,3 +287,84 @@ async def test_file_state_visible_in_slate(tmp_path):
     slate = pager._slate(sess.events, session=sess)
     assert "<file-state>" in slate
     assert "a.py" in slate and "do NOT re-read" in slate
+
+
+# ================================================================ direct API
+#
+# These tests exercise syscalls.tool_read / tool_write / tool_edit directly
+# (the end-user path the model sees), proving the slate dedup is wired in
+# without going through the engine. Audit R5: this is what was missing
+# before — slate was rendered but never populated.
+
+def _session_with_slate(cwd):
+    sess = create_session(cwd)
+    if 'fileslate' not in (getattr(sess, '_runtime', None) or {}):
+        rt = getattr(sess, '_runtime', None) or {}
+        rt['fileslate'] = FileSlate(cwd)
+        sess._runtime = rt
+    return sess
+
+
+def test_tool_read_direct_dedup(tmp_path):
+    """A second tool_read of a held range returns a slate-hit, not disk."""
+    from kern import syscalls
+    # Use a larger file so the slate-hit's win is actually visible
+    f = tmp_path / "f.py"
+    f.write_text("\n".join(f"line_{i:03d} = {i}" for i in range(1, 201)))  # 200 lines
+    sess = _session_with_slate(str(tmp_path))
+    fs = syscalls.FS(str(tmp_path))
+
+    txt1, meta1 = syscalls.tool_read(fs, "f.py", offset=1, limit=200, session=sess)
+    assert meta1.get("fileslate") != "hit", "first read must hit disk"
+    assert "line_001" in txt1
+
+    txt2, meta2 = syscalls.tool_read(fs, "f.py", offset=1, limit=200, session=sess)
+    assert meta2.get("fileslate") == "hit", "second read must be slate-hit"
+    assert "fileslate hit" in txt2
+    # crucial: the slate-hit is much cheaper than the full body
+    body_len = len(txt1)
+    assert len(txt2) < body_len // 2, (
+        f"slate-hit text ({len(txt2)} bytes) must be cheaper than full body "
+        f"({body_len} bytes) — should be a pointer, not the body"
+    )
+
+
+def test_tool_edit_invalidates_slate(tmp_path):
+    """After tool_edit, the next tool_read of that file is a real disk read."""
+    from kern import syscalls
+    f = tmp_path / "f.py"
+    f.write_text("first = 1\nlast = 2\n")
+    sess = _session_with_slate(str(tmp_path))
+    fs = syscalls.FS(str(tmp_path))
+
+    syscalls.tool_read(fs, "f.py", session=sess)
+    # confirm held
+    txt_check, meta_check = syscalls.tool_read(fs, "f.py", session=sess)
+    assert meta_check.get("fileslate") == "hit"
+
+    # edit the file
+    syscalls.tool_edit(fs, sess, "f.py", old_str="first = 1", new_str="FIRST = 99")
+
+    # next read MUST be real (not a stale hit), and MUST contain new content
+    txt, meta = syscalls.tool_read(fs, "f.py", session=sess)
+    assert meta.get("fileslate") != "hit", "edit did not invalidate slate"
+    assert "FIRST = 99" in txt
+    assert "first = 1" not in txt
+
+
+def test_tool_write_invalidates_slate(tmp_path):
+    """After tool_write, the next tool_read is real."""
+    from kern import syscalls
+    f = tmp_path / "f.py"
+    f.write_text("a\n")
+    sess = _session_with_slate(str(tmp_path))
+    fs = syscalls.FS(str(tmp_path))
+
+    syscalls.tool_read(fs, "f.py", session=sess)
+    _t, m = syscalls.tool_read(fs, "f.py", session=sess)
+    assert m.get("fileslate") == "hit"
+
+    syscalls.tool_write(fs, sess, "f.py", "REPLACED\n")
+    txt, meta = syscalls.tool_read(fs, "f.py", session=sess)
+    assert meta.get("fileslate") != "hit"
+    assert "REPLACED" in txt

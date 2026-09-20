@@ -273,13 +273,43 @@ def _unified_diff(path: Path, old: str, new: str) -> str:
     return "\n".join(diff)
 
 
+def _slate_invalidate(session, path: str) -> None:
+    """Best-effort fileslate invalidation. Safe on sessions with no slate."""
+    slate = (getattr(session, '_runtime', None) or {}).get('fileslate') if session else None
+    if slate is None:
+        return
+    try:
+        slate.invalidate(path)
+    except Exception:
+        pass  # never let slate bookkeeping fail the tool call
+
+
 def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
-              full: bool = False) -> tuple[str, dict]:
+              full: bool = False, session=None) -> tuple[str, dict]:
     """Read a file or inspect multimodal media (images/audio/binary).
     Supports auto-path resolution, numbered text slices, and native multimodal
     payload attachment for vision/audio models on VSLLM."""
     p, note = fs.resolve_resilient(path)
     res_prefix = (note + "\n") if note else ""
+
+    # FileSlate structural read-dedup (audit R5): if the range is already
+    # held in the session ledger, serve a pointer instead of re-rendering.
+    # The model has nothing to gain from the second byte-for-byte copy, and
+    # the unrendered form is ~30 tokens instead of ~800.
+    slate = (getattr(session, '_runtime', None) or {}).get('fileslate') if session else None
+    if slate is not None and not full:
+        try:
+            held_text = slate.covered_slice(str(p), int(offset), int(limit))
+        except Exception:
+            held_text = None
+        if held_text:
+            msg = (
+                f"{res_prefix}[fileslate hit: {p} lines {offset}-{offset + limit - 1} "
+                f"already held this session — content unchanged. Treat as known. "
+                f"Pass `full=True` only if you genuinely need to re-verify (it "
+                f"forces a real disk read and re-render).]"
+            )
+            return msg, {"fileslate": "hit"}
 
     if p.is_dir():
         entries = sorted(os.listdir(p))[:200]
@@ -338,7 +368,16 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
             return f"{res_prefix}{text}", {}
         return (f"{res_prefix}error: file too large for full read ({len(text.splitlines())} lines). "
                 f"Use offset/limit instead."), {}
-    return f"{res_prefix}{_numbered(p, offset, limit)}", {}
+    body = _numbered(p, offset, limit)
+    # Record into fileslate so a subsequent re-read of this range is a slate
+    # hit (see tool_read head) instead of another disk read. This is what
+    # actually kills the "circle and re-check" loop structurally.
+    if slate is not None:
+        try:
+            slate.record_read(str(p), body)
+        except Exception:
+            pass
+    return f"{res_prefix}{body}", {}
 
 def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
     p = fs.resolve(path)
@@ -354,6 +393,9 @@ def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
                          before_write=lambda: session.checkpoint([str(p)], cwd=str(fs.cwd)))
     old, _new = res if res else ("", content)
     diff = _unified_diff(p, old, content)
+    # FileSlate: a write invalidates every held range of this path — the
+    # next read of this file MUST be a real disk read, not a stale cache hit.
+    _slate_invalidate(session, str(p))
     msg = f"wrote {p} ({len(content)} bytes)"
     return msg, {"diff": diff, "path": str(p)}
 
@@ -532,6 +574,9 @@ def tool_edit(fs: FS, session, path: str, old_str: str = "", new_str: str = "",
         act_s, act_e = actual_range[0], actual_range[1]
         zone = _numbered_lines(flines, act_s, act_e)
         note_str = f" ({reloc_note[0]})" if reloc_note else ""
+        # FileSlate: invalidate so the model's "I already know this file" cache
+        # doesn't serve stale content after a successful edit.
+        _slate_invalidate(session, str(p))
         msg = f"edited {p} (lines {act_s}-{act_e}){note_str}\nreplaced:\n{zone}"
         if p.suffix == ".py":
             ok, err = _py_compile(p)
@@ -594,6 +639,9 @@ def tool_edit(fs: FS, session, path: str, old_str: str = "", new_str: str = "",
     src2, new_src = res
     diff = _unified_diff(p, src2, new_src)
     mode_note = "" if old_str in src2 else " (whitespace-tolerant match)"
+    # FileSlate: invalidate so the model's "I already know this file" cache
+    # doesn't serve stale content after a successful edit.
+    _slate_invalidate(session, str(p))
     msg = f"edited {p}{mode_note} (+{len(new_str)} -{len(old_str)} bytes)"
     if p.suffix == ".py":
         ok, err = _py_compile(p)

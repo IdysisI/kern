@@ -756,7 +756,7 @@ class Engine:
         import threading
         cancel = threading.Event()
         funcs = {
-            "read": lambda: syscalls.tool_read(self.fs, **args),
+            "read": lambda: syscalls.tool_read(self.fs, session=self.session, **args),
             "write": lambda: syscalls.tool_write(self.fs, self.session, **args),
             "edit": lambda: syscalls.tool_edit(self.fs, self.session, **args),
             "exec": lambda: syscalls.tool_exec(self.fs, **args, _cancel=cancel),
@@ -1010,7 +1010,36 @@ class Engine:
                     await body
                 except (asyncio.CancelledError, Exception):
                     pass
-                raise TimeoutError(entry.get("error") or f"subagent {hid} stalled")
+                # F4 (audit R5): the watchdog kills the body but the child may
+                # have produced real artefacts in its scratch dir. Salvage them
+                # so the parent still gets a useful report instead of just a
+                # TimeoutError. The previous code raised here, losing the work.
+                salvaged, artifacts = await _salvage_artifacts()
+                report_file = self.session.scratch / f"{hid}_report.md"
+                self.session.scratch.mkdir(parents=True, exist_ok=True)
+                try:
+                    body_text = (
+                        salvaged.strip() if salvaged.strip() else
+                        "(no artefacts produced before the watchdog fired — the "
+                        "child was still in its read loop at timeout)"
+                    )
+                    report_file.write_text(
+                        f"# Subagent Report ({hid}) — SALVAGED AFTER TIMEOUT\n"
+                        f"Task: {task}\nError: watchdog stalled the child at "
+                        f"step {child_engine.requests}/{steps_cap}\n\n"
+                        f"{body_text}")
+                    entry["report_path"] = str(report_file)
+                    entry["salvaged"] = True
+                except Exception:
+                    report_file = None
+                self.session.emit("subagent_finish", handle=hid, result=None,
+                                  report_path=str(report_file) if report_file else None,
+                                  error="watchdog timeout", requests=child_engine.requests)
+                salv = f" (salvaged {len(artifacts)} artifact(s) -> {report_file})" if report_file else ""
+                self.stream_cb("note", f"⚠ subagent {hid} stalled{salv} — partial report available")
+                return ("", {"handle": hid, "salvaged": True,
+                             "report_path": str(report_file) if report_file else None,
+                             "error": "watchdog timeout"})
             finally:
                 child_state["done"] = True
                 hb.cancel()
@@ -1658,12 +1687,15 @@ class Engine:
                         if ro_key is not None:
                             self._ro_cache[ro_key] = (text, meta)
                             if name == "read":
-                                # Teach the slate what the model now holds
-                                # (range-aware; survives the cache wipe below).
-                                try:
-                                    self.fileslate.record_read(str((args or {}).get("path", "")), str(text))
-                                except Exception:
-                                    pass
+                                # F5 (audit R5): if this read was a slate-hit,
+                                # nothing new was put on the slate — the range
+                                # was already held. Skip the redundant record.
+                                if not (isinstance(meta, dict) and meta.get("fileslate") == "hit"):
+                                    try:
+                                        self.fileslate.record_read(
+                                            str((args or {}).get("path", "")), str(text))
+                                    except Exception:
+                                        pass
                         elif not _is_read_only(name, args):
                             # FileSlate: SURGICAL invalidation. edit/write touch
                             # exactly one file — wiping the whole read cache for
@@ -1748,9 +1780,15 @@ class Engine:
                 # so legitimate research (many different reads) is never killed.
                 tgt = None
                 novel = False
-                if _step_is_progress(name, args):
+                # F5 (audit R5): a slate-hit read is NOT an inspection — the model
+                # asked about content it already holds and got a pointer, not a
+                # fresh disk read. Treat it as progress so the breaker never fires
+                # on efficient re-reference. Only raw disk reads count toward the
+                # breaker. The architecture makes correct behaviour the cheap path.
+                _slate_hit = bool(isinstance(meta, dict) and meta.get("fileslate") == "hit")
+                if _slate_hit or _step_is_progress(name, args):
                     _dbg(self.session, "breaker.progress_reset", step=attempt, tool=name,
-                         was_consecutive=self._consecutive_inspections)
+                         was_consecutive=self._consecutive_inspections, slate_hit=_slate_hit)
                     self._consecutive_inspections = 0
                 else:
                     tgt = _inspection_target(name, args)
