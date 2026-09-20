@@ -53,6 +53,26 @@ from .pager import budget
 
 DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
 
+# ── visual identity ──────────────────────────────────────────────────────
+# One place defines every color the TUI paints. Widgets import these instead
+# of sprinkling hex literals. The palette is a warm midnight (Tokyo Night
+# family) — deep blue-black ground, soft blue accent, calm green for success.
+# "Hug, don't bloat": the terminal background shows through everywhere;
+# identity comes from thin rails, color and rhythm, never from filled boxes.
+BG_DEEP   = "#16161e"   # deepest ground (head/foot strips)
+BG_SOFT   = "#1f2335"   # slightly lifted ground (cards, prompt)
+BG_RISE   = "#24283b"   # raised ground (pickers, modals)
+BG_LINE   = "#2f3450"   # hairline borders
+BLUE      = "#7aa2f7"   # primary accent — identity
+BLUE_SOFT = "#89ddff"   # secondary accent — links, cyan details
+GOLD      = "#e0af68"   # attention, warnings, in-flight
+GREEN     = "#9ece6a"   # success, done
+RED       = "#f7768e"   # errors, danger
+MAGENTA   = "#bb9af7"   # thinking, special
+TEXT_HI   = "#c0caf5"   # primary text
+TEXT_MID  = "#9aa5ce"   # secondary text
+TEXT_DIM  = "#565f89"   # tertiary text
+
 TOOL_ICON = {"read": "◱", "write": "✎", "edit": "✎", "exec": "▶", "spawn": "⑂",
              "fetch": "◈", "todo": "☰", "proc": "⚙", "memory": "◍"}
 
@@ -69,25 +89,43 @@ CSS = """
    rails and color, never from filled boxes. */
 Screen { background: transparent; }
 
-/* ── chrome ─────────────────────────────────────────────────────────── */
-#topbar { dock: top; height: 1; padding: 0 2; }
-#tleft  { width: auto; color: $text-muted; }
-#tright { width: 1fr; text-align: right; color: $text-muted; }
+/* ── chrome: slim brand strip top, live hints strip bottom.
+   These are the ONLY filled surfaces — they frame the conversation like a
+   cockpit, and the hairline border separates chrome from content crisply. */
+#topbar { dock: top; height: 1; padding: 0 2; background: #16161e;
+          border-bottom: tall #24283b; }
+#tleft  { width: auto; color: #9aa5ce; }
+#tright { width: 1fr; text-align: right; color: #565f89; }
 
 #workspace { height: 1fr; }
-#inspector { width: 34; border-left: solid #3e5140; padding: 1 2; overflow-y: auto; }
-#inspector-title { color: #bde596; text-style: bold; margin-bottom: 1; }
-#work-plan { margin-top: 1; }
-#work-mounts { margin-top: 1; color: $text-muted; }
-#work-proof { margin-top: 1; color: $text-muted; }
+/* inspector: same dark ground as the chrome strips → reads as one frame
+   wrapping the conversation on two sides. */
+#inspector { width: 34; padding: 0 1; overflow-y: auto;
+             background: #16161e; border-left: tall #24283b;
+             scrollbar-color: #2f3450 transparent;
+             scrollbar-background: transparent; }
+.insp-head { color: #414868; text-style: bold; margin: 1 0 0 0; }
+#inspector-title { color: #7aa2f7; text-style: bold; margin: 0 0 1 0; padding-top: 1; }
+#work-objective { color: #9aa5ce; margin: 0 0 1 0; }
+#work-plan { margin: 0; }
+#work-mounts { margin: 1 0 0 0; color: #565f89; }
+#work-proof { margin: 1 0 0 0; color: #565f89; }
 #chat { width: 1fr; height: 1fr; padding: 0 2; background: transparent;
-        scrollbar-color: $border transparent; scrollbar-background: transparent; }
+        scrollbar-color: #2f3450 transparent;
+        scrollbar-background: transparent;
+        scrollbar-size: 1 1; }
 
 /* activity line while a turn runs (hidden when idle) */
-#status { dock: bottom; height: 1; padding: 0 2; color: #e0af68; }
+#status { dock: bottom; height: 1; padding: 0 2; color: #e0af68;
+          background: #16161e; }
 
-#prompt { border: round $border; color: $text; height: auto; max-height: 9; min-height: 3;
-          background: transparent; }
+/* ── prompt: the one elevated card in the UI. Soft lift, rounded;
+   focusing it lights the border blue — you always know where typing goes. */
+#prompt { border: round #2f3450; color: #c0caf5; height: auto;
+          max-height: 9; min-height: 3; background: #1f2335;
+          padding: 0 1; margin: 0 0 0 0;
+          scrollbar-color: #2f3450 transparent;
+          scrollbar-background: transparent; }
 #prompt:focus { border: round #7aa2f7; }
 /* Cursor: a solid bright block, like a terminal caret.
    Textual's :ansi default is text-style: reverse with ansi_default colors —
@@ -107,45 +145,63 @@ Screen { background: transparent; }
 #prompt .text-area--cursor-line {
     background: transparent;
 }
-#bar { dock: bottom; height: 1; color: $text-muted; padding: 0 2; }
+#bar { dock: bottom; height: 1; color: #565f89; padding: 0 2;
+       background: #16161e; border-top: tall #24283b; }
 
-/* ── conversation: rails, not boxes ─────────────────────────────────── */
-/* you: one bright thick rail — the strongest structural mark in the file */
-.user    { border-left: thick #c0caf5; padding: 0 1; margin: 1 0 0 1; }
-/* kern answering (final): no rail, just alignment under your text */
-.assistant { padding: 0 1 0 1; margin-left: 1; }
-/* kern streaming: the rail pulses — blue means "kern is speaking now" */
+/* ── conversation: rails, not boxes. The chat column keeps the terminal's
+   own background so replies breathe; only structure gets color. ───────── */
+/* you: bright cyan rail + bold — unmistakably YOUR voice */
+.user    { border-left: thick #89ddff; padding: 0 1; margin: 1 0 0 1;
+           color: #89ddff; text-style: bold; }
+/* kern answering (final): no rail, calm alignment under your text */
+.assistant { padding: 0 1 0 1; margin-left: 1; color: #c0caf5; }
+.assistant Markdown { background: transparent; }
+/* kern streaming: blue rail = "kern is speaking now" */
 .stream  { padding: 0 1 0 1; margin-left: 1; border-left: tall #7aa2f7; }
 
 .thinking { background: transparent; border: none; padding: 0; margin: 0 0 0 1; }
-.thinking .thinking-text { color: $text-muted; text-style: italic; }
-CollapsibleTitle { color: $text-muted; text-style: italic; background: transparent; padding: 0; }
+.thinking .thinking-text { color: #565f89; text-style: italic; }
+CollapsibleTitle { color: #565f89; text-style: italic; background: transparent; padding: 0; }
 
-/* tool calls: purple hairline rail, one calm headline + dim result */
-.tool    { border-left: tall #bb9af7; padding: 0 1 0 1; margin: 0 0 0 1; }
-.note    { color: $text-muted; padding: 0 1 0 2; }
-.hello   { padding: 0 1 0 2; margin: 1 0; }
-.error   { border-left: tall #f7768e; padding: 0 1 0 1; margin: 0 0 0 1; color: $error; }
+/* tool calls: outcome-colored rail + soft panel so a wall of tool calls
+   scans as discrete steps instead of undifferentiated text */
+.tool    { border-left: tall #bb9af7; padding: 0 1 0 1; margin: 0 0 0 1;
+           background: #1a1b26; }
+.tool.running { border-left: tall #e0af68; }
+.tool.ok      { border-left: tall #9ece6a; }
+.tool.failed  { border-left: tall #f7768e; }
+.note    { color: #565f89; padding: 0 1 0 2; text-style: italic; }
+.hello   { padding: 1 2; margin: 1 0; color: #9aa5ce;
+           border: round #2f3450; background: #1a1b26; }
+.error   { border-left: tall #f7768e; padding: 0 1 0 1; margin: 0 0 0 1; color: #f7768e; }
 .todo    { border-left: tall #7dcfff; padding: 0 1 0 1; margin: 0 0 0 1; }
 .queued  { color: #e0af68; padding: 0 1 0 2; text-style: italic; }
 /* The waiting placeholder IS the assistant container, alive from the first
    frame: same rail as .stream, so pressing enter never looks dead. */
 .waiting { padding: 0 1 0 1; margin-left: 1; border-left: tall #7aa2f7;
-           color: $text-muted; text-style: italic; }
+           color: #565f89; text-style: italic; }
 
 Approve { align: center middle; }
-#dlg { width: 84; height: auto; max-height: 26; background: $surface;
+#dlg { width: 84; height: auto; max-height: 26; background: #1f2335;
        border: round #e0af68; padding: 1 2; }
-#dlg .q { color: $text; margin-bottom: 1; }
+#dlg .q { color: #c0caf5; margin-bottom: 1; }
 #dlg .diff { color: $text; }
 #dlg Button { margin: 0 1; }
 
 ModelPicker { align: center middle; }
 SessionPicker { align: center middle; }
-#mp { width: 74; height: 24; background: $surface; border: round #7aa2f7; padding: 0 1; }
-#mp ListView { height: 1fr; }
-#mp ListItem { padding: 0 1; }
-#mp ListItem.-highlight { background: $boost; }
+/* pickers: elevated panel in the same family as the prompt card — a modal
+   should feel like part of kern, not a gray foreign object */
+#mp { width: 86; max-width: 92%; height: auto; max-height: 26;
+      background: #1f2335; border: round #7aa2f7; padding: 0 1; }
+#mp ListView { height: auto; max-height: 20; background: transparent;
+               border: none;
+               scrollbar-color: #2f3450; scrollbar-background: #1f2335; }
+#mp ListItem { padding: 0 1; color: #9aa5ce; }
+#mp ListItem:hover { background: #24283b; }
+#mp ListItem.-highlight { background: #24283b; color: #c0caf5;
+                          text-style: bold; border-left: tall #7aa2f7; }
+#mp ListView > Contents { scrollbar-color: #2f3450 transparent; }
 """
 
 
@@ -226,7 +282,7 @@ class ToolCard(Static):
         return ""
 
     def __init__(self, name: str, args: dict):
-        super().__init__("", classes="tool", markup=True)
+        super().__init__("", classes="tool running", markup=True)
         self.tname = name
         self.args = args
         self.result: str | None = None
@@ -234,6 +290,15 @@ class ToolCard(Static):
         self._frame = STREAMING_CURSOR[0]
         self._t0 = time.monotonic()
         self._pending_text()
+
+    def _set_state(self, state: str):
+        """Swap the outcome rail color: running (gold) → ok (green) / failed
+        (red). The rail is the scan cue — you can read a long tool log by
+        color alone without reading any text."""
+        try:
+            self.set_classes(f"tool {state}")
+        except Exception:
+            pass
 
     def _head(self, mark: str) -> str:
         """One-line card header: status mark, icon, tool, headline, elapsed."""
@@ -268,8 +333,10 @@ class ToolCard(Static):
         if self.result is not None:
             ok = not self.result.startswith(("error", "denied")) and not __import__("re").search(r"^exit=(?!0(?:\s|$))-?\d+", self.result)
             mark = "[#9ece6a]✓[/]" if ok else "[#f7768e]✗[/]"
+            self._set_state("ok" if ok else "failed")
         else:
             mark = f"[#e0af68]{self._frame}[/]"   # still running
+            self._set_state("running")
         head = self._head(mark) + "\n"
         if self.diff:
             self.update(head + _diff_text(self.diff))
@@ -668,8 +735,18 @@ class KernApp(App):
         try:
             from .context import receipts
             if self.remote is not None:
-                fresh = Session(self.session.id)
-                self.session.events = fresh.events
+                # F1 (r3-tui): re-reading the whole journal every second
+                # blocked the UI thread on big files. stat() is one cheap
+                # syscall — re-parse only when the daemon actually appended.
+                try:
+                    st = self.session.log.stat()
+                    sig = (st.st_size, st.st_mtime_ns)
+                except OSError:
+                    sig = None
+                if sig is not None and sig != getattr(self, "_insp_log_sig", None):
+                    self._insp_log_sig = sig
+                    fresh = Session(self.session.id)
+                    self.session.events = fresh.events
             events = self.session.events
             objective = next((e.get('text','') for e in reversed(events) if e['kind']=='objective'), 'New session')
             self.query_one('#work-objective').update(objective[:600])
@@ -848,14 +925,21 @@ class KernApp(App):
             # (detaching the fresh one); esc/typing keeps the fresh session.
             # A blocking push_screen_wait here deadlocked startup whenever
             # any session existed (T23 regression caught it).
-            fut = asyncio.get_event_loop().create_future()
+            fut = asyncio.get_running_loop().create_future()   # F4
             self.push_screen(SessionPicker(rows, on_pick=fut))
 
             async def _startup_pick():
                 pick = await fut                  # resolves on dismiss
                 if pick and pick != "__new__":
                     await self._attach_remote(pick)
-            asyncio.ensure_future(_startup_pick())
+
+            def _pick_done(t):
+                # F4: an exception here would otherwise surface as
+                # "Task exception was never retrieved" noise.
+                if not t.cancelled() and t.exception() is not None:
+                    self._chat_error(f"session picker: {t.exception()!r}")
+            t = asyncio.ensure_future(_startup_pick())
+            t.add_done_callback(_pick_done)
 
         # Default path: start fresh session on daemon with user's model & cwd
         try:
@@ -1033,7 +1117,13 @@ class KernApp(App):
     def _remote_send_chat(self, text: str, media: dict | None = None):
         self._remote_running = True
         self._remote_turn_started()
-        asyncio.create_task(self._remote_send_chat_async(text, media=media))
+        t = asyncio.get_running_loop().create_task(
+            self._remote_send_chat_async(text, media=media))
+        # F4: never let a send failure vanish into "never retrieved"
+        def _send_done(task):
+            if not task.cancelled() and task.exception() is not None:
+                self._chat_error(f"send failed: {task.exception()!r}")
+        t.add_done_callback(_send_done)
 
     async def _remote_send_chat_async(self, text: str, media: dict | None = None):
         try:
@@ -1082,19 +1172,43 @@ class KernApp(App):
         entry = self._catalog.get(self.model, {})
         limit = entry.get("context_length") or (entry.get("limit") or {}).get("context")
         if limit:
-            res = f"ctx {used / limit * 100:.0f}% ({used:,}/{limit // 1000}k)"
+            pct = used / limit * 100
+            # color = pressure: calm green → amber → red as context fills
+            col = "#9ece6a" if pct < 60 else ("#e0af68" if pct < 85 else "#f7768e")
+            res = f"[{col}]ctx {pct:.0f}%[/] [dim]({used // 1000}k/{limit // 1000}k)[/]"
         else:
-            res = f"ctx≈{used:,}"
+            res = f"[dim]ctx≈{used:,}[/]"
         self._last_ctx_events_len = curr_len
         self._last_ctx_str = res
         return res
 
+    @staticmethod
+    def _k(key: str, word: str) -> str:
+        """A key-cap hint: the key sits on a small raised chip, the verb
+        beside it stays quiet. Reading the footer should feel like looking
+        at a keyboard, not a sentence."""
+        return f"[#c0caf5 on #2f3450] {key} [/] [dim]{word}[/]"
+
+    def _bar_hints(self) -> str:
+        # width-adaptive: the footer never wraps or truncates mid-hint —
+        # narrower terminals simply get fewer caps (the essential two first).
+        w = self.size.width if self.size else 120
+        k = self._k
+        if w >= 118:
+            return (f"{k('enter', 'send')}  {k('ctrl-c', 'stop')}  "
+                    f"{k('/help', 'commands')}  {k('ctrl-p', 'models')}  "
+                    f"{k('ctrl-r', 'resume')}  {k('ctrl-n', 'new')}")
+        if w >= 96:
+            return (f"{k('enter', 'send')}  {k('ctrl-c', 'stop')}  "
+                    f"{k('/help', 'commands')}  {k('ctrl-p', 'models')}")
+        return f"{k('enter', 'send')}  {k('ctrl-c', 'stop')}  {k('/help', 'commands')}"
+
     def _refresh_chrome(self):
         self._last_ctx_events_len = -1
         self.query_one("#tleft").update(
-            f" [bold]kern[/] [dim]·[/] [#9ece6a]{safe(self.model)}[/]")
+            f" [#7aa2f7 b]◆ kern[/] [dim]·[/] [#9ece6a]{safe(self.model)}[/]")
         self.query_one("#tright").update(
-            f"[dim]{self._short_cwd()}[/] [dim]·[/] [dim]{self.session.id}[/] ")
+            f"[dim]{safe(self._short_cwd())}[/] [dim]·[/] [dim]{safe(self.session.id)}[/] ")
 
     def _short_cwd(self):
         return self.cwd if len(self.cwd) < 46 else "…" + self.cwd[-45:]
@@ -1132,17 +1246,16 @@ class KernApp(App):
                 self._thinking_widget.set_frame(frame)
             if self._tool_card is not None:
                 self._tool_card.tick(frame)
-        self.query_one("#bar").update(
-            f" [dim]{right}[/]   "
-            f"[dim]enter send · ctrl-v image · ctrl-p models · ctrl-r resume · ctrl-n new · ctrl-c stop/quit · /help[/]")
+        self.query_one("#bar").update(f" {right}   {self._bar_hints()}")
 
     _verb = "thinking…"
 
     def _welcome(self):
         self.chat.mount(Static(
-            "[b]kern[/] [dim]v" + safe(KERN_VERSION) + "[/] — one model, no baggage.\n"
-            "[dim]ctrl-p models · ctrl-r resume · /new fresh · /help[/]\n"
-            "[dim]tools mount themselves: try[/] [mount: toy]",
+            "[#7aa2f7 b]◆ kern[/] [dim]v" + safe(KERN_VERSION) + "[/]\n"
+            "[dim]one model, no baggage — ask anything, watch it work.[/]\n"
+            "[dim]type[/] [#89ddff]/help[/] [dim]for commands · tools mount themselves: try[/] "
+            "[#89ddff][mount: toy][/]",
             classes="hello", markup=True))
         self.chat.scroll_end(animate=False)
 
@@ -1152,13 +1265,26 @@ class KernApp(App):
     def chat(self) -> VerticalScroll:
         return self.query_one("#chat")
 
+    # Sticky scroll: the chat follows the conversation ONLY while the user
+    # is at the bottom. Scroll up to read something mid-turn and kern stops
+    # yanking your view back down; scroll back to the bottom and following
+    # resumes automatically. 2-cell tolerance = "close enough to the end".
+    def _follow_end(self):
+        chat = self.chat
+        try:
+            at_end = (chat.max_scroll_y - chat.scroll_offset.y) <= 2
+        except Exception:
+            at_end = True
+        if at_end:
+            chat.scroll_end(animate=False)
+
     def _chat_note(self, text: str):
         self.chat.mount(Static(safe(text), classes="note", markup=True))
-        self.chat.scroll_end(animate=False)
+        self._follow_end()
 
     def _chat_error(self, text: str):
         self.chat.mount(Static(safe(text), classes="error", markup=True))
-        self.chat.scroll_end(animate=False)
+        self._follow_end()
 
     def chat_text(self) -> str:
         out = []
@@ -1206,7 +1332,7 @@ class KernApp(App):
                 self.chat.mount(self._thinking_widget)
             self._thinking_widget.append_thinking(text)
             self._verb = "thinking…"
-            self.chat.scroll_end(animate=False)
+            self._follow_end()
             return
         elif kind == "text":
             if self._thinking_widget is not None:
@@ -1234,7 +1360,7 @@ class KernApp(App):
                           "todo": "planning…", "proc": "checking process…"}.get(name, "working…")
             self._tool_card = ToolCard(name, args)
             self.chat.mount(self._tool_card)
-            self.chat.scroll_end(animate=False)
+            self._follow_end()
         elif kind == "result":
             if self._skip_result:
                 self._skip_result = False
@@ -1242,12 +1368,12 @@ class KernApp(App):
             if self._tool_card is not None:
                 self._tool_card.set_result(text)
             self._verb = "thinking…"
-            self.chat.scroll_end(animate=False)
+            self._follow_end()
         elif kind == "diff":
             if self._tool_card is not None:
                 self._tool_card.set_diff(text)
                 self._tool_card = None
-                self.chat.scroll_end(animate=False)
+                self._follow_end()
         elif kind == "todo":
             self._flush_stream()  # keep ordering: never mount a widget above buffered text
             import json as _json
@@ -1257,7 +1383,7 @@ class KernApp(App):
                 self.chat.mount(self._todo_card)
             else:
                 self._todo_card.render_items(items)
-            self.chat.scroll_end(animate=False)
+            self._follow_end()
         elif kind == "note":
             self._flush_stream()  # keep ordering: flush buffered text before a note
             self._chat_note("◈ " + text.splitlines()[0])
@@ -1273,7 +1399,7 @@ class KernApp(App):
                     self.chat.mount(self._compaction_widget)
                 else:
                     w.update(safe(text))
-                self.chat.scroll_end(animate=False)
+                self._follow_end()
                 return
 
             # Final summary arrived: dismiss any intermediate progress widget
@@ -1291,7 +1417,7 @@ class KernApp(App):
             self.chat.mount(Static(
                 safe("▤ context compacted — kept:\n" + body),
                 classes="note", markup=True))
-            self.chat.scroll_end(animate=False)
+            self._follow_end()
         elif kind == "handle":
             self._chat_note(f"⚙ background process {text} started")
 
@@ -1325,7 +1451,7 @@ class KernApp(App):
         tail = "" if text[-1:].isspace() else " "
         w.update(f"{text}{tail}{frame}")
         if grew:
-            self.chat.scroll_end(animate=False)
+            self._follow_end()
 
     def _flush_stream(self):
         # finalize thinking block if active
@@ -1456,7 +1582,7 @@ class KernApp(App):
         self._flush_stream()
         self.query_one("#status").display = False
         self.query_one("#prompt").focus()
-        self.chat.scroll_end(animate=False)
+        self._follow_end()
         # deliver queued steering
         if self._queue:
             nxt, nxt_media = self._queue.pop(0)
@@ -1557,8 +1683,24 @@ class KernApp(App):
         else:
             active_events = self.session.events
 
-        for ev in active_events:
-            self._render_one(ev, calls_by_id)
+        # F2 (r3-tui): even after a compact, the post-cutoff window can be
+        # thousands of events on long sessions — an unbounded widget tree.
+        # Show the newest 500 and point at the log for the rest.
+        REPLAY_CAP = 500
+        if len(active_events) > REPLAY_CAP:
+            skipped = len(active_events) - REPLAY_CAP
+            self.chat.mount(Static(
+                f"◈ {skipped} earlier events not replayed — full log in events.jsonl",
+                classes="note"
+            ))
+            active_events = active_events[-REPLAY_CAP:]
+
+        # Mount in ONE batch: every individual mount otherwise triggers a
+        # full layout pass of the chat column → O(n²) on resume (r3-tui F2).
+        # batch() defers refresh/layout until the whole replay is built.
+        with self.chat.batch():
+            for ev in active_events:
+                self._render_one(ev, calls_by_id)
 
         self._refresh_chrome()
         self.chat.scroll_end(animate=False)

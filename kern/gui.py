@@ -1293,6 +1293,14 @@ class Composer(QFrame):
 
         # clipboard-image attachment chip (ctrl+v with an image)
         self._images: list[dict] = []
+        # G2: a real 26px thumbnail — see WHAT you're about to send, not a
+        # faceless "image attached" label. Rounded corners via mask.
+        self._img_thumb = QLabel("")
+        self._img_thumb.setFixedSize(26, 26)
+        self._img_thumb.setStyleSheet(
+            f"border: 1px solid {LINE_SOFT}; border-radius: 5px; background: {BG_2};")
+        self._img_thumb.setVisible(False)
+        bar.addWidget(self._img_thumb)
         self._img_chip = QLabel("")
         self._img_chip.setStyleSheet(
             f"color: {ACCENT}; font-size: 10.5px; border: 1px solid {LINE_SOFT};"
@@ -1385,6 +1393,31 @@ class Composer(QFrame):
         if self._img_chip is not None:
             self._img_chip.setText("")
             self._img_chip.setVisible(False)
+        if self._img_thumb is not None:
+            self._img_thumb.setPixmap(QPixmap())
+            self._img_thumb.setVisible(False)
+
+    def _set_thumb(self, img: dict | None):
+        """G2: decode the attached image and show a 26px thumbnail so the
+        user SEES what they're about to send. Any decode failure degrades
+        to just hiding the thumbnail — the chip still shows the size."""
+        if self._img_thumb is None or img is None:
+            return
+        try:
+            import base64 as _b64
+            from PySide6.QtGui import QImage
+            raw = _b64.b64decode(img.get("data", ""))
+            qimg = QImage.fromData(raw)
+            if qimg.isNull():
+                self._img_thumb.setVisible(False)
+                return
+            pm = QPixmap.fromImage(qimg).scaled(
+                24, 24, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation)
+            self._img_thumb.setPixmap(pm)
+            self._img_thumb.setVisible(True)
+        except Exception:
+            self._img_thumb.setVisible(False)
 
     def _grab_clip_image(self):
         """Try Qt clipboard first (native, no subprocess), fall back to the
@@ -1429,13 +1462,17 @@ class Composer(QFrame):
             return True
         self._images.append(img)
         kb = len(img["data"]) * 3 // 4 // 1024
-        self._img_chip.setText(f"🖼 image attached ({kb} KB)")
+        self._img_chip.setText(f"image · {kb} KB")
         self._img_chip.setVisible(True)
+        self._set_thumb(img)
         return True
 
     def _note(self, msg: str):
         self._img_chip.setText(msg)
         self._img_chip.setVisible(True)
+        if self._img_thumb is not None:
+            self._img_thumb.setPixmap(QPixmap())
+            self._img_thumb.setVisible(False)
 
     def eventFilter(self, obj, ev):
         if obj is self.edit and ev.type() == ev.Type.KeyPress:
