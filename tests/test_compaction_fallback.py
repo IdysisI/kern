@@ -127,38 +127,47 @@ def _span():
     return span
 
 
-def _fold(client, budget='0.6', frac='0.4'):
+def _fold(client, stall='0.5'):
+    """Run one fold under the new liveness contract: KERN_FOLD_STALL is the
+    per-chunk inactivity watchdog (no total budget; KERN_FOLD_BUDGET ignored).
+    Returns (engine, ctx, ok) where ok is fold()'s return value: True = episode
+    emitted, False = aborted without touching context."""
     from kern.context import ContextManager as Context
     e = FakeEngine(client)
     ctx = Context(e)
     span = _span()
     e.session.events = list(span)
-    os.environ['KERN_FOLD_BUDGET'] = budget
-    os.environ['KERN_FOLD_RETRY_FRAC'] = frac
+    os.environ['KERN_FOLD_STALL'] = stall
+    os.environ['KERN_FOLD_BUDGET'] = '0.1'   # legacy knob: must be ignored
     try:
-        asyncio.run(ctx.fold(span, 0, span[-1]['n']))
+        ok = asyncio.run(ctx.fold(span, 0, span[-1]['n']))
     finally:
+        os.environ.pop('KERN_FOLD_STALL', None)
         os.environ.pop('KERN_FOLD_BUDGET', None)
-        os.environ.pop('KERN_FOLD_RETRY_FRAC', None)
-    return e, ctx
+    return e, ctx, ok
 
 
-# ------------------------------------------------ 1. degraded fallback is informative
+# ------------------------------------------------ 1. stalled fold aborts, context survives
 
-def test_degraded_fallback_carries_real_payload():
-    """Budget expiry must still keep tool names+args, result summaries and
-    assistant reasoning — not blank 'N action: ' stubs."""
-    e, _ = _fold(SlowClient(latency=5.0))
-    assert e.session.emitted, 'no episode emitted'
-    text = e.session.emitted[-1][1].get('text', '')
-    assert 'degraded' in text or 'unverified_index' in text, 'expected degraded episode'
-    for needle in ('kern/parser.py', 'def parse(tokens) found',
-                   'tokenizer drops token', 'rewrite lexer'):
-        assert needle in text, f'degraded episode lost payload: {needle!r} not in episode'
-    # no blank stubs: every rendered line must carry content after the kind tag
-    import re
-    blanks = re.findall(r'^\d+ (?:action|tool_result|assistant|user): ?$', text, re.M)
-    assert not blanks, f'degraded episode contains {len(blanks)} blank stub lines'
+def test_stalled_fold_aborts_and_keeps_context():
+    """NEW CONTRACT: when the summarizer stalls (no stream data for
+    KERN_FOLD_STALL seconds), fold must ABORT — no episode, original span stays
+    in view verbatim, explicit abort note. The old behavior (budget expiry →
+    degraded raw-index episode that then HID the span behind pager episodes)
+    destroyed context out of nowhere; that must never happen again."""
+    e, _ctx, ok = _fold(SlowClient(latency=5.0), stall='0.4')
+    assert ok is False, 'a stalled fold must report failure'
+    episodes = [ev for ev in e.session.emitted if ev[0] == 'episode']
+    assert not episodes, 'aborted fold must NOT emit an episode'
+    aborts = [ev for ev in e.session.emitted if ev[0] == 'fold_abort']
+    assert aborts, 'aborted fold must record a fold_abort event'
+    text = aborts[0][1].get('text', '')
+    assert 'stall' in text.lower(), f'abort reason missing stall detail: {text!r}'
+    # context kept: every original span event still in place (the harness's
+    # emit() APPENDS the fold_abort event itself, so compare the span prefix)
+    span = _span()
+    assert e.session.events[:len(span)] == span, \
+        'span was modified/destroyed by an aborted fold'
 
 
 def test_digest_renders_every_event_kind():
@@ -177,23 +186,29 @@ def test_digest_renders_every_event_kind():
 # ------------------------------------------------ 2. retry wave rescues stalled chunks
 
 def test_stalled_chunks_rescued_by_retry_wave():
-    """Wave-1 calls that stall must be cancelled at the wave deadline and retried
-    with a small digest inside the reserved slice -> real LLM summary, not index."""
-    e, _ = _fold(StalledThenFastClient(stall_calls=1, stall=30.0),
-                 budget='2.0', frac='0.6')
+    """A wave-1 call that stalls must be cut by the inactivity watchdog and
+    retried once with a small digest -> real LLM summary, not an abort."""
+    e, _ctx, ok = _fold(StalledThenFastClient(stall_calls=1, stall=30.0),
+                        stall='0.5')
+    assert ok is not False, 'retry pass should have rescued the stalled chunk'
     assert e.session.emitted, 'no episode emitted'
     text = e.session.emitted[-1][1].get('text', '')
     assert 'llm summary' in text, \
         f'retry wave did not produce an LLM summary; episode head: {text[:200]!r}'
-    assert 'unverified_index' not in text, 'fell back to raw index despite retry budget'
+    assert 'unverified_index' not in text, 'fell back to raw index despite retry pass'
 
 
 def test_chunk_never_silently_dropped():
-    """If BOTH waves fail, the chunk must still appear as a digest (backstop)."""
-    e, _ = _fold(SlowClient(latency=30.0), budget='0.5', frac='0.4')
-    text = e.session.emitted[-1][1].get('text', '')
-    # every source event kind must be represented somewhere in the episode
-    assert 'kern/parser.py' in text, 'chunk vanished from episode entirely'
+    """If BOTH the first pass and the retry pass fail, the fold must ABORT and
+    the span must remain in context verbatim — never replaced by stubs."""
+    e, _ctx, ok = _fold(SlowClient(latency=30.0), stall='0.3')
+    assert ok is False, 'a fully-failed fold must report failure'
+    episodes = [ev for ev in e.session.emitted if ev[0] == 'episode']
+    assert not episodes, 'fully-failed fold must not emit an episode'
+    # every source event is still in context — nothing was dropped
+    span = _span()
+    assert e.session.events[:len(span)] == span, \
+        'failed fold dropped/modified the original span'
 
 
 # ------------------------------------------------ 3. no duplicate overlapping folds
@@ -227,7 +242,8 @@ def test_no_duplicate_overlapping_folds():
 # ------------------------------------------------ 4. UI gets a one-liner, not the JSON
 
 def test_ui_stream_is_a_oneline_status():
-    e, _ = _fold(SlowClient(latency=5.0))
+    e, _ctx, ok = _fold(SlowClient(latency=5.0), stall='10')   # healthy, just slow
+    assert ok is not False, 'slow-but-streaming fold must succeed'
     assert e.notes, 'no stream notes emitted'
     ui = [t for t in e.notes if 'compacted' in t]
     assert ui, f'no compaction status note; got {e.notes[:3]}'

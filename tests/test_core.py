@@ -439,6 +439,11 @@ async def test_distinct_py_reads_do_not_trip_breaker(tmp_path, monkeypatch):
     Uses the `read` tool (deterministic, no subprocess) but the SAME breaker code path:
     _inspection_target extracts each distinct path -> novel -> counter stays at 1."""
     monkeypatch.setenv('KERN_INSPECTION_BREAK', '5')
+    # Large window so background compaction never triggers: its fold calls
+    # share this fake client and would consume model turns, making the
+    # journaled-read count depend on the compaction schedule instead of the
+    # breaker invariant under test.
+    monkeypatch.setenv('KERN_CONTEXT_WINDOW', '262144')
     n = 0
     files = []
     for i in range(25):

@@ -119,21 +119,28 @@ def test_fold_emits_live_progress():
 
 
 def test_fold_respects_time_budget():
-    """With a tiny budget and a slow model, fold must finish near the budget,
-    keeping a degraded raw index rather than blocking for every batch."""
-    e, ctx = _make_engine(latency=5.0)  # each LLM call "takes" 5s
-    span = e.session.events
-    os.environ['KERN_FOLD_BUDGET'] = '0.5'
+    """A silent/stalled provider (no stream chunks for KERN_FOLD_STALL seconds)
+    must be cut by the inactivity watchdog quickly and the fold must ABORT —
+    emitting no episode and leaving the span in context. There is no total
+    wall-clock budget anymore; see test_fold_liveness for the streaming case."""
+    e, ctx = _make_engine(latency=5.0)  # each call sleeps 5s BEFORE any chunk
+    span = list(e.session.events)
+    e.session.events = list(span)
+    os.environ['KERN_FOLD_STALL'] = '0.5'   # watchdog < 5s silence -> abort
+    os.environ['KERN_FOLD_BUDGET'] = '0.5'  # legacy knob: must be ignored
     try:
         t0 = time.monotonic()
-        asyncio.run(ctx.fold(span, 0, span[-1]['n']))
+        ok = asyncio.run(ctx.fold(span, 0, span[-1]['n']))
         elapsed = time.monotonic() - t0
     finally:
+        os.environ.pop('KERN_FOLD_STALL', None)
         os.environ.pop('KERN_FOLD_BUDGET', None)
-    assert elapsed < 3.0, f'fold blew past budget: {elapsed:.2f}s'
-    assert e.session.emitted, 'no episode emitted'
-    text = e.session.emitted[-1][1].get('text', '')
-    assert text, 'empty episode text'
+    assert ok is False, 'a silent provider must abort the fold'
+    assert elapsed < 3.0, f'stall watchdog too slow: {elapsed:.2f}s'
+    assert not [ev for ev in e.session.emitted if ev[0] == 'episode'], \
+        'aborted fold must not emit an episode'
+    assert [ev for ev in e.session.emitted if ev[0] == 'fold_abort'], \
+        'aborted fold must record a fold_abort event'
 
 
 def test_prepare_does_not_block_on_fold():

@@ -294,16 +294,22 @@ class ContextManager:
                     # emitting duplicate overlapping episodes (1800–3311 + 1800–3314).
                     self._fold_pending = (cutoff, end)
                     try:
-                        await self.fold(span, cutoff, end)
+                        folded = await self.fold(span, cutoff, end)
                     finally:
                         self._fold_pending = None
-                    view = pager.materialize(e.session.events, e.session)
-                    size = estimate(view, system, tools)
+                    if folded is not False:
+                        view = pager.materialize(e.session.events, e.session)
+                        size = estimate(view, system, tools)
         e.context_stats = {'estimated_tokens': size, 'context_length': window,
                            'available_input': available, 'target': target, 'estimate': True}
         if size > available:
-            raise RuntimeError(f'context needs approximately {size} tokens; input allowance {available}. '
-                               'Use memory history/artifact slices or configure the verified model context window.')
+            aborted = (' Compaction ran but ABORTED (summarizer stalled or failed):'
+                       ' nothing was removed — retry when the model responds, or'
+                       ' start a fresh session.'
+                       if getattr(self, '_fold_failures', 0) else '')
+            raise RuntimeError(f'context needs approximately {size} tokens; input allowance {available}.'
+                               + aborted +
+                               ' Use memory history/artifact slices or configure the verified model context window.')
         e.output_budget = min(default_max_output_tokens(e.model), max(256, window-size-1024))
         return self._with_recall(self._with_repo_context(view, e), e)
 
@@ -445,6 +451,13 @@ class ContextManager:
         task = getattr(self, '_fold_task', None)
         if task is not None and not task.done():
             return  # a fold is already running; don't pile up
+        # After an ABORTED fold (summarizer stalled/failed) wait out a cooldown
+        # before scheduling another — otherwise every turn would re-attempt the
+        # same doomed fold against a dead/slow provider.
+        if getattr(self, '_fold_failures', 0):
+            cooldown = float(os.environ.get('KERN_FOLD_FAIL_COOLDOWN', '300'))
+            if _time.monotonic() - getattr(self, '_fold_fail_at', 0.0) < cooldown:
+                return
         import asyncio as _a
         try:
             loop = _a.get_running_loop()
@@ -562,30 +575,33 @@ class ContextManager:
 
         summaries = [None] * len(batches)
         total = len(batches)
-        # Hard wall-clock budget: compaction must be seconds, not minutes.
-        # Past this we stop calling the model and keep deterministic source indexes.
-        fold_budget = float(os.environ.get('KERN_FOLD_BUDGET', '60'))
+        # Liveness rule: there is NO total wall-clock budget for folding anymore.
+        # The old KERN_FOLD_BUDGET=60s killed slow-but-streaming models
+        # mid-response and then "preserved" raw-index stubs — context destroyed
+        # while the model was still working. Now every chunk gets a re-arming
+        # inactivity watchdog (KERN_FOLD_STALL): it fires ONLY when the stream
+        # has been silent for that long. A model that keeps producing tokens is
+        # waited on indefinitely; a dead/silent model is stopped, and then the
+        # fold ABORTS (no episode emitted, original span stays in view).
+        fold_stall = float(os.environ.get('KERN_FOLD_STALL', '90'))
         fold_concurrency = max(1, int(os.environ.get('KERN_FOLD_CONCURRENCY', '8')))
         # events per chunk fed to the summarizer as an attributed digest
         DIGEST_CAP = max(60, int(os.environ.get('KERN_FOLD_DIGEST_CAP', '240')))
-        deadline = _time.monotonic() + fold_budget
-        # Wave 1 gets the budget minus a reserved retry slice: chunks whose call
-        # stalls (API queueing) are cancelled at wave1_deadline and retried once
-        # with a much smaller digest inside the remaining slice. Without the
-        # reservation a stalled chunk could only fall back to the raw index.
-        retry_budget = fold_budget * float(os.environ.get('KERN_FOLD_RETRY_FRAC', '0.4'))
-        wave1_deadline = _time.monotonic() + max(0.0, fold_budget - retry_budget)
+        # No shared deadline: each chunk is guarded by its own re-arming
+        # inactivity watchdog (fold_stall). A chunk that fails (silent stream or
+        # API error) gets ONE retry pass with a much smaller digest; if any chunk
+        # still fails, the whole fold ABORTS without emitting an episode, so the
+        # original span stays fully in view — a fold failure can never destroy
+        # context. (KERN_FOLD_BUDGET / KERN_FOLD_RETRY_FRAC are obsolete.)
         llm_done = 0
+        failures = {}
 
         if total:
             e.stream_cb('summary', f'⟳ compacting {end - start} events '
                         f'({total} chunk{"s" if total > 1 else ""})…')
 
-        async def _fold_one(bi, batch, cap, dl):
+        async def _fold_one(bi, batch, cap):
             nonlocal llm_done
-            remaining = dl - _time.monotonic()
-            if remaining <= 0:
-                return
             # Summarize a compact attributed digest, not the raw batch JSON: raw
             # batches reached ~59k chars (~15k tokens) per chunk, so under API load
             # every parallel call missed the shared deadline -> 0/4 chunks and a
@@ -602,10 +618,15 @@ class ContextManager:
             try:
                 if estimate([{'role':'user','text':prompt}]) > window-output_budget-512:
                     raise ValueError('summary batch exceeds verified context; source index retained')
-                async with asyncio.timeout(remaining):
+                # Re-arming inactivity watchdog: reschedule() on EVERY stream
+                # event, so a model that keeps producing tokens is waited on
+                # indefinitely; only genuine silence for fold_stall seconds ends
+                # the chunk (TimeoutError -> retry pass -> abort, see below).
+                async with asyncio.timeout(fold_stall) as _wdog:
                     async for chunk in e.client.stream_chat(e.model, [{'role':'user','text':prompt}],
                             system='You create attributed navigation notes for an agent journal. Output only JSON.',
                             tools=None, max_tokens=output_budget):
+                        _wdog.reschedule(_time.monotonic() + fold_stall)
                         if chunk.kind == 'text':
                             answer += chunk.text
                         elif chunk.kind == 'error':
@@ -616,40 +637,50 @@ class ContextManager:
                 data = json.loads(answer.strip().removeprefix('```json').removesuffix('```').strip())
                 summaries[bi] = summary_fields(data)
                 llm_done += 1
-            except TimeoutError:
-                # Budget expired mid-call: leave the chunk empty so the retry wave
-                # (smaller digest, reserved time slice) gets a chance at it.
-                return
+            except (TimeoutError, asyncio.TimeoutError):
+                # The stream went silent for fold_stall seconds — a dead/hung
+                # provider, not a slow-but-progressing model. Leave the chunk
+                # None; the retry pass gets one shot with a tiny digest.
+                failures[bi] = f'stalled: no stream data for {fold_stall:.0f}s'
             except Exception as err:
-                # Safe fallback is an explicit source index, not a fabricated summary.
-                # _digest_events renders each event ACTUAL payload (tool name+args,
-                # result summary/excerpt+status, assistant text); the old
-                # x.get("text","") form emitted mostly-empty stubs for tool_result
-                # and action items, so degraded episodes carried no information.
-                summaries[bi] = {'unverified_index': _digest_events(batch).splitlines(),
-                                 'summary_error': str(err)[:200]}
+                # Record and leave None — NEVER degrade to raw-index stubs (the
+                # old fallback produced information-free episodes that then hid
+                # the real span behind pager episodes: context destroyed).
+                failures[bi] = f'{type(err).__name__}: {err}'[:200]
             if total > 1:
                 e.stream_cb('summary', f'⟳ compacting… {min(llm_done, total)}/{total} chunks')
 
         sem = asyncio.Semaphore(fold_concurrency)
-        async def _guarded(bi, batch, cap, dl):
+        async def _guarded(bi, batch, cap):
             async with sem:
-                await _fold_one(bi, batch, cap, dl)
-        await asyncio.gather(*[_guarded(i, b, DIGEST_CAP, wave1_deadline) for i, b in enumerate(batches)])
-        # Second wave: chunks skipped because the shared deadline expired (API
-        # load/queueing) are retried once with a much smaller digest while budget
-        # remains — a partial LLM summary beats a fully degraded episode.
-        if llm_done < total and _time.monotonic() < deadline:
-            retry = [(i, b) for i, b in enumerate(batches) if summaries[i] is None]
-            if retry:
-                await asyncio.gather(*[_guarded(i, b, max(40, DIGEST_CAP // 4), deadline)
-                                        for i, b in retry])
-        for i, b in enumerate(batches):
-            if summaries[i] is None:
-                summaries[i] = {'unverified_index': _digest_events(b).splitlines(),
-                                'summary_error': 'budget exhausted'}
+                await _fold_one(bi, batch, cap)
+        await asyncio.gather(*[_guarded(i, b, DIGEST_CAP) for i, b in enumerate(batches)])
+        # Retry pass: any chunk that stalled or errored gets ONE more attempt
+        # with a much smaller digest (its own fresh stall watchdog). No shared
+        # deadline — a retry is only skipped if it already succeeded.
+        missing = [i for i in range(len(batches)) if summaries[i] is None]
+        if missing:
+            for i in missing:
+                failures.pop(i, None)
+            await asyncio.gather(*[_guarded(i, batches[i], max(40, DIGEST_CAP // 4))
+                                    for i in missing])
+        # ALL-OR-NOTHING: if any chunk still failed after the retry pass, ABORT
+        # the fold entirely — emit no episode so the original span stays fully
+        # in view (the raw batch file in scratch is untouched by this). The
+        # cooldown gate in _schedule_fold keeps this from hot-looping.
+        missing = [i for i in range(len(batches)) if summaries[i] is None]
+        if missing:
+            reasons = [failures.get(i, 'chunk failed') for i in missing[:3]]
+            note = (f'⚠ compaction aborted: {len(missing)}/{len(batches)} chunks '
+                    f'could not be summarized ({"; ".join(reasons)}). '
+                    f'Context kept as-is — nothing was removed.')
+            e.stream_cb('summary', note)
+            e.session.emit('fold_abort', start=start, end=end, text=note)
+            self._fold_failures = getattr(self, '_fold_failures', 0) + 1
+            self._fold_fail_at = _time.monotonic()
+            return False
+        self._fold_failures = 0
         summaries = [s for s in summaries if s is not None]
-        degraded = llm_done < total
 
         # M1: deterministic structured ledger from the RAW span (0 LLM calls).
         # The LLM summary above is a navigation aid (P2); this structured record
@@ -684,8 +715,6 @@ class ContextManager:
         text = json.dumps({'summaries': summaries, 'ledger': structured}, ensure_ascii=False)
         e.session.emit('episode', start=start, end=end, source=str(source), text=text)
         done_note = f'Episode {start}–{end}: attributed navigation notes ({llm_done}/{total} chunks summarized); original: {source}\n{text}'
-        if degraded:
-            done_note = f'[degraded: budget {fold_budget:.0f}s reached] ' + done_note
         # M4: consolidate durable facts into attributed project memory (deterministic,
         # 0 LLM). Only high-signal user constraints/decisions and (when no episodic
         # projection is available) the goal itself are promoted to atoms — the
@@ -701,10 +730,9 @@ class ContextManager:
         # ledger) into the user's terminal — the "wall of JSON" on every compaction.
         # The UI gets a one-line status; the model keeps the detail in the journal.
         ui_note = (f'⟳ context compacted — episode {start}–{end} '
-                   f'({llm_done}/{total} chunks summarized'
-                   + (f', degraded: budget {fold_budget:.0f}s reached' if degraded else '')
-                   + f'); source: {source}')
+                   f'({llm_done}/{total} chunks summarized); source: {source}')
         e.stream_cb('summary', ui_note)
+        return True
 
     _CONSTRAINT_MARK = (
         'always', 'never', 'must', 'do not', "don't", 'prefer', 'limit', 'at most',

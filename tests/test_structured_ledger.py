@@ -88,8 +88,14 @@ def test_fold_emits_structured_ledger(tmp_path):
 
 
 def test_fold_ledger_survives_llm_failure(tmp_path, monkeypatch):
-    """Even when the model fails entirely, the structured ledger is emitted."""
+    """NEW CONTRACT: when the model fails entirely the fold ABORTS — it emits no
+    episode (the original span stays in view verbatim, so nothing is lost) and
+    records a fold_abort. This supersedes the old 'emit a degraded ledger'
+    behavior: keeping the real span beats any synthetic fallback."""
     from kern.context import ContextManager
+
+    monkeypatch.setenv('KERN_FOLD_STALL', '0.4')
+    monkeypatch.setenv('KERN_FOLD_BUDGET', '0.5')   # legacy: ignored
 
     class DeadClient:
         async def stream_chat(self, *a, **k):
@@ -101,8 +107,10 @@ def test_fold_ledger_survives_llm_failure(tmp_path, monkeypatch):
     ctx = ContextManager(e)
     span = [{'n': 1, 'kind': 'tool_result', 'name': 'exec', 'status': 'error',
              'text': 'boom'}]
-    asyncio.run(ctx.fold(span, 0, 1))
+    ok = asyncio.run(ctx.fold(span, 0, 1))
+    assert ok is False, 'a dead model must abort the fold'
     eps = [kw for k, kw in e.session.emitted if k == 'episode']
-    assert eps
-    payload = json.loads(eps[-1]['text'])
-    assert payload['ledger']['tool_errors'].get('exec') == 1
+    assert not eps, 'aborted fold must not emit an episode (would destroy context)'
+    aborts = [kw for k, kw in e.session.emitted if k == 'fold_abort']
+    assert aborts, 'aborted fold must record a fold_abort event'
+    assert aborts[-1].get('start') == 0 and aborts[-1].get('end') == 1

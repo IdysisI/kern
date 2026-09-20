@@ -121,23 +121,32 @@ async def test_fold_streams_progress_and_loop_stays_alive(tmp_path, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_fold_respects_budget_under_slow_llm(tmp_path, monkeypatch):
-    # A pathologically slow LLM (longer than the budget) must still terminate.
-    monkeypatch.setenv('KERN_FOLD_BUDGET', '0.5')
+async def test_legacy_budget_ignored_healthy_stream_waited_out(tmp_path, monkeypatch):
+    # NEW CONTRACT: no total wall-clock budget. A model that keeps streaming is
+    # waited on until it finishes; only inactivity (KERN_FOLD_STALL) stops a
+    # chunk, and then the fold ABORTS without emitting an episode. The legacy
+    # KERN_FOLD_BUDGET knob must be ignored entirely.
+    monkeypatch.setenv('KERN_FOLD_BUDGET', '0.5')   # legacy: must be ignored
+    monkeypatch.setenv('KERN_FOLD_STALL', '0.4')    # watchdog > inter-chunk 0.1s
     monkeypatch.setenv('KERN_FOLD_CONCURRENCY', '1')
     import kern.context as kc
     monkeypatch.setattr(kc, 'health_of', lambda m: _Health(), raising=False)
 
     eng = FakeEngine(tmp_path)
-    eng.client = SlowClient(chunks=100, delay=0.1)   # 10s of LLM >> 0.5s budget
+    eng.client = SlowClient(chunks=10, delay=0.1)   # ~1s healthy stream > 0.5s "budget"
     cm = ContextManager.__new__(ContextManager)
     cm.engine = eng
     cm._last_user = 'goal'
 
     t0 = time.monotonic()
-    await cm.fold(_span(4), 0, 4)
+    ok = await cm.fold(_span(4), 0, 4)
     elapsed = time.monotonic() - t0
-    # fold must bail out near the budget, not run the full 10s
-    assert elapsed < 5.0, f'fold overran budget: {elapsed:.2f}s'
-    assert any(k == 'episode' for (k, _kw) in eng.session.emitted)
-    print(f'\n[budget] fold terminated in {elapsed:.3f}s (budget 0.5s) despite 10s LLM')
+    # fold waited for the FULL stream despite the legacy 0.5s budget
+    assert elapsed >= 0.9, f'fold cut a healthy stream short: {elapsed:.2f}s'
+    assert ok is not False, 'healthy stream must not abort'
+    episodes = [kw for (k, kw) in eng.session.emitted if k == 'episode']
+    assert len(episodes) == 1, 'exactly one episode expected'
+    assert 'unverified_index' not in episodes[0].get('text', ''), \
+        'episode must carry the real summary, not raw-index stubs'
+    print(f'\n[liveness] healthy stream waited out in {elapsed:.3f}s '
+          f'(legacy 0.5s budget ignored, stall watchdog armed)')
