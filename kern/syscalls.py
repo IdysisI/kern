@@ -1177,10 +1177,51 @@ import atexit
 atexit.register(cleanup_procs)
 
 
-def tool_todo(items: list[dict]) -> tuple[str, dict]:
-    if not isinstance(items, list) or any(not isinstance(i, dict) or not isinstance(i.get("text"), str)
-            or i.get("status") not in ("pending", "active", "done", "blocked") for i in items):
+_TODO_STATUSES = ("pending", "active", "done", "blocked")
+
+
+def _coerce_todo_items(items):
+    """Tolerant coercion: a small model's `items` may arrive as a list of
+    strings (typed without status), a single string, or a JSON-string list.
+    Coerce to the canonical [{text, status}] form; return None if hopeless."""
+    if isinstance(items, str):
+        # JSON-encoded list, or a single task line
+        stripped = items.strip()
+        if stripped.startswith("["):
+            import json as _json
+            try:
+                items = _json.loads(stripped)
+            except Exception:
+                items = [stripped]
+        else:
+            items = [stripped]
+    if not isinstance(items, list):
+        return None
+    out = []
+    for it in items:
+        if isinstance(it, dict):
+            text = it.get("text")
+            status = it.get("status", "pending")
+        elif isinstance(it, str):
+            text, status = it, "pending"
+        else:
+            return None
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if status not in _TODO_STATUSES:
+            status = "pending" if str(status) not in _TODO_STATUSES else status
+        out.append({"text": text, "status": status})
+    return out or None
+
+
+def tool_todo(items) -> tuple[str, dict]:
+    if isinstance(items, list) and not items:
+        # Empty plan update = clearing the plan — a real, recordable action.
+        return "todo cleared", {"todo": []}
+    coerced = _coerce_todo_items(items)
+    if coerced is None:
         return 'error: items must contain text and status pending|active|done|blocked', {"status": "failed"}
+    items = coerced
     n = len(items)
     done = sum(1 for i in items if i.get("status") == "done")
     return f"todo updated: {done}/{n} done", {"todo": items}
