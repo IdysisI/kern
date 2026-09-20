@@ -63,3 +63,23 @@ def test_forget_real_run_still_works(tmp_path):
     t.remember("the cache timeout is 30 seconds")
     t.forget("cache")
     assert not any("cache" in r["text"] for r in t._rows())
+
+
+def test_reconcile_flags_conflicting_unkeyed_claims(tmp_path):
+    # Two contradictory unkeyed facts must NOT be presented as settled truth.
+    t = MemoryTree(str(tmp_path))
+    t.remember("max retries is 3", topic="cfg")
+    t.remember("max retries is 5", topic="cfg")  # correction, no shared key
+    out = t.reconcile("cfg")
+    assert "competing claims" in out
+    assert "verify" in out.lower()
+    # both still present (nothing silently dropped)
+    assert "max retries is 3" in out and "max retries is 5" in out
+
+
+def test_reconcile_single_claim_no_conflict_flag(tmp_path):
+    t = MemoryTree(str(tmp_path))
+    t.remember("the db host is db.internal", topic="cfg")
+    out = t.reconcile("cfg")
+    assert "competing claims" not in out
+    assert "db.internal" in out

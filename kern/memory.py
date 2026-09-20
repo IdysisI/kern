@@ -188,14 +188,15 @@ class MemoryTree:
         return 0
 
     def reconcile(self, topic):
-        """Return the active claims for a topic, resolving contradictions.
+        """Return the active claims for a topic, FLAGGING contradictions.
 
         M3 hygiene: notes sharing the same ``key`` are already superseded at
-        write time. For *unkeyed* notes that assert conflicting values about the
-        same subject, we surface only the newest / highest-source-rank claim as
-        'current' and list the rest as 'superseded candidates', so retrieval
-        never silently returns a stale or self-contradicting set. Raw rows are
-        untouched (nothing is deleted — decay lowers rank, never deletes).
+        write time, and identical unkeyed notes are deduped here. For *unkeyed*
+        notes that assert conflicting values about the same subject, we do NOT
+        silently pick a winner (could be complementary facts) — we surface a
+        '⚠ N competing claims' warning so the model verifies instead of
+        trusting a silent contradiction. Raw rows are untouched (nothing is
+        deleted — decay lowers rank, never deletes).
         """
         rows = [r for r in self._rows() if r['topic'] == topic]
         if not rows:
@@ -213,9 +214,20 @@ class MemoryTree:
                 continue
             seen.add(k)
             current.append(r)
-        lines = [f'Attributed claims for "{topic}" (current; {len(superseded)} duplicate/conflicting elided):']
+        # Conflict surface (audit R7): multiple *distinct* active claims on one
+        # topic is exactly the "max retries is 3" vs "is 5" case. We never
+        # silently drop them (could be complementary facts), but we DO flag the
+        # ambiguity so the model verifies instead of trusting a contradiction.
+        conflict = len(current) > 1
+        header = f'Attributed claims for "{topic}" (current; {len(superseded)} duplicate elided):'
+        if conflict:
+            header = (f'⚠ {len(current)} competing claims for "{topic}" — verify before relying '
+                      f'({len(superseded)} duplicate elided). To resolve: remember(corrected_text, '
+                      f'topic="{topic}", key=<shared_key>) then forget the losers:')
+        lines = [header]
         for r in current:
-            lines.append(f"note:{r['id']}: {r['text']} [source:{r['source']}]")
+            flag = '' if conflict else ''
+            lines.append(f"note:{r['id']}:{flag} {r['text']} [source:{r['source']}]")
         if superseded:
             lines.append('Elided as duplicate/lower-rank (recoverable via history):')
             for r in superseded:
