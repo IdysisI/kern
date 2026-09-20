@@ -1673,6 +1673,13 @@ class Engine:
                                               text=_sl, status="slate",
                                               constraint="slate")
                             self.stream_cb("result", _sl)
+                            # F5 (audit R5): slate-hit short-circuit must also
+                            # reset the inspection counter, otherwise the
+                            # breaker still fires after 20 efficient
+                            # re-references. This bypasses the post-execution
+                            # sensor below, so we reset here.
+                            self._consecutive_inspections = 0
+                            self._last_inspection_target = None
                             continue
                     # Action receipt: record intent BEFORE the effect, so a
                     # crash mid-call leaves a dangling intent the pager can
@@ -1783,12 +1790,20 @@ class Engine:
                 # F5 (audit R5): a slate-hit read is NOT an inspection — the model
                 # asked about content it already holds and got a pointer, not a
                 # fresh disk read. Treat it as progress so the breaker never fires
-                # on efficient re-reference. Only raw disk reads count toward the
-                # breaker. The architecture makes correct behaviour the cheap path.
-                _slate_hit = bool(isinstance(meta, dict) and meta.get("fileslate") == "hit")
-                if _slate_hit or _step_is_progress(name, args):
+                # on efficient re-reference. Same for dedup-cache hits (constraint
+                # = 'dedup', meta from constraints.mark_dedup): the result came
+                # from the session cache, no new observation happened. Only raw
+                # disk reads and novel observations count toward the breaker.
+                # The architecture makes correct behaviour the cheap path.
+                _meta = meta if isinstance(meta, dict) else {}
+                _from_cache = (
+                    _meta.get("fileslate") == "hit"
+                    or _meta.get("constraint") == "dedup"
+                    or str(_meta.get("status") or "").startswith("cached")
+                )
+                if _from_cache or _step_is_progress(name, args):
                     _dbg(self.session, "breaker.progress_reset", step=attempt, tool=name,
-                         was_consecutive=self._consecutive_inspections, slate_hit=_slate_hit)
+                         was_consecutive=self._consecutive_inspections, from_cache=_from_cache)
                     self._consecutive_inspections = 0
                 else:
                     tgt = _inspection_target(name, args)

@@ -289,6 +289,42 @@ async def test_file_state_visible_in_slate(tmp_path):
     assert "a.py" in slate and "do NOT re-read" in slate
 
 
+@pytest.mark.asyncio
+async def test_breaker_never_fires_on_repeated_slate_hits(tmp_path):
+    """End-to-end: a model that re-reads the SAME held range 25 times must
+    never trip the inspection breaker. The engine's slate short-circuit
+    returns held content and must reset the inspection counter (F5 fix) —
+    before the fix, the short-circuit path bypassed the post-execution
+    sensor and the breaker fired at 20, killing efficient re-referencing.
+    This is the user's exact circling complaint, at the breaker layer."""
+    a = tmp_path / "loop.py"
+    a.write_text("VALUE = 42\n" * 30)
+    sess = create_session(str(tmp_path))
+    eng = Engine("m", "test", sess, str(tmp_path))
+    # 25 identical re-reads of the same range, then a final write = progress.
+    script = [("read", {"path": "loop.py", "offset": 1, "limit": 30})] * 25
+    script.append(("write", {"path": "out.txt", "content": "ok"}))
+    eng.client = ScriptedModel(script)
+    await eng.chat("re-read the held range repeatedly then write")
+
+    # 1. The write (a progress step) must have executed — i.e. the breaker
+    #    never blocked the run before reaching it.
+    assert (tmp_path / "out.txt").read_text() == "ok", (
+        "breaker fired before the model could act — slate-hit short-circuit "
+        "is still counting toward the inspection limit")
+    # 2. At least one cache short-circuit happened — either a slate hit
+    #    (cross-turn) or a dedup cache hit (same-turn, constraint='dedup').
+    cached = [e for e in sess.events
+              if e.get("kind") == "tool_result"
+              and (e.get("status") == "slate" or e.get("constraint") == "dedup")]
+    assert cached, "expected at least one cache short-circuit in this scenario"
+    # 3. The first read was real (disk), the rest served from cache/slate.
+    disk_reads = [e for e in sess.events
+                  if e.get("kind") == "tool_result" and e.get("name") == "read"
+                  and e.get("status") not in ("slate", "cached")]
+    assert disk_reads, "first read should be a real disk read"
+
+
 # ================================================================ direct API
 #
 # These tests exercise syscalls.tool_read / tool_write / tool_edit directly
