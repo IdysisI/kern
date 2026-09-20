@@ -117,6 +117,21 @@ def _slate(events: list[dict], session=None) -> str:
             else:
                 lines.append(f"  … {hid}: running ({task})")
 
+    # FileSlate: what file content the model already HOLDS this session.
+    # This survives compaction (it's rebuilt from the live ledger, not the
+    # folded history), so the model never re-reads ranges it already has —
+    # the measured fix for the re-read waste the user reported.
+    try:
+        slate = (getattr(session, '_runtime', None) or {}).get('fileslate')
+        if slate is not None:
+            fs_block = slate.state_block()
+            if fs_block:
+                lines.append("<file-state>")
+                lines.append(fs_block)
+                lines.append("</file-state>")
+    except Exception:
+        pass
+
     lines.append("</work-state>")
     return "\n".join(lines)
 

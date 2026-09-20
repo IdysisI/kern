@@ -437,6 +437,10 @@ class Engine:
             self.mounts = runtime['mounts']
             self._replay_mounts()
         self.mounts = runtime['mounts']
+        # FileSlate: session-scoped file-knowledge ledger (see kern/fileslate.py).
+        # Survives across turns like the fetch cache; dies with the session.
+        from .fileslate import FileSlate
+        self.fileslate = runtime.setdefault("fileslate", FileSlate(cwd))
         self.depth = subagent_depth
         self.last_usage: dict = {}
         self.usage_in = 0
@@ -1617,6 +1621,30 @@ class Engine:
                                               constraint=meta.get("constraint"))
                             self.stream_cb("result", str(text))
                             continue
+                    # FileSlate read-serve: the exact-arg _ro_cache above only
+                    # matches identical (path,offset,limit). The slate is
+                    # RANGE-aware and survives mutations of OTHER files, so a
+                    # re-read of any already-held slice of an unchanged file is
+                    # answered byte-identically with zero billed execution. This
+                    # is the fix for the measured re-read waste (343 reads of
+                    # one file across 269 slices in a single session).
+                    if name == "read":
+                        try:
+                            _sl = self.fileslate.covered_slice(
+                                args.get("path", ""), args.get("offset", 1),
+                                args.get("limit", 200))
+                        except Exception:
+                            _sl = None
+                        if _sl is not None:
+                            _dbg(self.session, "slate.hit",
+                                 target=str(args.get("path", ""))[:60])
+                            self.session.emit("action", call_id=cid, name=name,
+                                              arguments=args)
+                            self.session.emit("tool_result", call_id=cid, name=name,
+                                              text=_sl, status="slate",
+                                              constraint="slate")
+                            self.stream_cb("result", _sl)
+                            continue
                     # Action receipt: record intent BEFORE the effect, so a
                     # crash mid-call leaves a dangling intent the pager can
                     # flag as "uncertain — verify before retry".
@@ -1629,10 +1657,50 @@ class Engine:
                     if _succeeded:
                         if ro_key is not None:
                             self._ro_cache[ro_key] = (text, meta)
+                            if name == "read":
+                                # Teach the slate what the model now holds
+                                # (range-aware; survives the cache wipe below).
+                                try:
+                                    self.fileslate.record_read(str((args or {}).get("path", "")), str(text))
+                                except Exception:
+                                    pass
                         elif not _is_read_only(name, args):
-                            if self._ro_cache:
-                                _dbg(self.session, "dedup.invalidate", tool=name, cleared=len(self._ro_cache))
-                            self._ro_cache.clear()
+                            # FileSlate: SURGICAL invalidation. edit/write touch
+                            # exactly one file — wiping the whole read cache for
+                            # them is what blinded the model after every edit
+                            # (measured: 64 edits followed by same-file re-reads
+                            # within 3 calls). Only exec/py can mutate anything,
+                            # so only those justify a full wipe.
+                            _mut_path = (args or {}).get("path") if name in ("edit", "write") else None
+                            if _mut_path:
+                                try:
+                                    self.fileslate.invalidate(str(_mut_path))
+                                    # fresh outline of the changed file rides
+                                    # along in the slate so <file-state> stays
+                                    # structural even though lines are dropped
+                                    from .fileslate import quick_outline
+                                    self.fileslate.set_outline(
+                                        str(_mut_path),
+                                        quick_outline(str(self.fs.resolve(str(_mut_path)))))
+                                    _dbg(self.session, "slate.invalidate",
+                                         target=str(_mut_path)[:60])
+                                except Exception:
+                                    pass
+                                # drop only this path's exact-arg cache entries
+                                _pk = str(_mut_path)
+                                for _k in [k for k in self._ro_cache
+                                           if k[0] in ("read", "map") and _pk in k[1]]:
+                                    del self._ro_cache[_k]
+                            else:
+                                if self._ro_cache:
+                                    _dbg(self.session, "dedup.invalidate", tool=name, cleared=len(self._ro_cache))
+                                self._ro_cache.clear()
+                        elif name == "read":
+                            # Teach the slate what the model now holds.
+                            try:
+                                self.fileslate.record_read(str((args or {}).get("path", "")), str(text))
+                            except Exception:
+                                pass
                 if prior is not None and not _is_read_only(name, args):
                     # Only warn for side-effecting repeats. Re-running a read-only
                     # status/log/read is harmless and must not be flagged (F3).
