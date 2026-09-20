@@ -1,8 +1,15 @@
-"""Isolated persistent interpreter. A timeout kills this process, not a thread."""
+"""Isolated persistent interpreter.
+
+An interrupt/timeout first tries SIGINT (POSIX): the cell aborts with a
+KeyboardInterrupt and the namespace SURVIVES (audit r4-gui W2). Only if the
+worker fails to answer within the parent's grace period does the parent fall
+back to killing the process.
+"""
 import contextlib
 import io
 import json
 import os
+import signal
 import sys
 import traceback
 
@@ -18,20 +25,52 @@ SENTINEL = SENTINEL_FMT % os.getpid()
 
 
 class Capture(io.TextIOBase):
+    """Rolling capture that keeps HEAD + TAIL on overflow (audit r4-gui W4).
+
+    Tracebacks and the first lines of progress output matter most — the old
+    tail-only cap silently clipped the actual error away.
+    """
+    CAP = 16000
+
     def __init__(self):
-        self.text = ''
-        self.dropped = 0
+        self.head = ''
+        self.tail = ''
+        self.total = 0
 
     def write(self, text):
-        self.text += text
-        if len(self.text) > 16000:
-            self.dropped += len(self.text) - 16000
-            self.text = self.text[-16000:]
+        self.total += len(text)
+        self.tail += text
+        half = self.CAP // 2
+        if len(self.tail) > half:
+            if not self.head:
+                self.head = self.tail[:half]
+            self.tail = self.tail[-half:]
         return len(text)
+
+    def render(self):
+        if not self.head:
+            return self.tail
+        dropped = max(0, self.total - len(self.head) - len(self.tail))
+        return (self.head + f'\n[... {dropped} characters omitted ...]\n'
+                + self.tail)
 
 
 def main():
-    namespace = {}
+    # Seed __name__ so `if __name__ == "__main__":` blocks in pasted snippets
+    # don't run by accident — but the name EXISTS (audit r4-gui W3).
+    namespace = {'__name__': '__kern__', '__builtins__': __builtins__}
+
+    def _sigint(_signum, _frame):
+        # Runs on the main thread between bytecodes: aborts ONLY the current
+        # cell; the namespace (variables/imports) survives (W2). C-level calls
+        # that ignore signals are covered by the parent's kill-after-grace.
+        raise KeyboardInterrupt('py() cell interrupted')
+
+    try:
+        signal.signal(signal.SIGINT, _sigint)
+    except (ValueError, OSError):
+        pass  # non-main-thread or platform quirk: parent kill still applies
+
     for line in sys.stdin:
         buf = Capture()
         status = 'succeeded'
@@ -42,9 +81,7 @@ def main():
         except BaseException:
             status = 'failed'
             buf.write(traceback.format_exc())
-        text = buf.text or '(no output; state retained)'
-        if buf.dropped:
-            text = f'[{buf.dropped} characters omitted]\n' + text
+        text = buf.render() or '(no output; state retained)'
         # Single buffered write to the real fd 1: one atomic-ish line the parent
         # can find by sentinel even if the payload itself printed raw bytes.
         frame = SENTINEL + json.dumps({'text': text, 'status': status}) + '\n'

@@ -101,3 +101,53 @@ def test_tool_py_survives_stray_fd1_output(tmp_path):
     assert meta.get("status") in (None, "succeeded"), f"garbage desynced py(): {text!r}"
     assert "real result 42" in text, f"expected the real output, got: {text!r}"
     assert "42" in text2, f"protocol desynced on the next call: {text2!r}"
+
+
+def test_interrupt_preserves_namespace(tmp_path):
+    """W2 regression: an interrupt must abort ONLY the running cell (SIGINT →
+    KeyboardInterrupt in the worker); the persistent namespace must survive.
+    The old behavior killed the worker, resetting every variable/import."""
+    import threading
+    import time
+
+    fs = FS(str(tmp_path))
+
+    class FakeSession:
+        scratch = tmp_path / "scratch"
+        _py_proc = None
+
+    s = FakeSession()
+    try:
+        text, _meta = tool_py(s, "keep = 'precious'\nprint('ok')", _fs=fs)
+        assert "ok" in text
+
+        cancel = threading.Event()
+        out = {}
+
+        def run():
+            out["r"] = tool_py(s, "while True:\n    pass", timeout=30,
+                               _cancel=cancel, _fs=fs)
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        time.sleep(0.5)
+        cancel.set()
+        th.join(15)
+        assert not th.is_alive(), "interrupt did not stop the infinite cell"
+        itext, imeta = out["r"]
+        assert imeta.get("status") == "uncertain", imeta
+        assert "interrupt" in itext.lower(), itext
+
+        # the namespace must still hold the pre-interrupt state
+        text2, _m2 = tool_py(s, "print('keep is', keep)", _fs=fs)
+        assert "keep is precious" in text2, \
+            f"namespace destroyed by interrupt: {text2!r}"
+
+        # W3: __name__ is seeded (snippets probing it must not NameError, and
+        # must not trigger "__main__" blocks)
+        text3, _m3 = tool_py(s, "print('name:', __name__)", _fs=fs)
+        assert "__kern__" in text3, text3
+    finally:
+        proc = getattr(s, "_py_proc", None)
+        if proc is not None:
+            proc.kill()

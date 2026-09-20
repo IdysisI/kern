@@ -1070,11 +1070,39 @@ def tool_py(session, code: str, timeout: int = 60, *, _cancel=None, _fs=None) ->
             except queue.Empty:
                 pass
     except queue.Empty:
+        # W2: an interrupt/timeout used to KILL the worker — losing every
+        # variable/import accumulated in the persistent namespace. Now POSIX
+        # first tries SIGINT (aborts only the cell) and waits a grace period
+        # for the sentinel-framed reply; the process is killed only if it
+        # stays silent (C-level call ignoring Python signal handlers).
+        reason = 'interrupted' if _cancel is not None and _cancel.is_set() else 'timeout'
+        graceful = False
+        if os.name != 'nt' and proc.poll() is None:
+            import signal as _signal
+            try:
+                proc.send_signal(_signal.SIGINT)
+            except (OSError, ValueError):
+                pass
+            else:
+                try:
+                    raw = result.get(timeout=3.0)
+                    graceful = bool(raw)
+                except queue.Empty:
+                    graceful = False
+        if graceful:
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                data = None
+            if data is not None:
+                text = data.get('text', '')
+                return (f'py() cell {reason} (namespace kept):\n{text}',
+                        {"status": "uncertain", "interrupted": reason})
         _stop_process(proc)
         reader.join(5)
         session._py_proc = None
-        reason = 'interrupted' if _cancel is not None and _cancel.is_set() else 'timeout'
-        return f'error: py {reason}; interpreter stopped and state reset; partial effects possible', {"status": "uncertain"}
+        return (f'error: py {reason}; interpreter stopped and state reset; '
+                'partial effects possible', {"status": "uncertain"})
     if not raw:
         session._py_proc = None
         return 'error: Python interpreter exited; state reset', {"status": "uncertain"}
