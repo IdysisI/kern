@@ -29,7 +29,7 @@ import websockets
 
 from .client import Client, load_health
 from .engine import Engine
-from .journal import create_session, list_sessions
+from .journal import create_session, list_sessions, Session
 from .pager import budget
 
 HOST = os.environ.get("KERN_SERVE_HOST", "127.0.0.1")
@@ -88,8 +88,13 @@ class Conn:
         aid = self._approval_seq
         fut = asyncio.get_running_loop().create_future()
         self._approvals[aid] = fut
-        await self.send(event="approve_request", id=aid, desc=desc, diff=diff)
-        return await fut
+        try:
+            await self.send(event="approve_request", id=aid, desc=desc, diff=diff)
+            return await fut
+        finally:
+            # turn cancelled / connection dropped while awaiting: never leave
+            # a stale future (UI would show a dead approval, dict leaks)
+            self._approvals.pop(aid, None)
 
     def engine(self) -> Engine:
         return Engine(self.client, self.model, self.session, self.cwd,
@@ -137,6 +142,26 @@ class Conn:
         elif m == "new_session":
             self.session = create_session(cwd=self.cwd)
             await self.send(result={"session": self.session.id})
+        elif m == "attach":
+            # Reopen an existing session (the web client restores its last
+            # session id on connect; without this every reload lost history —
+            # audit r4-gui S1). The session must EXIST on disk: Session(sid)
+            # silently succeeds with empty events for an unknown id, and
+            # swapping the live session for that would wipe context.
+            sid = str(msg.get("session") or "")
+            if sid not in list_sessions():
+                await self.send(event="error",
+                                error=f"cannot open session: unknown id {sid!r}")
+                return
+            try:
+                sess = Session(sid)
+            except Exception as e:
+                await self.send(event="error", error=f"cannot open session: {e}")
+                return
+            if self.turn and not self.turn.done():
+                self.turn.cancel()
+            self.session = sess   # engine() is a factory: next call binds it
+            await self.send(result={"session": sess.id})
         elif m == "models":
             try:
                 models = await self.client.list_models()
