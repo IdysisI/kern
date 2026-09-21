@@ -86,3 +86,158 @@ def test_image_budget_does_not_count_base64_as_text_tokens():
     large=estimate(message('abc'*100000))
     assert small==large
     assert small>=8192
+
+
+def test_thinking_retention_in_openai_and_anthropic():
+    messages = [
+        {
+            "role": "assistant",
+            "text": "Done with step 1",
+            "thinking": "Thinking about step 1...",
+            "thinking_signature": "sig123",
+            "tool_calls": [{"id": "call_1", "name": "read", "arguments": {"path": "a.txt"}}],
+        }
+    ]
+
+    # OpenAI format preserves reasoning_content
+    oai = _ir_to_openai(messages)
+    assert len(oai) == 1
+    assert oai[0]["role"] == "assistant"
+    assert oai[0]["reasoning_content"] == "Thinking about step 1..."
+    assert oai[0]["content"] == "Done with step 1"
+    assert len(oai[0]["tool_calls"]) == 1
+
+    # Anthropic format preserves thinking block with signature
+    ant = _ir_to_anthropic(messages)
+    assert len(ant) == 1
+    assert ant[0]["role"] == "assistant"
+    blocks = ant[0]["content"]
+    assert blocks[0] == {"type": "thinking", "thinking": "Thinking about step 1...", "signature": "sig123"}
+    assert blocks[1] == {"type": "text", "text": "Done with step 1"}
+    assert blocks[2]["type"] == "tool_use"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_streaming_signature(monkeypatch):
+    events = [
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "Planning..."}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig_abc"}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "Hello"}},
+        {"type": "content_block_stop", "index": 1},
+        {"type": "message_stop"},
+    ]
+    endpoint(monkeypatch, events)
+    result = [e async for e in Client().stream_chat("claude-test", [])]
+    thinking_events = [e for e in result if e.kind == "thinking"]
+    assert len(thinking_events) == 2
+    assert thinking_events[0].text == "Planning..."
+    assert thinking_events[1].signature == "sig_abc"
+    assert "".join(e.text for e in result if e.kind == "text") == "Hello"
+
+
+def test_pager_materialize_and_budget_preserves_thinking():
+    from kern.pager import materialize, budget
+
+    session_mock = type("MockSession", (), {"events": [], "cwd": "/tmp", "log": "/tmp/events.jsonl"})()
+    events = [
+        {"n": 0, "kind": "session_start", "cwd": "/tmp"},
+        {"n": 1, "kind": "user", "text": "Calculate 2+2"},
+        {
+            "n": 2,
+            "kind": "assistant",
+            "text": "Let me calculate.",
+            "thinking": "Need to use python calculator.",
+            "thinking_signature": "sig_mock",
+            "tool_calls": [{"id": "c1", "name": "py", "arguments": {"code": "2+2"}}],
+        },
+        {"n": 3, "kind": "tool", "call_id": "c1", "text": "4"},
+    ]
+
+    ir = materialize(events, session_mock)
+    assistant_msgs = [m for m in ir if m["role"] == "assistant"]
+    assert len(assistant_msgs) == 1
+    assert assistant_msgs[0]["thinking"] == "Need to use python calculator."
+    assert assistant_msgs[0]["thinking_signature"] == "sig_mock"
+
+    b = budget(events, session_mock)
+    assert b["assistant_bytes"] > 0
+    assert b["approx_tokens"] > 0
+
+
+def test_gemini_thought_signature_in_extra_content():
+    # Verify _ir_to_openai preserves extra_content on tool_calls
+    messages = [
+        {
+            "role": "assistant",
+            "text": None,
+            "tool_calls": [
+                {
+                    "id": "function-call-123",
+                    "name": "read",
+                    "arguments": {"path": "main.py"},
+                    "extra_content": {
+                        "google": {
+                            "thought_signature": "sig_gemini_xyz"
+                        }
+                    },
+                }
+            ],
+        }
+    ]
+    wire = _ir_to_openai(messages)
+    assert len(wire) == 1
+    tc = wire[0]["tool_calls"][0]
+    assert tc["id"] == "function-call-123"
+    assert tc["extra_content"] == {"google": {"thought_signature": "sig_gemini_xyz"}}
+
+
+@pytest.mark.asyncio
+async def test_openai_streaming_gemini_extra_content(monkeypatch):
+    events = [
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "function-call-999",
+                                "type": "function",
+                                "function": {"name": "read", "arguments": '{"path": '},
+                                "extra_content": {
+                                    "google": {"thought_signature": "sig_chunk_1"}
+                                },
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "function": {"arguments": '"foo.py"}'},
+                            }
+                        ]
+                    }
+                }
+            ]
+        },
+        {"choices": [{"delta": {}}]},
+        "[DONE]",
+    ]
+    endpoint(monkeypatch, events)
+    result = [e async for e in Client().stream_chat("gemini-test", [])]
+    tc_events = [e for e in result if e.kind == "tool_call"]
+    assert len(tc_events) == 1
+    assert tc_events[0].tool_call["id"] == "function-call-999"
+    assert tc_events[0].tool_call["name"] == "read"
+    assert tc_events[0].tool_call["arguments"] == {"path": "foo.py"}
+    assert tc_events[0].tool_call["extra_content"] == {"google": {"thought_signature": "sig_chunk_1"}}

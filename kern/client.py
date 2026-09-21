@@ -96,11 +96,12 @@ HEALTH_TTL = float(os.environ.get("KERN_HEALTH_TTL", str(7 * 24 * 3600)))
 
 @dataclass
 class StreamEvent:
-    kind: str                       # "text" | "tool_call" | "usage" | "done" | "error"
+    kind: str                       # "text" | "tool_call" | "usage" | "done" | "error" | "thinking"
     text: str = ""
     tool_call: dict | None = None   # {"id": str, "name": str, "arguments": dict}
     usage: dict = field(default_factory=dict)
     error: str = ""
+    signature: str = ""
 
 # ---------------------------------------------------------------- health ---
 
@@ -299,17 +300,23 @@ class Client:
                 args = json.loads(raw)
                 if not isinstance(args, dict):
                     raise ValueError(f"arguments must be a JSON object, got {type(args).__name__}")
-                yield StreamEvent("tool_call", tool_call={"id": cid, "name": slot["name"], "arguments": args})
+                tc_data = {"id": cid, "name": slot["name"], "arguments": args}
+                if slot.get("extra_content"):
+                    tc_data["extra_content"] = slot["extra_content"]
+                yield StreamEvent("tool_call", tool_call=tc_data)
             except (json.JSONDecodeError, ValueError) as e:
                 yield StreamEvent(
                     "error",
                     error=f"[tool={name} id={cid}] stage=arg-parse invalid-json: {e} "
                           f"raw[:200]={raw[:200]!r}")
-                yield StreamEvent("tool_call", tool_call={
+                tc_data = {
                     "id": cid, "name": slot["name"], "arguments": {},
                     "kern_error": (f"error: malformed tool arguments (stage=arg-parse, "
                                    f"tool={name}): {e}. No repair attempted. "
-                                   f"Re-issue the tool call with valid JSON arguments.")})
+                                   f"Re-issue the tool call with valid JSON arguments.")}
+                if slot.get("extra_content"):
+                    tc_data["extra_content"] = slot["extra_content"]
+                yield StreamEvent("tool_call", tool_call=tc_data)
 
     async def _stream_openai(self, model, messages, system, tools, max_tokens):
         msgs = ([{"role": "system", "content": system}] if system else []) + _ir_to_openai(messages, model=model)
@@ -367,6 +374,8 @@ class Client:
                                 slot = pending.setdefault(tc.get("index", 0), {"id": "", "name": "", "args": ""})
                                 if tc.get("id"):
                                     slot["id"] = tc["id"]
+                                if tc.get("extra_content"):
+                                    slot["extra_content"] = tc["extra_content"]
                                 fn = tc.get("function") or {}
                                 if fn.get("name"):
                                     slot["name"] = fn["name"]
@@ -435,6 +444,8 @@ class Client:
                                 yield StreamEvent("text", text=d["text"])
                             elif d.get("type") == "thinking_delta" and d.get("thinking"):
                                 yield StreamEvent("thinking", text=d["thinking"])
+                            elif d.get("type") == "signature_delta" and d.get("signature"):
+                                yield StreamEvent("thinking", signature=d["signature"])
                             elif d.get("type") == "input_json_delta" and index in pending:
                                 pending[index]["args"] += d.get("partial_json", "")
                         elif et == "content_block_stop" and index in pending:
@@ -592,10 +603,20 @@ def _ir_to_openai(messages: list[dict], model: str = "") -> list[dict]:
             out.append({'role':'user', 'content':images})
             images = []
         if m["role"] == "assistant" and m.get("tool_calls"):
-            out.append({"role": "assistant", "content": m.get("text") or None,
-                        "tool_calls": [{"id": tc["id"], "type": "function",
-                                        "function": {"name": tc["name"],
-                                                     "arguments": json.dumps(tc["arguments"])}} for tc in m["tool_calls"]]})
+            tool_calls = []
+            for tc in m["tool_calls"]:
+                tc_obj = {
+                    "id": tc["id"],
+                    "type": "function",
+                    "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])},
+                }
+                if tc.get("extra_content"):
+                    tc_obj["extra_content"] = tc["extra_content"]
+                tool_calls.append(tc_obj)
+            asst_msg = {"role": "assistant", "content": m.get("text") or None, "tool_calls": tool_calls}
+            if m.get("thinking"):
+                asst_msg["reasoning_content"] = m["thinking"]
+            out.append(asst_msg)
         elif m["role"] == "tool":
             media = m.get("media")
             if media and media.get("type") == "image" and supports_vision(model):
@@ -636,6 +657,11 @@ def _ir_to_anthropic(messages: list[dict], model: str = "") -> list[dict]:
     for m in messages:
         if m["role"] == "assistant" and m.get("tool_calls"):
             blocks = []
+            if m.get("thinking"):
+                tb = {"type": "thinking", "thinking": m["thinking"]}
+                if m.get("thinking_signature"):
+                    tb["signature"] = m["thinking_signature"]
+                blocks.append(tb)
             if m.get("text"):
                 blocks.append({"type": "text", "text": m["text"]})
             blocks += [{"type": "tool_use", "id": tc["id"], "name": tc["name"],
