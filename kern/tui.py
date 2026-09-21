@@ -20,6 +20,10 @@ from . import __version__ as KERN_VERSION
 DAEMON_VERSION = KERN_VERSION
 
 from rich.markdown import Markdown as RichMarkdown
+from rich.markdown import CodeBlock as RichCodeBlock
+from rich import default_styles
+from rich import themes
+from rich.syntax import Syntax
 from rich.text import Text
 from rich.table import Table as RichTable
 from textual.markup import escape
@@ -53,22 +57,11 @@ from .pager import budget
 
 DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
 
-# ── visual identity ──────────────────────────────────────────────────────
-# Modern Obsidian & Tokyo Night palette with refined contrast, glowing accents,
-# crisp typography, and sleek status tokens.
-BG_DEEP   = "#13141f"   # deepest ground (head/foot strips, frame)
-BG_SOFT   = "#181926"   # lifted card surface (prompts, tool cards, cards)
-BG_RISE   = "#202234"   # raised surfaces (modals, popovers, keycaps)
-BG_LINE   = "#2c3047"   # hairline borders and separators
-BLUE      = "#7aa2f7"   # primary brand accent — electric blue
-BLUE_SOFT = "#7dcfff"   # secondary cyan accent — parameters, tags
-GOLD      = "#e0af68"   # running state, attention, warnings
-GREEN     = "#73daca"   # success, verified, active states
-RED       = "#f7768e"   # errors, failed, danger
-MAGENTA   = "#bb9af7"   # deep reasoning, capabilities
-TEXT_HI   = "#f0f4fc"   # crisp primary text
-TEXT_MID  = "#c0caf5"   # secondary readable text
-TEXT_DIM  = "#787e9d"   # tertiary metadata, subtle labels
+# Visual identity lives in ONE place: the _THEMES tables below. The previous
+# design kept a module-level palette (BG_DEEP, BLUE, GOLD, …) that nothing
+# consumed — the CSS was a literal string, so those constants were dead and
+# drifted from what actually painted. Colours are theme variables now, which
+# is what lets ctrl+t re-skin chrome, cards and markup in a single frame.
 
 TOOL_ICON = {"read": "📖", "write": "📝", "edit": "✏️", "exec": "⚡", "spawn": "🤖",
              "fetch": "🌐", "todo": "📋", "proc": "⚙️", "memory": "🧠", "py": "🐍"}
@@ -79,167 +72,257 @@ TOOL_ICON = {"read": "📖", "write": "📝", "edit": "✏️", "exec": "⚡", "
 # one calm breath every 1.44s. Single column wide, never jitters the layout.
 STREAMING_CURSOR = "··∙∙••••∙∙··"
 
-CSS = """
-/* ── modern terminal canvas ─────────────────────────────────────────── */
-Screen { background: transparent; }
+# ──────────────────────────────────────────────────────────────────────
+#  Themes — "Midnight Glass" (dark, default) and "Daylight" (light).
+#  Every colour the UI paints is a theme variable, so ctrl+t re-skins the
+#  whole app in a single frame: chrome, cards, accent rails, dialogs and
+#  inline markup alike. Nothing downstream hard-codes a hex any more.
+#
+#  Depth ladder (surfaces come forward as they lighten):
+#      $canvas → $chrome → $card → $panel → $chip
+#  Semantic accents: $primary blue · $secondary magenta · $accent cyan
+#      $teal · $success green · $warning amber · $error red
+# ──────────────────────────────────────────────────────────────────────
+from textual.theme import Theme
 
-/* ── topbar cockpit header ─────────────────────────────────────────── */
+KERN_DARK = "kern-midnight"
+KERN_LIGHT = "kern-daylight"
+
+_THEMES = (
+    Theme(
+        name=KERN_DARK,
+        primary="#7aa2f7",
+        secondary="#bb9af7",
+        success="#9ece6a",
+        warning="#e0af68",
+        error="#f7768e",
+        accent="#7dcfff",
+        foreground="#c6cfe6",
+        background="#0d0f17",
+        surface="#141722",
+        panel="#1a1e2e",
+        dark=True,
+        variables={
+            # transparent canvas in dark mode: the terminal's own background
+            # (and palette) shows through the gaps — real transparency.
+            "canvas": "transparent",
+            "chrome": "#10131d",
+            "card": "#151827",
+            "card-hi": "#1b2033",
+            "chip": "#1e2334",
+            "chip-hi": "#272e45",
+            "border": "#232a3d",
+            "border-hi": "#313b56",
+            "bright": "#eef2ff",
+            "muted": "#7e88a3",
+            "faint": "#5a6380",
+            "teal": "#73daca",
+            "primary-soft": "#161d31",
+            "danger-soft": "#241a22",
+            "warn-soft": "#221d15",
+            "ok-soft": "#16211b",
+        },
+    ),
+    Theme(
+        name=KERN_LIGHT,
+        primary="#3d6ad6",
+        secondary="#8250c4",
+        success="#3d8b52",
+        warning="#96660f",
+        error="#c53b53",
+        accent="#1c7a99",
+        foreground="#2a2f3e",
+        background="#eef1f8",
+        surface="#ffffff",
+        panel="#f6f8fd",
+        dark=False,
+        variables={
+            "canvas": "#eef1f8",
+            "chrome": "#e3e8f4",
+            "card": "#f8faff",
+            "card-hi": "#edf2fd",
+            "chip": "#e5eaf7",
+            "chip-hi": "#d7dff2",
+            "border": "#d2d9ea",
+            "border-hi": "#b5bfd8",
+            "bright": "#131a2b",
+            "muted": "#666f88",
+            "faint": "#8b93a9",
+            "teal": "#2a7d7d",
+            "primary-soft": "#e6eefb",
+            "danger-soft": "#fbe9ec",
+            "warn-soft": "#fbf2e0",
+            "ok-soft": "#e8f4ec",
+        },
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Markdown that belongs to the theme.
+#
+#  Rich's defaults fight the app: inline code is "cyan on black" and fenced
+#  blocks carry pygments' own painted slab (Monokai's near-black). Inside a
+#  themed card that reads as a foreign dark rectangle floating in the reply
+#  — and in the light theme it is close to unreadable. So fences render on
+#  `default` (the card background shows through) with a pygments style that
+#  matches the theme's brightness, and inline code is left bold-on-nothing
+#  (see the DEFAULT_STYLES override below KernMarkdown).
+# ──────────────────────────────────────────────────────────────────────
+CODE_THEME_DARK = "monokai"       # bright tokens, for the dark palette
+CODE_THEME_LIGHT = "friendly"     # dark tokens, for the light palette
+
+
+class _ThemedFence(RichCodeBlock):
+    """A fenced code block with no painted background of its own."""
+
+    def __rich_console__(self, console, options):
+        code = str(self.text).rstrip()
+        yield Syntax(code, self.lexer_name, theme=self.theme, word_wrap=True,
+                     padding=(0, 1), background_color="default")
+
+
+class KernMarkdown(RichMarkdown):
+    """Rich markdown with Kern's fence rendering swapped in.
+
+    Drop-in for RichMarkdown — and still `isinstance`-compatible with it, so
+    the chat_text()/replay paths that sniff for markdown keep working.
+    """
+
+    elements = {**RichMarkdown.elements,
+                "fence": _ThemedFence,
+                "code_block": _ThemedFence}
+
+
+# Rich paints inline code as `cyan on black`: a black chip inside every themed
+# card, and the one markdown style that cannot be re-pointed at runtime — rich
+# resolves it from `rich.themes.DEFAULT`, a Theme built (by copy) when rich is
+# imported, and Textual's console is constructed inside App.__init__ long
+# before any theme flip. So it is neutralised once, here: bold with no
+# background inherits the card's own colours and reads as code in both themes
+# instead of fighting them.
+for _styles in (getattr(themes, "DEFAULT", None) and themes.DEFAULT.styles,
+                default_styles.DEFAULT_STYLES):
+    if _styles is not None:
+        _styles["markdown.code"] = RichStyle(bold=True)
+        _styles["markdown.code_block"] = RichStyle()
+del _styles
+
+
+CSS = """
+/* ═══ Midnight Glass ════════════════════════════════════════════════════
+   Three rules, applied everywhere below:
+
+   1. DEPTH BY SURFACE, NOT NOISE.  Layers recede in a fixed ladder
+      $canvas → $chrome → $card → $panel → $chip; a hairline $border
+      separates them and $border-hi marks anything you can act on.
+   2. COLOUR IS MEANING.  Accent rails and semantic hues say what a line
+      *is* — you / kern / tool / plan / danger — never mere decoration.
+   3. MOTION IS CONFIRMATION.  140–220ms in_out_quad transitions on
+      background and border make focus, hover and state changes read as
+      one continuous gesture instead of a jump cut.
+
+   Every value is a theme variable, so ctrl+t re-skins the whole app —
+   chrome, cards, rails, dialogs and inline markup — in a single frame.
+   ═════════════════════════════════════════════════════════════════════ */
+
+Screen { background: $canvas; }
+
+/* ── topbar: brand · session · model · context meter ────────────────── */
 #topbar {
     dock: top;
-    height: 1;
+    /* height 2 = one text row + one hairline: a 1-row box with a border has
+       zero content rows, so the header would paint nothing but its edge. */
+    height: 2;
     padding: 0 2;
-    background: #13141f;
-    border-bottom: solid #222538;
+    background: $chrome;
+    color: $muted;
+    border-bottom: solid $border;
 }
 #tleft {
     width: auto;
-    color: #c0caf5;
+    color: $bright;
+    text-style: bold;
 }
 #tright {
     width: 1fr;
     text-align: right;
-    color: #787e9d;
+    color: $muted;
 }
 
 #workspace { height: 1fr; }
 
-/* ── inspector HUD sidebar ─────────────────────────────────────────── */
+/* ── inspector HUD: the agent's live work-state, always one glance away */
 #inspector {
-    width: 36;
+    width: 38;
     padding: 0 1;
     overflow-y: auto;
-    background: #13141f;
-    border-left: tall #222538;
-    scrollbar-color: #2c3047 transparent;
+    background: $chrome;
+    border-left: heavy $border;
+    scrollbar-color: $border-hi transparent;
+    scrollbar-color-hover: $primary transparent;
+    scrollbar-background: transparent;
     scrollbar-size: 1 1;
 }
 .insp-head {
-    color: #787e9d;
+    color: $muted;
     text-style: bold;
     margin: 1 0 0 0;
 }
 #inspector-title {
-    color: #7aa2f7;
+    color: $faint;
     text-style: bold;
     margin: 0 0 1 0;
     padding-top: 1;
 }
-#work-objective {
-    color: #f0f4fc;
+#work-objective, #work-plan, #work-notes, #work-mounts, #work-proof {
     margin: 0 0 1 0;
-    background: #181926;
-    border-left: tall #7aa2f7;
     padding: 0 1;
+    background: $card;
+    border: round $border;
+    transition: border 220ms in_out_quad, background 220ms in_out_quad;
 }
-#work-plan {
-    margin: 0 0 1 0;
-    color: #c0caf5;
-    background: #181926;
-    border-left: tall #73daca;
-    padding: 0 1;
-}
-#work-notes {
-    margin: 0 0 1 0;
-    color: #c0caf5;
-    background: #181926;
-    border-left: tall #bb9af7;
-    padding: 0 1;
-}
-#work-mounts {
-    margin: 0 0 1 0;
-    color: #e0af68;
-    background: #181926;
-    border-left: tall #e0af68;
-    padding: 0 1;
-}
-#work-proof {
-    margin: 0;
-    color: #7dcfff;
-    background: #181926;
-    border-left: tall #7dcfff;
-    padding: 0 1;
-}
+#work-objective { color: $bright;    border-left: tall $primary; }
+#work-plan      { color: $text;      border-left: tall $teal; }
+#work-notes     { color: $text;      border-left: tall $secondary; }
+#work-mounts    { color: $warning;   border-left: tall $warning; }
+#work-proof     { color: $accent;    border-left: tall $accent; margin: 0; }
 
-/* ── conversation stream & chat ────────────────────────────────────── */
+/* ── conversation stream ────────────────────────────────────────────── */
 #chat {
     width: 1fr;
     height: 1fr;
     padding: 0 2;
     background: transparent;
-    scrollbar-color: #2c3047 transparent;
-    scrollbar-color-hover: #7aa2f7 transparent;
+    scrollbar-color: $border-hi transparent;
+    scrollbar-color-hover: $primary transparent;
     scrollbar-background: transparent;
     scrollbar-size: 1 1;
 }
 
-/* activity line while a turn runs (hidden when idle) */
-#status {
-    dock: bottom;
-    height: 1;
-    padding: 0 2;
-    color: #e0af68;
-    background: #13141f;
-    border-top: solid #222538;
-}
-
-/* ── command prompt area ───────────────────────────────────────────── */
-#prompt {
-    border: round #2c3047;
-    color: #f0f4fc;
-    height: auto;
-    max-height: 9;
-    min-height: 3;
-    background: #181926;
-    padding: 0 1;
-    margin: 0 0 0 0;
-    scrollbar-color: #2c3047 transparent;
-    scrollbar-background: transparent;
-}
-#prompt:focus {
-    border: round #7aa2f7;
-    background: #1a1c2c;
-}
-#prompt .text-area--cursor {
-    background: #c0caf5;
-    color: #13141f;
-    text-style: none;
-}
-#prompt .text-area--cursor-line {
-    background: #202234;
-}
-
-/* ── footer status bar ─────────────────────────────────────────────── */
-#bar {
-    dock: bottom;
-    height: 1;
-    padding: 0 2;
-    background: #13141f;
-    border-top: solid #222538;
-    color: #787e9d;
-}
-
-/* ── conversation stream cards & rails ─────────────────────────────── */
+/* you — the only card with a full surface: your words anchor the scroll */
 .user {
-    border-left: thick #7aa2f7;
+    border-left: thick $primary;
     padding: 0 1;
     margin: 1 0 0 1;
-    color: #f0f4fc;
-    background: #181926;
+    color: $bright;
+    background: $card;
 }
+/* kern — bare text on canvas: a reply should read as speech, not as UI */
 .assistant {
     padding: 0 1 0 1;
     margin-left: 1;
-    color: #c0caf5;
+    color: $text;
 }
-.assistant Markdown {
-    background: transparent;
-}
+.assistant Markdown { background: transparent; }
 .stream {
     padding: 0 1 0 1;
     margin-left: 1;
-    border-left: tall #7aa2f7;
+    color: $text;
+    border-left: tall $primary;
 }
 
+/* thinking — collapsed by design; a whisper, not a panel */
 .thinking {
     background: transparent;
     border: none;
@@ -247,140 +330,191 @@ Screen { background: transparent; }
     margin: 1 0 0 1;
 }
 .thinking .thinking-text {
-    color: #787e9d;
+    color: $muted;
     text-style: italic;
 }
 CollapsibleTitle {
-    color: #bb9af7;
+    color: $secondary;
     background: transparent;
     padding: 0;
+    margin: 0;
+    transition: color 160ms in_out_quad;
+}
+CollapsibleTitle:hover {
+    background: transparent;
+    color: $bright;
 }
 
+/* tool calls — one card per call; the left rail is the state at a glance */
 .tool {
-    border-left: tall #bb9af7;
     padding: 0 1 0 1;
     margin: 1 0 0 1;
-    background: #181926;
-    border: round #222538;
+    background: $card;
+    border: round $border;
+    border-left: tall $secondary;
+    transition: background 220ms in_out_quad, border 220ms in_out_quad;
 }
-.tool.running {
-    border-left: tall #e0af68;
-}
-.tool.ok {
-    border-left: tall #73daca;
-}
-.tool.failed {
-    border-left: tall #f7768e;
-    background: #1e161c;
-}
+.tool.running { border-left: tall $warning; background: $warn-soft; }
+.tool.ok      { border-left: tall $teal; }
+.tool.failed  { border-left: tall $error; background: $danger-soft; }
 
-.note {
-    color: #787e9d;
-    padding: 0 1 0 2;
-    text-style: italic;
-}
-.hello {
-    padding: 1 2;
-    margin: 1 0;
-    color: #c0caf5;
-    border: round #2c3047;
-    background: #181926;
-}
-.error {
-    border-left: tall #f7768e;
-    padding: 0 1 0 1;
-    margin: 1 0 0 1;
-    color: #f7768e;
-    background: #1e161c;
-}
-.todo {
-    border-left: tall #73daca;
-    padding: 0 1 0 1;
-    margin: 1 0 0 1;
-    background: #181926;
-    border: round #222538;
-}
-.queued {
-    color: #e0af68;
-    padding: 0 1 0 2;
-    text-style: italic;
-}
+.note    { color: $muted;   padding: 0 1 0 2; text-style: italic; }
+.queued  { color: $warning; padding: 0 1 0 2; text-style: italic; }
 .waiting {
     padding: 0 1 0 1;
     margin-left: 1;
-    border-left: tall #7aa2f7;
-    color: #787e9d;
+    border-left: tall $primary;
+    color: $muted;
     text-style: italic;
 }
 
-/* ── modals ────────────────────────────────────────────────────────── */
-Approve {
-    align: center middle;
+/* welcome — the one card allowed a full frame: first impressions */
+.hello {
+    padding: 1 2;
+    margin: 1 0;
+    color: $text;
+    border: round $border-hi;
+    background: $card;
 }
-#dlg {
-    width: 86;
+
+.error {
+    border-left: tall $error;
+    padding: 0 1 0 1;
+    margin: 1 0 0 1;
+    color: $error;
+    background: $danger-soft;
+}
+
+/* todo — plan card: teal rail, progress bar rendered inside */
+.todo {
+    padding: 0 1 0 1;
+    margin: 1 0 0 1;
+    background: $card;
+    border: round $border;
+    border-left: tall $teal;
+}
+
+/* ── activity strip: one line of live truth while a turn runs ───────── */
+#status {
+    dock: bottom;
+    height: 1;            /* single row: no border, or the text row vanishes */
+    padding: 0 2;
+    color: $warning;
+    background: $chrome;
+    text-style: bold;
+}
+
+/* ── prompt: the one thing you touch — the strongest affordance here ── */
+#prompt {
+    border: round $border-hi;
+    color: $bright;
     height: auto;
-    max-height: 28;
-    background: #181926;
-    border: round #e0af68;
+    max-height: 12;
+    min-height: 3;
+    background: $card;
+    padding: 0 1;
+    margin: 0 0 0 0;
+    scrollbar-color: $border-hi transparent;
+    scrollbar-color-hover: $primary transparent;
+    scrollbar-background: transparent;
+    transition: border 160ms in_out_quad, background 160ms in_out_quad;
+}
+#prompt:focus {
+    border: round $primary;
+    background: $card-hi;
+}
+#prompt .text-area--cursor {
+    background: $bright;
+    color: $chrome;
+    text-style: none;
+}
+#prompt .text-area--cursor-line { background: $chip; }
+
+/* ── footer: context meter + keycaps ────────────────────────────────── */
+#bar {
+    dock: bottom;
+    height: 1;            /* single row: the prompt card above is the divider */
+    padding: 0 2;
+    background: $chrome;
+    color: $muted;
+}
+
+/* ── modals: amber = decide, blue = choose ──────────────────────────── */
+Approve { align: center middle; }
+#dlg {
+    width: 96;
+    max-width: 94%;
+    height: auto;
+    max-height: 80%;
+    background: $panel;
+    border: round $warning;
     padding: 1 2;
 }
 #dlg .q {
-    color: #f0f4fc;
+    color: $bright;
+    text-style: bold;
     margin-bottom: 1;
 }
-#dlg .diff {
-    color: #c0caf5;
-}
+#dlg .diff { color: $text; }
 #dlg Button {
     margin: 0 1;
-    background: #202234;
-    color: #c0caf5;
-    border: round #2c3047;
+    background: $chip;
+    color: $text;
+    border: round $border-hi;
+    transition: background 140ms in_out_quad, color 140ms in_out_quad;
 }
 #dlg Button:hover {
-    background: #7aa2f7;
-    color: #13141f;
+    background: $primary;
+    color: $chrome;
+    text-style: bold;
 }
+/* Variants carry the meaning: allow=green, always=blue, deny=red. Without
+   these the id-scoped rule above (higher specificity than Textual's default
+   Button.-success etc.) would flatten all three to one anonymous chip. */
+#dlg Button.-success { background: $ok-soft;      color: $success; border: round $success; }
+#dlg Button.-primary { background: $primary-soft; color: $primary; border: round $primary; }
+#dlg Button.-error   { background: $danger-soft;  color: $error;   border: round $error; }
+#dlg Button.-success:hover { background: $success; color: $chrome; }
+#dlg Button.-primary:hover { background: $primary; color: $chrome; }
+#dlg Button.-error:hover   { background: $error;   color: $chrome; }
 
-ModelPicker {
-    align: center middle;
-}
-SessionPicker {
-    align: center middle;
-}
+ModelPicker { align: center middle; }
+SessionPicker { align: center middle; }
 #mp {
-    width: 88;
-    max-width: 92%;
+    width: 92;
+    max-width: 94%;
     height: auto;
-    max-height: 28;
-    background: #181926;
-    border: round #7aa2f7;
+    max-height: 30;
+    background: $panel;
+    border: round $primary;
     padding: 1 2;
 }
 #mp ListView {
     height: auto;
-    max-height: 20;
-    background: transparent;
-    border: solid #222538;
-    scrollbar-color: #2c3047 transparent;
+    max-height: 22;
+    background: $card;
+    border: round $border;
+    scrollbar-color: $border-hi transparent;
+    scrollbar-background: transparent;
 }
 #mp ListItem {
     padding: 0 1;
-    color: #c0caf5;
+    color: $text;
+    background: transparent;
 }
 #mp ListItem:hover {
-    background: #202234;
-    color: #f0f4fc;
+    background: $chip;
+    color: $bright;
 }
 #mp ListItem.-highlight {
-    background: #24273c;
-    color: #7dcfff;
+    background: $primary-soft;
+    color: $accent;
     text-style: bold;
-    border-left: tall #7aa2f7;
+    border-left: tall $primary;
 }
 #mp ListView > Contents {
-    scrollbar-color: #2c3047 transparent;
+    scrollbar-color: $border-hi transparent;
+    scrollbar-background: transparent;
 }
 """
 
@@ -403,11 +537,11 @@ def _diff_text(diff: str, max_lines: int = 30) -> str:
         if line.startswith("+++") or line.startswith("---"):
             out.append(f"[dim]{esc}[/]")
         elif line.startswith("+"):
-            out.append(f"[#9ece6a]{esc}[/]")
+            out.append(f"[$success]{esc}[/]")
         elif line.startswith("-"):
-            out.append(f"[#f7768e]{esc}[/]")
+            out.append(f"[$error]{esc}[/]")
         elif line.startswith("@@"):
-            out.append(f"[#7dcfff]{esc}[/]")
+            out.append(f"[$accent]{esc}[/]")
         else:
             out.append(f"[dim]{esc}[/]")
     return "\n".join(out)
@@ -443,7 +577,7 @@ class ThinkingBlock(Collapsible):
 
 class UserMsg(Static):
     def __init__(self, text):
-        super().__init__(f"[#c0caf5 b]you[/]  {safe(text)}", classes="user", markup=True)
+        super().__init__(f"[$text b]you[/]  {safe(text)}", classes="user", markup=True)
 
 
 class ToolCard(Static):
@@ -487,11 +621,11 @@ class ToolCard(Static):
         el = time.monotonic() - self._t0
         # dim the elapsed timer once finished; keep the mark colored
         timing = f"  [dim]{el:.1f}s[/]" if el >= 0.05 else ""
-        return (f"{mark} [#bb9af7]{icon}[/] [b]{safe(self.tname)}[/] "
+        return (f"{mark} [$secondary]{icon}[/] [b]{safe(self.tname)}[/] "
                 f"[dim]{head}[/]{timing}")
 
     def _pending_text(self):
-        self.update(self._head(f"[#e0af68]{self._frame}[/]"))
+        self.update(self._head(f"[$warning]{self._frame}[/]"))
 
     def tick(self, frame: str):
         """Animate the leading glyph + elapsed timer while the tool runs."""
@@ -512,10 +646,10 @@ class ToolCard(Static):
             return   # nothing to show yet — keep the pending look
         if self.result is not None:
             ok = not self.result.startswith(("error", "denied")) and not __import__("re").search(r"^exit=(?!0(?:\s|$))-?\d+", self.result)
-            mark = "[#9ece6a]✓[/]" if ok else "[#f7768e]✗[/]"
+            mark = "[$success]✓[/]" if ok else "[$error]✗[/]"
             self._set_state("ok" if ok else "failed")
         else:
-            mark = f"[#e0af68]{self._frame}[/]"   # still running
+            mark = f"[$warning]{self._frame}[/]"   # still running
             self._set_state("running")
         head = self._head(mark) + "\n"
         if self.diff:
@@ -531,23 +665,50 @@ class TodoCard(Static):
 
     def render_items(self, items):
         done = sum(1 for it in items if it.get("status") == "done")
-        lines = [f"[#7dcfff][bold]plan[/bold][/]  [dim]{done}/{len(items)}[/]"]
+        lines = [f"[$accent][bold]plan[/bold][/]  [dim]{done}/{len(items)}[/]"]
         for it in items:
             st = it.get("status", "pending")
-            mark, style = {"done": ("✓", "#9ece6a"), "active": ("●", "#e0af68"),
+            mark, style = {"done": ("✓", "$success"), "active": ("●", "$warning"),
                            "pending": ("○", "dim")}.get(st, ("○", "dim"))
             if st == "done":
-                lines.append(f"  [#9ece6a]{mark}[/] [dim strike]{safe(it.get('text', ''))}[/]")
+                lines.append(f"  [$success]{mark}[/] [dim strike]{safe(it.get('text', ''))}[/]")
             elif st == "active":
-                lines.append(f"  [#e0af68]{mark}[/] [b]{safe(it.get('text', ''))}[/]")
+                lines.append(f"  [$warning]{mark}[/] [b]{safe(it.get('text', ''))}[/]")
             else:
                 lines.append(f"  [dim]{mark}[/] [dim]{safe(it.get('text', ''))}[/]")
         self.update("\n".join(lines))
 
 
-class Approve(ModalScreen[str]):
+# Textual merges BINDINGS only from DOMNode subclasses (`_merge_bindings`
+# skips plain mixins), so the keys every modal must keep answering live in a
+# tuple that each modal splats into its OWN BINDINGS list; the *actions* are
+# shared through the mixin.
+#
+# Why they are needed at all: Textual drops the App from the binding chain
+# while a ModalScreen is on top, so the footer's advertised ctrl-t (theme)
+# and ctrl-d/q (quit) would silently do nothing exactly when a dialog is
+# demanding attention. Navigation keys (ctrl-p / ctrl-r / ctrl-n) are
+# deliberately NOT mirrored — pushing a picker over a picker only builds a
+# stack the user then has to unwind.
+_MODAL_BINDINGS = (Binding("ctrl+t", "kern_theme", show=False),
+                   Binding("ctrl+d", "kern_quit", show=False),
+                   Binding("ctrl+q", "kern_quit", show=False))
+
+
+class _ModalKeys:
+    """Shared actions for the app-level keys mirrored into every modal."""
+
+    def action_kern_theme(self):
+        self.app.action_toggle_theme()
+
+    def action_kern_quit(self):
+        self.app.exit()
+
+
+class Approve(_ModalKeys, ModalScreen[str]):
     BINDINGS = [Binding("y", "pick('y')", "allow"), Binding("n", "pick('n')", "deny"),
-                Binding("a", "pick('a')", "always"), Binding("escape", "pick('n')")]
+                Binding("a", "pick('a')", "always"), Binding("escape", "pick('n')"),
+                *_MODAL_BINDINGS]
 
     def __init__(self, desc: str, diff: str | None = None):
         super().__init__()
@@ -556,7 +717,7 @@ class Approve(ModalScreen[str]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dlg"):
-            yield Label("[#e0af68]⚠[/] kern wants to act", markup=True)
+            yield Label("[$warning]⚠[/] kern wants to act", markup=True)
             if self.diff:
                 yield Static(_diff_text(self.diff, 18), classes="diff", markup=True)
             else:
@@ -574,8 +735,8 @@ class Approve(ModalScreen[str]):
         self.dismiss(ev.button.id)
 
 
-class ModelPicker(ModalScreen[str | None]):
-    BINDINGS = [Binding("escape", "cancel")]
+class ModelPicker(_ModalKeys, ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel"), *_MODAL_BINDINGS]
 
     def __init__(self, rows: list[tuple[str, str]], current: str):
         super().__init__()
@@ -584,10 +745,10 @@ class ModelPicker(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mp"):
-            yield Label("[#7dcfff]switch model[/]  [dim]enter to select · esc to close[/]", markup=True)
+            yield Label("[$accent]switch model[/]  [dim]enter to select · esc to close[/]", markup=True)
             items = []
             for name, status in self.rows:
-                cur = " [#e0af68]●[/]" if name == self.current else ""
+                cur = " [$warning]●[/]" if name == self.current else ""
                 items.append(ListItem(Label(f"{name}  {status}{cur}", markup=True), id=f"m-{abs(hash(name))}"))
             yield ListView(*items)
 
@@ -637,8 +798,8 @@ def _picker_label(sid: str, info: dict) -> str:
     return f"{prev}  ·  {stamp}".rstrip(" ·")
 
 
-class SessionPicker(ModalScreen[str | None]):
-    BINDINGS = [Binding("escape", "cancel")]
+class SessionPicker(_ModalKeys, ModalScreen[str | None]):
+    BINDINGS = [Binding("escape", "cancel"), *_MODAL_BINDINGS]
 
     def __init__(self, rows: list[dict], on_pick: "asyncio.Future | None" = None):
         super().__init__()
@@ -653,10 +814,10 @@ class SessionPicker(ModalScreen[str | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mp"):
-            yield Label("[#7dcfff]resume session[/]  [dim]enter to open · esc to close[/]", markup=True)
+            yield Label("[$accent]resume session[/]  [dim]enter to open · esc to close[/]", markup=True)
             items = []
             for r in self.rows:
-                label = (f"[#9ece6a]{r['id']}[/]  [dim]{r['turns']} turns · "
+                label = (f"[$success]{r['id']}[/]  [dim]{r['turns']} turns · "
                          f"{safe(r['preview'] or '(empty)')}[/]")
                 items.append(ListItem(Label(label, markup=True)))
             yield ListView(*items)
@@ -822,6 +983,7 @@ class KernApp(App):
                 Binding("ctrl+n", "new_session", "new", show=False),
                 Binding("ctrl+r", "resume", "resume", show=False),
                 Binding("ctrl+p", "models", "models", show=False),
+                Binding("ctrl+t", "toggle_theme", "theme", show=False),
                 Binding("ctrl+l", "clear", "clear", show=False)]
 
     def __init__(self, model: str | None = None, cwd: str | None = None):
@@ -829,6 +991,12 @@ class KernApp(App):
         # widget background becomes ansi_default -> the terminal's own
         # background (and palette) shows through. Real transparency.
         super().__init__(ansi_color=os.environ.get("KERN_ANSI", "1") != "0")
+        # "Midnight Glass" (dark) + "Daylight" (light). Registered before the
+        # first paint so every CSS variable and every inline [$accent] in
+        # markup resolves through one palette; ctrl+t swaps the whole app.
+        for _theme in _THEMES:
+            self.register_theme(_theme)
+        self.theme = os.environ.get("KERN_THEME") or KERN_DARK
         self.model = model or DEFAULT_MODEL
         self.cwd = cwd or os.getcwd()
         self.client = Client()
@@ -910,6 +1078,9 @@ class KernApp(App):
             self.query_one('#inspector').display = event.size.width >= 110
         except Exception:
             pass
+        # Re-fit the header through the tick, not here: a drag-resize fires
+        # dozens of events and _refresh_chrome shells out to git.
+        self._chrome_dirty = True
 
     def _refresh_inspector(self):
         try:
@@ -1261,13 +1432,13 @@ class KernApp(App):
                             # visible duplicate. Compare the plain text to skip it.
                             current = getattr(w, "_rendered_text", None)
                             if current != reply:
-                                w.update(RichMarkdown(reply, justify="left"))
+                                w.update(self._md(reply))
                                 w._rendered_text = reply
                             w.set_classes("assistant")
                             w.display = True
                         else:
                             # nothing streamed live (pure attach/view case)
-                            widget = Static(RichMarkdown(reply, justify="left"),
+                            widget = Static(self._md(reply),
                                             classes="assistant")
                             widget._rendered_text = reply
                             self.chat.mount(widget)
@@ -1299,7 +1470,7 @@ class KernApp(App):
         self.query_one("#status").display = True
         self._dismiss_waiting()
         self._waiting_widget = Static(
-            f"[#7aa2f7 b]kern[/]  {STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
+            f"[$primary b]kern[/]  {STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
         self.chat.mount(self._waiting_widget)
         self.chat.scroll_end(animate=False)
 
@@ -1363,10 +1534,17 @@ class KernApp(App):
         if limit:
             pct = used / limit * 100
             # color = pressure: calm green → amber → red as context fills
-            col = "#9ece6a" if pct < 60 else ("#e0af68" if pct < 85 else "#f7768e")
-            res = f"[{col}]ctx {pct:.0f}%[/] [dim]({used // 1000}k/{limit // 1000}k)[/]"
+            col = "$success" if pct < 60 else ("$warning" if pct < 85 else "$error")
+            # ...and the same pressure as *shape*: six blocks, filled ones
+            # tracking pct, so "halfway to the ceiling" reads in one glance
+            # without parsing a number. Empty blocks sit at $chip-hi —
+            # visible, but quieter than the filled rail.
+            filled = max(0, min(6, round(pct / 100 * 6)))
+            meter = f"[{col}]{'▰' * filled}[/][$chip-hi]{'▱' * (6 - filled)}[/]"
+            res = (f"[{col}]ctx {pct:.0f}%[/] {meter} "
+                   f"[dim $muted]{used // 1000}k/{limit // 1000}k[/]")
         else:
-            res = f"[dim]ctx≈{used:,}[/]"
+            res = f"[dim $muted]ctx≈{used // 1000}k[/]"
         self._last_ctx_events_len = curr_len
         self._last_ctx_str = res
         return res
@@ -1376,7 +1554,7 @@ class KernApp(App):
         """A key-cap hint: the key sits on a small raised chip, the verb
         beside it stays quiet. Reading the footer should feel like looking
         at a keyboard, not a sentence."""
-        return f"[#f0f4fc on #202234] {key} [/] [dim #787e9d]{word}[/]"
+        return f"[$bright on $chip-hi] {key} [/] [dim $muted]{word}[/]"
 
     def _bar_hints(self) -> str:
         # width-adaptive: the footer never wraps or truncates mid-hint —
@@ -1386,7 +1564,8 @@ class KernApp(App):
         if w >= 118:
             return (f"{k('enter', 'send')}  {k('ctrl-c', 'stop')}  "
                     f"{k('/help', 'commands')}  {k('ctrl-p', 'models')}  "
-                    f"{k('ctrl-r', 'resume')}  {k('ctrl-n', 'new')}")
+                    f"{k('ctrl-r', 'resume')}  {k('ctrl-t', 'theme')}  "
+                    f"{k('ctrl-n', 'new')}")
         if w >= 96:
             return (f"{k('enter', 'send')}  {k('ctrl-c', 'stop')}  "
                     f"{k('/help', 'commands')}  {k('ctrl-p', 'models')}")
@@ -1401,13 +1580,45 @@ class KernApp(App):
         # WP8 nit: idle/busy chip so the operator can tell at a glance
         # whether the loop is running or parked. Use _turn_running() as the
         # source of truth (it checks both turn_worker and remote).
-        state_chip = "[#9ece6a]● idle[/]" if not self._turn_running() else "[#f7768e]● busy[/]"
-        self.query_one("#tleft").update(
-            f" [#7aa2f7 b]⚡ KERN[/] [dim]v{safe(KERN_VERSION)}[/]  "
-            f"{state_chip}  [#7dcfff b]{model_name}[/]{branch_str}")
-        self.query_one("#tright").update(
-            f"[dim #787e9d]📁 {safe(self._short_cwd())}[/]  "
-            f"[dim #565f89]id:[/] [dim]{safe(self.session.id[:8])}[/] ")
+        # Amber = working, red is reserved for *failed* (matches the tool
+        # cards' rails), so a long turn never looks like an emergency.
+        state_chip = ("[$success]● idle[/]" if not self._turn_running()
+                      else "[$warning]● working[/]")
+        left = (f" [$primary b]⚡ KERN[/] [dim]v{safe(KERN_VERSION)}[/]  "
+                f"{state_chip}  [$accent b]{model_name}[/]{branch_str}")
+        self.query_one("#tleft").update(left)
+        # `or "new"` matters: on a fresh store the session has no id yet, and
+        # slicing None here used to raise inside on_mount — which left the
+        # whole header blank instead of showing what it could.
+        sid = safe((self.session.id or "new")[:8])
+        cwd_txt = safe(self._short_cwd())
+        width = self.size.width if self.size else 120
+        # Responsive right side: the header is one row, so it must never wrap
+        # into the brand. Shed the least useful part first (session id), then
+        # shorten the path, then drop the side entirely.
+        left_len = self._markup_len(left)
+        for right in (f"[dim $muted]📁 {cwd_txt}[/]  [dim $faint]id:[/] [dim]{sid}[/] ",
+                      f"[dim $muted]📁 {cwd_txt}[/] ",
+                      f"[dim $muted]📁 {cwd_txt.rsplit('/', 1)[-1]}[/] ",
+                      ""):
+            if left_len + self._markup_len(right) + 2 <= width:
+                break
+        self.query_one("#tright").update(right)
+
+    def _markup_len(self, markup: str) -> int:
+        """Cell width of a Textual markup string, theme variables resolved.
+
+        Rich's own parser cannot read `$theme` styles — it takes [$primary]
+        for literal text and then fails on the closing [/] — so width is
+        measured through Textual's Content, which knows the active theme and
+        gets emoji / wide-character widths right. Falls back to a raw length
+        (an over-estimate, so the header sheds parts early rather than crash).
+        """
+        try:
+            from textual.content import Content
+            return Content.from_markup(markup, theme=self.current_theme).cell_length
+        except Exception:
+            return len(markup)
 
     def _git_branch(self) -> str:
         try:
@@ -1437,6 +1648,10 @@ class KernApp(App):
             pass
 
     def _on_tick_inner(self):
+        if getattr(self, "_chrome_dirty", False):
+            # Debounced: pay for the git shell-out at most once per tick.
+            self._chrome_dirty = False
+            self._refresh_chrome()
         right = self._ctx_info()
         if self._turn_running():
             el = time.monotonic() - self._t0
@@ -1464,11 +1679,41 @@ class KernApp(App):
     _verb = "thinking…"
 
     def _welcome(self):
+        # The first thing you see, so it answers three questions at once:
+        # what is this, where is it pointed, and how do I drive it. Keycaps
+        # (self._k) make the bindings look pressable rather than quoted.
+        branch = self._git_branch()
+        where = (f"[dim $muted]{safe(self._short_cwd())}[/]"
+                 + (f"  [dim $faint]⎇ {safe(branch)}[/]" if branch else ""))
+        k = self._k
+        # Fit the keycap row to the column the card actually lands in. The
+        # inspector rail eats ~38 cells, so app width is the wrong measure and
+        # a fixed list wraps mid-cap on narrow terminals — caps are added
+        # left-to-right only while they still fit on one line.
+        try:
+            insp = self.query_one("#inspector")
+            insp_w = insp.size.width if (insp.display and insp.size.width) else 38
+        except Exception:
+            insp_w = 38
+        app_w = self.size.width if self.size else 120
+        avail = max(30, app_w - insp_w - 10)      # 10 = chat + card padding
+        caps: list[str] = []
+        used = 0
+        for key, word in (("enter", "send"), ("ctrl-t", "theme"), ("ctrl-p", "models"),
+                          ("ctrl-r", "resume"), ("/help", "commands")):
+            need = len(key) + len(word) + 6       # chip padding + gap + separator
+            if caps and used + need > avail:
+                break
+            caps.append(k(key, word))
+            used += need
         self.chat.mount(Static(
-            f"[#7aa2f7 b]⚡ KERN[/] [dim #787e9d]v{safe(KERN_VERSION)}[/]  [#73daca]●[/] [dim]ready[/]\n"
-            "[dim]Autonomous execution engine · Instant feel · Verified results[/]\n"
-            "[dim]Commands:[/] [#7dcfff]/help[/] [dim]·[/] [#7dcfff]/models[/] [dim]· Tools mount on demand: e.g.[/] "
-            "[#7dcfff][mount: git-workflow][/]",
+            f"[$primary b]⚡ KERN[/] [dim $muted]v{safe(KERN_VERSION)}[/]   "
+            f"[$teal]●[/] [dim]ready[/]   [$accent b]{safe(self.model)}[/]\n"
+            f"{where}   [dim $faint]session[/] "
+            f"[dim $muted]{safe((self.session.id or 'new')[:8])}[/]\n"
+            f"{'  '.join(caps)}\n"
+            "[dim $muted]Capabilities mount on demand:[/] "
+            "[$accent][mount: git-workflow][/]",
             classes="hello", markup=True))
         self.chat.scroll_end(animate=False)
 
@@ -1680,7 +1925,7 @@ class KernApp(App):
         self._stream_buf = []
         self._stream_dirty = False
         if text:
-            w.update(RichMarkdown(text, justify="left"))
+            w.update(self._md(text))
             w._rendered_text = text      # so turn_end can skip an identical repaint
             w.set_classes("assistant")
         else:
@@ -1774,7 +2019,7 @@ class KernApp(App):
         self.query_one("#status").display = True
         self._dismiss_waiting()
         self._waiting_widget = Static(
-            f"[#7aa2f7 b]kern[/]  {STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
+            f"[$primary b]kern[/]  {STREAMING_CURSOR[0]} [dim]thinking…[/]", classes="waiting", markup=True)
         self.chat.mount(self._waiting_widget)
         self.chat.scroll_end(animate=False)
         self._t0 = time.monotonic()
@@ -1831,6 +2076,48 @@ class KernApp(App):
 
     def action_models(self):
         self.run_worker(self._model_picker(), name="picker", exclusive=False)
+
+    def action_toggle_theme(self):
+        """ctrl+t — flip the whole app between dark and light in one frame.
+
+        Because nothing in the UI hard-codes a colour (CSS and markup both
+        speak in $theme variables), swapping `self.theme` re-skins chrome,
+        cards, rails, dialogs and the stream at once. The 220ms colour
+        transitions in CSS make it read as a dissolve, not a flash.
+        """
+        self.theme = KERN_LIGHT if self.theme == KERN_DARK else KERN_DARK
+        self.notify(f"{'Daylight' if self.theme == KERN_LIGHT else 'Midnight Glass'} theme",
+                    title="Theme", timeout=2.0)
+        # Replies already in the stream hold rich-rendered colours baked at
+        # render time, so they need an explicit repaint to follow the flip.
+        self._repaint_markdown()
+        self._on_tick_inner()          # repaint topbar/footer in the new palette
+
+    # ---- markdown that follows the theme ------------------------------
+    def _code_theme(self) -> str:
+        """Pygments style matching the app theme's brightness."""
+        return CODE_THEME_DARK if self.current_theme.dark else CODE_THEME_LIGHT
+
+    def _md(self, text: str) -> KernMarkdown:
+        """Render a reply as markdown tuned to the current theme."""
+        return KernMarkdown(text, justify="left", code_theme=self._code_theme())
+
+    def _repaint_markdown(self):
+        """Re-render the replies already on screen after a theme flip.
+
+        `Static.content` is the accessor in Textual 8 (there is no public
+        `.renderable`), and the pygments palette is baked into the rich object
+        at construction — so a flip has to rebuild it, not just recolour CSS.
+        """
+        try:
+            for w in self.chat.children:
+                if not isinstance(w, Static):
+                    continue
+                content = w.content
+                if isinstance(content, KernMarkdown):
+                    w.update(self._md(content.markup))
+        except Exception:
+            pass
 
     def action_resume(self):
         if self.remote is not None:
@@ -1927,7 +2214,7 @@ class KernApp(App):
             self.chat.mount(UserMsg(ev.get("text", "")))
         elif kind == "assistant":
             if ev.get("text"):
-                self.chat.mount(Static(RichMarkdown(ev["text"], justify="left"),
+                self.chat.mount(Static(self._md(ev["text"]),
                                        classes="assistant"))
             for tc in ev.get("tool_calls", []):
                 card = ToolCard(tc["name"], tc.get("arguments", {}))
@@ -1971,6 +2258,20 @@ class KernApp(App):
             return
         if cmd == "/help":
             self._chat_note(HELP)
+        elif cmd == "/theme":
+            # /theme dark|light — or bare /theme to flip, same path as ctrl+t.
+            # Whole-app re-skin in one frame: nothing here hard-codes a colour.
+            want = arg.lower()
+            if want in ("dark", "midnight", KERN_DARK):
+                self.theme = KERN_DARK
+            elif want in ("light", "day", "daylight", KERN_LIGHT):
+                self.theme = KERN_LIGHT
+            else:
+                self.action_toggle_theme()
+                return
+            self._refresh_chrome()
+            self._chat_note("theme → " + ("Daylight" if self.theme == KERN_LIGHT
+                                         else "Midnight Glass"))
         elif cmd == "/model" and arg:
             self.model = arg
             self._explicit_model = True
@@ -2168,9 +2469,9 @@ class KernApp(App):
             name = m["id"]
             h = health.get(name, {})
             if h.get("ok"):
-                status = f"[#9ece6a]✓ {h.get('ttft', '?')}s[/]"
+                status = f"[$success]✓ {h.get('ttft', '?')}s[/]"
             elif h:
-                status = "[#f7768e]✗[/]"
+                status = "[$error]✗[/]"
             else:
                 status = "[dim]·[/]"
             rows.append((name, status))
@@ -2189,6 +2490,7 @@ class KernApp(App):
 
 
 HELP = ("/model <name> · ctrl-p model picker · /probe re-handshake\n"
+        "/theme dark|light (ctrl+t) re-skin the whole app in one frame\n"
         "ctrl+v paste image from clipboard (vision models) · esc clear attachment\n"
         "/new fresh session · /resume (ctrl+r) pick an old session\n"
         "/restart save + full restart (daemon included), same session\n"
