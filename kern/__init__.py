@@ -28,7 +28,11 @@ import os
 import sys
 from pathlib import Path
 
-_STATIC = "0.3.0"
+# Bump on release; the "+<content hash>" suffix below is derived, never
+# hand-written. Must stay in lockstep with pyproject.toml [project].version
+# and kern/bootstrap._STATIC — tests/test_release.py fails the build if they
+# drift (bootstrap duplicates the literal because __init__ imports it).
+_STATIC = "0.4.0"
 
 
 def _hash_pkg(pkg_dir: Path) -> str:
@@ -85,6 +89,11 @@ __version__: str = (
     else _hash_pkg(Path(__file__).resolve().parent)
 )
 
+#: Plain semver base of __version__, without the content-hash suffix. This is
+#: what protocol handshakes and user-facing "which release is this" answers
+#: should use — a strict-semver parser chokes on the "+<hash>" build metadata.
+__version_base__: str = _STATIC
+
 #: Version of the code actually imported by THIS process (may be a frozen copy).
 running_version: str = _hash_pkg(Path(__file__).resolve().parent)
 
@@ -94,4 +103,5 @@ running_is_stale: bool = _running_stale
 #: The canonical repo root, or None for a snapshot-only install.
 repo_root: "Path | None" = _repo_root
 
-__all__ = ["__version__", "running_version", "running_is_stale", "repo_root"]
+__all__ = ["__version__", "__version_base__", "running_version",
+           "running_is_stale", "repo_root"]

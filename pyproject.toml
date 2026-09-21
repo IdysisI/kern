@@ -1,6 +1,6 @@
 [project]
 name = "kern-agent"
-version = "0.3.0"
+version = "0.4.0"
 description = "Kern — an OS-kernel-style agentic harness for one user-chosen model"
 readme = "README.md"
 license = { text = "MIT" }

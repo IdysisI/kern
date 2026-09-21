@@ -27,6 +27,20 @@ SKILL_DIRS = [KERN_HOME / "skills", Path.home() / ".agents" / "skills"]
 MCP_CONFIG = KERN_HOME / "mcp.json"
 
 
+def _pkg_version() -> str:
+    """Plain semver base for protocol handshakes (no "+<content hash>" suffix).
+
+    Imported lazily and guarded: the MCP initialize handshake must never fail
+    because a version lookup did, and a strict-semver server would reject the
+    content-addressed `__version__` string outright.
+    """
+    try:
+        from . import __version_base__
+        return str(__version_base__)
+    except Exception:
+        return "0.0.0"
+
+
 @dataclass
 class Capability:
     name: str
@@ -107,7 +121,7 @@ class MCPClient:
                 self._reader = asyncio.create_task(self._read_responses())
                 result = await self._rpc('initialize', {
                     'protocolVersion':'2025-11-25','capabilities':{},
-                    'clientInfo':{'name':'kern','version':'0.3.0'}})
+                    'clientInfo':{'name':'kern','version':_pkg_version()}})
                 if result.get('protocolVersion') not in ('2024-11-05','2025-03-26','2025-06-18','2025-11-25'):
                     raise RuntimeError('unsupported negotiated MCP protocol')
                 await self._notify('notifications/initialized', {})
