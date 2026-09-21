@@ -1,22 +1,35 @@
-.venv*/
-.test-runs/
-dist/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / tooling caches
 .pytest_cache/
-*.raw
-*.svg
-*.png
-# but README/repo images live in docs/assets — always track those
-!docs/assets/*.svg
-!docs/assets/*.png
-/tmp/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
-*.kern-lock
-*.kern-tmp
-scratch/
-bench/
+# Kern runtime state (never commit local journals/sessions)
+.kern/
 
-# generated/subagent artifacts
-research/
-KERN.md
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Local env files
+.env
+.env.*

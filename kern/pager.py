@@ -288,6 +288,8 @@ def materialize(events: list[dict], session) -> list[dict]:
                     full = session.offload(f"t{ev['n']}", text)
                     out_text += (f"\n[full output: {full} — use read(path) "
                                  f"with offset/limit to inspect any part]")
+                if ev.get("coverage"):
+                    out_text += f"\n[{ev['coverage']}]"
                 m_item = {"role": "tool", "tool_call_id": ev.get("call_id", ""), "text": out_text}
                 if ev.get("media"):
                     m_item["media"] = ev["media"]
@@ -299,16 +301,22 @@ def materialize(events: list[dict], session) -> list[dict]:
             elif i not in keep_inline and n - i > STALE_AGE and len(text) > STALE_MIN \
                     :
                 path = session.offload(f"t{ev['n']}", text)
+                cleared = (f"[old tool result cleared: {ev.get('name', '?')} — "
+                           f"{len(text):,} bytes -> {path}. "
+                           f"Head: {re.sub(r'\s+', ' ', text[:140]).strip()!r}. "
+                           f"Use read(path) if you need it again.]")
+                if ev.get("coverage"):
+                    cleared += f"\n[{ev['coverage']}]"
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
-                             "text": f"[old tool result cleared: {ev.get('name', '?')} — "
-                                     f"{len(text):,} bytes -> {path}. "
-                                     f"Head: {re.sub(r'\s+', ' ', text[:140]).strip()!r}. "
-                                     f"Use read(path) if you need it again.]"})
+                             "text": cleared})
                 # Deliberately NOT registered: the body is gone from this view,
                 # so it is not a valid dedup target.
             else:
+                sq_text = _squash(text)
+                if ev.get("coverage"):
+                    sq_text += f"\n[{ev['coverage']}]"
                 msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""),
-                             "text": _squash(text)})
+                             "text": sq_text})
                 # Body visible (squashed): valid dedup target.
                 if rh:
                     seen_result_hashes[rh] = ev.get("n", i)
@@ -353,6 +361,19 @@ def budget(events: list[dict], session) -> dict:
             out["tool_bytes"] += size
     out["approx_tokens"] = (out["assistant_bytes"] + out["user_bytes"] + out["tool_bytes"]) // 4
     out["scope"] = "projected messages only; full system/tools budget is enforced by ContextManager"
+    # WP7: aggregate hygiene counters across all turn_end events. Sums per
+    # key — multiple turns in the journal sum naturally.
+    hygiene = {}
+    for ev in events:
+        if ev.get("kind") != "hygiene":
+            continue
+        for k, v in ev.items():
+            if k in ("kind", "n", "ts"):
+                continue
+            if isinstance(v, (int, float)):
+                hygiene[k] = hygiene.get(k, 0) + v
+    if hygiene:
+        out["hygiene"] = hygiene
     return out
 
 

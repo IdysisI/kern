@@ -140,6 +140,62 @@ class FileSlate:
         except Exception:
             pass
 
+    def record_content(self, path: str, full_text: str) -> None:
+        """Record content we just WROTE (write/edit success) — ground truth,
+        no re-read needed. Keeps the slate hot across mutations so the next
+        read of the same range is answered from held state."""
+        try:
+            self._clock += 1
+            p = self._resolve(path)
+            if p is None:
+                return
+            sig = _sig(p)                      # stat AFTER the atomic write
+            if len(full_text) > _MAX_FILE_CHARS:   # giant file: outline-only entry
+                e = self._entries.get(p) or _Entry(sig)
+                e.lines.clear(); e.lo, e.hi = 10**9, -1
+                e.sig = sig; e.total = None; e.touch = self._clock
+                self._entries[p] = e
+                return
+            lines = full_text.splitlines()     # MUST be splitlines(): parity with _numbered
+            old = self._entries.get(p)
+            e = _Entry(sig)
+            e.lines = {i + 1: ln for i, ln in enumerate(lines)}
+            e.lo, e.hi, e.total = 1, len(lines), len(lines)
+            e.outline = old.outline if old else ""
+            e.touch = self._clock
+            self._entries[p] = e
+            self._evict_if_needed()
+        except Exception:
+            pass   # the slate never breaks a tool call
+
+    def coverage(self, path: str) -> str:
+        """One-line summary of what we hold for path ('' when nothing held).
+        Surfaced on read receipts so the model can see redundant re-reads."""
+        try:
+            p = self._resolve(path)
+            e = self._entries.get(p) if p else None
+            if not e or not e.lines:
+                return ""
+            nums = sorted(e.lines)
+            ranges = []
+            s = pr = nums[0]
+            for n in nums[1:]:
+                if n == pr + 1:
+                    pr = n
+                    continue
+                ranges.append((s, pr)); s = pr = n
+            ranges.append((s, pr))
+            total = e.total or max(nums)
+            stale = "" if _sig(p) == e.sig else " ⚠stale"
+            nxt = next((ln for ln in range(1, total + 1) if ln not in e.lines), None)
+            rs = ",".join(f"{a}-{b}" if a != b else f"{a}" for a, b in ranges)
+            out = f"coverage: held {rs} of {total} lines{stale}"
+            if nxt:
+                out += f" · next unread: {nxt}"
+            return out
+        except Exception:
+            return ""
+
     def set_outline(self, path: str, outline: str) -> None:
         """Attach a structural outline (from codegraph) to a path."""
         try:
@@ -156,7 +212,7 @@ class FileSlate:
             pass
 
     # ── answering ──────────────────────────────────────────────────────
-    def covered_slice(self, path: str, offset: int = 1, limit: int = 200):
+    def covered_slice(self, path: str, offset: int = 1, limit: int = 400):
         """If the file is unchanged and [offset, offset+limit-1] is fully
         held, return the byte-identical text tool_read would return now.
         Otherwise None (caller proceeds with the real read).

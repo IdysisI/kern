@@ -43,3 +43,11 @@ include = ["/kern", "/tests", "/README.md", "/CHANGELOG.md", "/CONTRIBUTING.md",
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# WP8: keep pytest focused on the tests/ tree and adopt the asyncio mode
+# we use throughout the suite (mode=auto → individual @pytest.mark.asyncio
+# isn't needed, but tests still pass with it; we keep it explicit so new
+# tests can't silently regress to the wrong mode).
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

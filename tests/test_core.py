@@ -357,7 +357,9 @@ async def test_inspection_loop_sensor(tmp_path):
     assert len(dupes) == 4, f"identical reads must dedup after the first, got {len(dupes)}"
     assert first['text'].strip() and 'cached' not in first['text']
     for d in dupes:
-        assert d.get('constraint') == 'dedup'
+        # WP1: dedup marks absorbed repeats; the 3rd+ identical hit is
+        # additionally flagged 'nullop' so the loop reaches the breaker.
+        assert d.get('constraint') in ('dedup', 'nullop')
         # F1: the stub must be self-contained — it carries the original's head,
         # so it survives the pager clearing the first result.
         assert 'hello world' in d['text'], "dedup stub must inline a bounded excerpt"
@@ -687,10 +689,11 @@ async def test_py_file_read_triggers_nudge(tmp_path):
 
 @pytest.mark.asyncio
 async def test_unlimited_read_of_large_file_nudges_once(tmp_path):
-    """An unlimited read() of a >200-line file must trigger auto_paginate exactly ONCE
-    (per file); an explicit-slice read must not, and the hint must be executable."""
+    """An unlimited read() of a file larger than the default limit must trigger
+    auto_paginate exactly ONCE (per file); an explicit-slice read must not, and
+    the hint must be executable."""
     big = tmp_path / 'big.py'
-    big.write_text('\n'.join(f'# line {i}' for i in range(400)))
+    big.write_text('\n'.join(f'# line {i}' for i in range(600)))
     calls = iter([
         {'path': str(big)},                 # unlimited, big -> nudge
         {'path': str(big)},                 # unlimited again -> already hinted, no 2nd nudge

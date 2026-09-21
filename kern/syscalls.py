@@ -37,22 +37,22 @@ KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))
 SCHEMAS = [
     {"type": "function", "function": {
         "name": "read",
-        "description": "Read a slice of a file (numbered lines). Prefer slices over whole files. Set full=true to get the entire file (only if under 2000 lines).",
+        "description": "Read a file (numbered lines). Default: first 400 lines; full=true returns the whole file when ≤2000 lines — PREFER full=true for files under ~800 lines (one call beats five slices). Use offset/limit only after map(outline) or grep located what you need. NEVER re-read a range listed in <file-state> or marked held in a [coverage:] line — it is byte-identical and already known to you.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
             "offset": {"type": "integer", "description": "first line, 1-based (default 1)"},
-            "limit": {"type": "integer", "description": "max lines (default 200)"},
+            "limit": {"type": "integer", "description": "max lines (default 400)"},
             "full": {"type": "boolean", "description": "return whole file if under 2000 lines"}},
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "write",
-        "description": "Create a file or fully rewrite it. For changing part of an existing file use edit instead.",
+        "description": "Create a file or fully rewrite it. To change part of an existing file use edit instead — never rewrite a whole file to change a few lines.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"]}}},
     {"type": "function", "function": {
         "name": "edit",
-        "description": "Replace an exact unique string in a file. If old_str fails, use start_line/end_line (1-based, inclusive) to replace a line range instead.",
+        "description": "Replace an exact unique string (or a checked line range). The receipt includes the fresh post-edit region with line numbers — do NOT re-read the file to verify the edit; the receipt shows it. If old_str fails, re-read ONLY the small region around the target, not the whole file.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"},
             "start_line": {"type": "integer", "description": "first line to replace (1-based)"},
@@ -61,7 +61,7 @@ SCHEMAS = [
             "required": ["path", "old_str", "new_str"]}}},
     {"type": "function", "function": {
         "name": "exec",
-        "description": "Run a shell command in the project directory. Use for builds, tests, rg/sed search, python, math. Set background=true for long-running processes (dev servers, watchers) — you get a handle for proc().",
+        "description": "Run a shell command in the project dir. Batch related steps into ONE command with && when they must run in order. Use background=true + proc() for anything that may exceed 60s (test suites, dev servers). Do NOT use cat/head/tail/sed to read files — use read(); file bytes in exec output are redacted.",
         "parameters": {"type": "object", "properties": {
             "cmd": {"type": "string"},
             "timeout": {"type": "integer", "description": "seconds, default 60"},
@@ -110,7 +110,7 @@ SCHEMAS = [
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "map",
-        "description": "Structural repo map — deterministic AST/regex index, 0 model cost. PREFER this over grep or repeated reads for architectural/cross-module questions: find where a symbol is defined, who calls it, what a module imports/depends on, or the repo outline. Actions: map (top modules), outline(path), find(name), callers(name), deps(path), dependents(name).",
+        "description": "Zero-cost structural repo index (no model). Call map(outline=path) BEFORE reading any file you have not seen this session; use find/callers/deps instead of grep when looking for a symbol.",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["map", "outline", "find", "callers", "deps", "dependents"]},
             "path": {"type": "string", "description": "repo-relative file, for outline/deps"},
@@ -118,14 +118,14 @@ SCHEMAS = [
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "py",
-        "description": "Run Python code in a persistent interpreter: variables, imports and functions survive across py() calls for the whole session (fresh after a restart). One call can loop, compute, and batch many file transformations — prefer ONE py() call over many edit() calls for repetitive work. Print what you need (output capped).",
+        "description": "Run Python in a persistent interpreter (variables/imports survive between calls). One py() call can loop over hundreds of files and print a summary — always prefer ONE py() over many read/exec calls for bulk or repetitive work.",
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string"},
             "timeout": {"type": "integer", "description": "seconds, default 60, max 300"}},
             "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "note",
-        "description": "Record a durable finding in working memory: an anchor you located, a decision made, a root cause identified, a constraint from the user. Notes are re-injected into <work-state> on EVERY step and survive context compaction — record conclusions instead of re-deriving them (re-reading files you already analyzed). action=add with short text; action=drop with id; action=list to review.",
+        "description": "Record CONCLUSIONS (anchors found, root causes, decisions), not plans. Notes are re-injected every step and survive compaction — a recorded conclusion is never re-derived, so you never re-read a file 'to remember'.",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["add", "drop", "list"]},
             "text": {"type": "string", "description": "the finding, one line (add)"},
@@ -133,7 +133,7 @@ SCHEMAS = [
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "todo",
-        "description": "Set the live task list. Each item: {text, status: pending|active|done|blocked}. Mark done only after checking evidence; retain completed work to avoid repeating it.",
+        "description": "Set the plan BEFORE the first mutating action on multi-step work: 3-8 verifiable items. Update it as steps complete — a stale plan misleads you. Mark done only with evidence.",
         "parameters": {"type": "object", "properties": {
             "items": {"type": "array", "items": {"type": "object", "properties": {
                 "text": {"type": "string"},
@@ -285,7 +285,51 @@ def _slate_invalidate(session, path: str) -> None:
         pass  # never let slate bookkeeping fail the tool call
 
 
-def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
+def _slate_refresh(session, p: Path, new_src: str) -> None:
+    """Record content we just wrote so the slate stays hot across mutations
+    (a mutation refreshes ground truth instead of wiping it)."""
+    slate = (getattr(session, '_runtime', None) or {}).get('fileslate') if session else None
+    if slate is None:
+        return
+    try:
+        slate.record_content(str(p), new_src)
+    except Exception:
+        pass  # never let slate bookkeeping fail the tool call
+
+
+def _content_offload(session, p: Path, new_src: str) -> str | None:
+    """Persist the full new content to a scratch ref for cross-restart slate
+    hydration. Returns the ref path or None."""
+    try:
+        if session is None or not hasattr(session, "offload"):
+            return None
+        return session.offload(f"content-{re.sub(r'[^A-Za-z0-9_.-]', '_', p.name)}", new_src)
+    except Exception:
+        return None
+
+
+def _fresh_state(new_src: str, anchor_line: int, span_len: int) -> str:
+    """Render the replaced region in the NEW content ±8 lines, numbered,
+    capped at 60 lines. anchor_line is the 1-based first line of the new
+    span; span_len its line count. This is the anti-re-read receipt: the
+    model sees post-edit ground truth without spending another request."""
+    try:
+        lines = new_src.splitlines()
+        if not lines:
+            return ""
+        anchor_line = max(1, min(anchor_line, len(lines)))
+        end = max(anchor_line, anchor_line + max(1, span_len) - 1)
+        lo = max(1, anchor_line - 8)
+        hi = min(len(lines), end + 8)
+        if hi - lo + 1 > 60:
+            hi = lo + 59
+        return (f"\nfresh state (lines {lo}-{hi}):\n"
+                + "\n".join(f"{i:>4}: {lines[i - 1]}" for i in range(lo, hi + 1)))
+    except Exception:
+        return ""
+
+
+def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 400,
               full: bool = False, session=None) -> tuple[str, dict]:
     """Read a file or inspect multimodal media (images/audio/binary).
     Supports auto-path resolution, numbered text slices, and native multimodal
@@ -310,15 +354,15 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
                 f"Pass `full=True` only if you genuinely need to re-verify (it "
                 f"forces a real disk read and re-render).]"
             )
-            return msg, {"fileslate": "hit"}
+            return msg, {"fileslate": "hit", "path": str(p)}
 
     if p.is_dir():
         entries = sorted(os.listdir(p))[:200]
-        return f"{res_prefix}{p}/ (directory)\n" + "\n".join(entries), {}
+        return f"{res_prefix}{p}/ (directory)\n" + "\n".join(entries), {"path": str(p)}
     if not p.exists():
         near = difflib.get_close_matches(str(p), [str(x) for x in p.parent.glob("*")], n=3) if p.parent.exists() else []
         return (f"error: no such file: {p}"
-                + (f"\ndid you mean: {', '.join(near)}" if near else "")), {}
+                + (f"\ndid you mean: {', '.join(near)}" if near else "")), {"path": str(p)}
 
     size = p.stat().st_size
     suffix = p.suffix.lower()
@@ -378,7 +422,7 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 200,
             slate.record_read(str(p), body)
         except Exception:
             pass
-    return f"{res_prefix}{body}", {}
+    return f"{res_prefix}{body}", {"path": str(p)}
 
 def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
     p = fs.resolve(path)
@@ -394,11 +438,15 @@ def tool_write(fs: FS, session, path: str, content: str) -> tuple[str, dict]:
                          before_write=lambda: session.checkpoint([str(p)], cwd=str(fs.cwd)))
     old, _new = res if res else ("", content)
     diff = _unified_diff(p, old, content)
-    # FileSlate: a write invalidates every held range of this path — the
-    # next read of this file MUST be a real disk read, not a stale cache hit.
-    _slate_invalidate(session, str(p))
+    # FileSlate 2.0: record the content we just wrote (ground truth) so the
+    # slate stays hot across mutations instead of forcing a re-read.
+    _slate_refresh(session, p, content)
+    meta: dict = {"diff": diff, "path": str(p)}
+    ref = _content_offload(session, p, content)
+    if ref:
+        meta["content_ref"] = ref
     msg = f"wrote {p} ({len(content)} bytes)"
-    return msg, {"diff": diff, "path": str(p)}
+    return msg, meta
 
 
 def _locked_update(p: Path, fn, before_write=None) -> tuple[str, str] | None:
@@ -575,15 +623,20 @@ def tool_edit(fs: FS, session, path: str, old_str: str = "", new_str: str = "",
         act_s, act_e = actual_range[0], actual_range[1]
         zone = _numbered_lines(flines, act_s, act_e)
         note_str = f" ({reloc_note[0]})" if reloc_note else ""
-        # FileSlate: invalidate so the model's "I already know this file" cache
-        # doesn't serve stale content after a successful edit.
-        _slate_invalidate(session, str(p))
+        # FileSlate 2.0: refresh ground truth instead of invalidating.
+        _slate_refresh(session, p, new_src)
+        meta: dict = {"diff": diff, "path": str(p)}
+        ref = _content_offload(session, p, new_src)
+        if ref:
+            meta["content_ref"] = ref
+        # Fresh-state window: the replaced region in the NEW content ±8 lines.
         msg = f"edited {p} (lines {act_s}-{act_e}){note_str}\nreplaced:\n{zone}"
+        msg += _fresh_state(new_src, act_s, len(new_str.splitlines()))
         if p.suffix == ".py":
             ok, err = _py_compile(p)
             if not ok:
                 msg += f"\nWARNING post-check failed:\n{err}"
-        return msg, {"diff": diff, "path": str(p)}
+        return msg, meta
 
     # Exact-string mode
     if not old_str:
@@ -640,15 +693,21 @@ def tool_edit(fs: FS, session, path: str, old_str: str = "", new_str: str = "",
     src2, new_src = res
     diff = _unified_diff(p, src2, new_src)
     mode_note = "" if old_str in src2 else " (whitespace-tolerant match)"
-    # FileSlate: invalidate so the model's "I already know this file" cache
-    # doesn't serve stale content after a successful edit.
-    _slate_invalidate(session, str(p))
+    # FileSlate 2.0: refresh ground truth instead of invalidating.
+    _slate_refresh(session, p, new_src)
+    meta: dict = {"diff": diff, "path": str(p)}
+    ref = _content_offload(session, p, new_src)
+    if ref:
+        meta["content_ref"] = ref
     msg = f"edited {p}{mode_note} (+{len(new_str)} -{len(old_str)} bytes)"
+    # Fresh-state window: the replaced region in the NEW content ±8 lines.
+    anchor = new_src[:new_src.find(new_str)].count("\n") + 1 if new_str in new_src else 1
+    msg += _fresh_state(new_src, anchor, len(new_str.splitlines()))
     if p.suffix == ".py":
         ok, err = _py_compile(p)
         if not ok:
             msg += f"\nWARNING post-check failed:\n{err}"
-    return msg, {"diff": diff, "path": str(p)}
+    return msg, meta
 
 
 # ---- background process registry ----------------
@@ -1026,6 +1085,13 @@ def tool_map(cwd: str, action: str = "map", path: str = "", name: str = "") -> t
     from kern.codegraph import CodeGraph
     try:
         g = CodeGraph(cwd)
+        # WP3: refresh the graph against disk mtime before answering.
+        # refresh() is incremental and stat-cheap; skipping it returned
+        # stale module lists when the repo had been edited mid-session.
+        try:
+            g.refresh()
+        except Exception:
+            pass
         if action == "map":
             return g.map(), {}
         if action == "outline":

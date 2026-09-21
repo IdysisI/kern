@@ -162,8 +162,28 @@ def evidence_block(events, session):
     rows = receipts(events)
     unresolved = [r for r in rows if r['status'] == 'uncertain']
     recent = [r for r in rows if r['status'] != 'uncertain'][-12:]
+    # WP6: tag verification receipts — exec runs that actually ran a test
+    # suite and reported a passing tally. These rows render with a ✓verify
+    # marker and a header count, so the review-skip predicate and the model
+    # can see at a glance which turns are confirmed by tests.
+    _verify_rx_cmd = re.compile(r"pytest|unittest|cargo test|go test|npm test", re.I)
+    _verify_rx_out = re.compile(r"\d+ passed|\bOK\b")
+    verify_count = 0
+    for r in rows:
+        if r.get("name") != "exec":
+            continue
+        cmd = (r.get("arguments") or {}).get("cmd", "") or ""
+        result = str(r.get("result", ""))
+        if (r.get("status") == "succeeded"
+                and _verify_rx_cmd.search(cmd)
+                and _verify_rx_out.search(result)):
+            r["verify"] = True
+            verify_count += 1
+        else:
+            r["verify"] = False
     lines = [f'<execution-evidence journal="{session.log}">',
-             'Receipts outrank narrative summaries. Success describes this operation only.']
+             f'Receipts outrank narrative summaries. Success describes this operation only.',
+             f'verification receipts: {verify_count}']
     if len(unresolved) > 12:
         pointer = session.offload('unresolved-receipts', json.dumps(unresolved, ensure_ascii=False))
         lines.append(f'{len(unresolved)} uncertain operations; full index: {pointer}')
@@ -179,7 +199,8 @@ def evidence_block(events, session):
             # and the tool result already confirmed in-turn (audit r3-smallmodel
             # F8, ~220 chars/row of noise). Keep id, tool, status, event and a
             # short result snippet (exit codes / test tallies live there).
-            lines.append(f"{r['id']} {r['name']} -> {r['status']} (event {r.get('result_event',r['event'])}) {res[:120]}")
+            marker = " ✓verify" if r.get("verify") else ""
+            lines.append(f"{r['id']} {r['name']} -> {r['status']}{marker} (event {r.get('result_event',r['event'])}) {res[:120]}")
     lines.append('Older operations: memory(action="history", pattern="..."). Never repeat uncertain effects without checking actual state.')
     return '\n'.join(lines) + '\n</execution-evidence>'
 
@@ -268,6 +289,9 @@ class ContextManager:
         else:
             target = min(max(1024, available - 2048), max(16000, available * 3 // 4))
         view = pager.materialize(e.session.events, e.session)
+        view = self._with_repo_context(view, e)
+        view = self._with_mission_packet(view, e, available)
+        view = self._with_recall(view, e)
         size = estimate(view, system, tools)
         # Maintenance is incremental and occurs at completed exchange boundaries,
         # even on one very long user turn; it doesn't wait for half a huge window.
@@ -299,6 +323,9 @@ class ContextManager:
                         self._fold_pending = None
                     if folded is not False:
                         view = pager.materialize(e.session.events, e.session)
+                        view = self._with_repo_context(view, e)
+                        view = self._with_mission_packet(view, e, available)
+                        view = self._with_recall(view, e)
                         size = estimate(view, system, tools)
         e.context_stats = {'estimated_tokens': size, 'context_length': window,
                            'available_input': available, 'target': target, 'estimate': True}
@@ -311,7 +338,7 @@ class ContextManager:
                                + aborted +
                                ' Use memory history/artifact slices or configure the verified model context window.')
         e.output_budget = min(default_max_output_tokens(e.model), max(256, window-size-1024))
-        return self._with_recall(self._with_repo_context(view, e), e)
+        return self._with_recall(self._with_mission_packet(self._with_repo_context(view, e), e, available), e)
 
     # ---- Repo orientation: compact code map + KERN.md, first turn only ------
     def _with_repo_context(self, view, e):
@@ -338,8 +365,14 @@ class ContextManager:
                 if not kp.is_file():
                     # First contact with this repo: Kern orients itself — generate
                     # a lean KERN.md so future sessions start informed (user does
-                    # nothing). Only in a git repo, so we never litter scratch dirs.
-                    if (_P(cwd) / '.git').exists():
+                    # nothing). WP3: any project marker on disk (not just .git) is
+                    # a strong enough signal to populate KERN.md. Otherwise we'd
+                    # burn 4+ orientation exec calls learning the working test
+                    # command and entry points from a clean repo checkout.
+                    if (_P(cwd) / '.git').exists() or any(
+                        (_P(cwd) / m).exists()
+                        for m in ("pyproject.toml", "package.json",
+                                  "Cargo.toml", "go.mod")):
                         from .kernfile import ensure_kern_md
                         res = ensure_kern_md(cwd)
                         if res.get('created'):
@@ -400,6 +433,180 @@ class ContextManager:
             if not block.strip():
                 return view
             return [{'role': 'system', 'text': block}] + view
+        except Exception:
+            return view
+
+    def _with_mission_packet(self, view, e, available):
+        """WP3: bounded mission context — a lean orientation packet that
+        replaces the 4-7 pure-orientation calls the model usually burns on
+        the first turn of a new session in a new repo. Cached per
+        session/runtime keyed on the source user event so the block is
+        byte-stable across every step of the turn.
+
+        Fail-open: any error -> the unmodified view.
+        """
+        try:
+            sess = getattr(e, 'session', None)
+            if sess is None:
+                return view
+            rt = getattr(sess, '_runtime', None)
+            if rt is None:
+                return view
+            # Source key: last non-continuation user event's n; on continuation
+            # turns, fall back to the session objective.
+            src_n = None
+            try:
+                from .engine import _is_continuation_prompt
+            except Exception:
+                _is_continuation_prompt = lambda *a, **k: False
+            try:
+                for ev in reversed(list(getattr(sess, 'events', []))):
+                    if ev.get('kind') == 'user':
+                        txt = str(ev.get('text', ''))
+                        if _is_continuation_prompt(txt):
+                            continue
+                        src_n = ev.get('n', src_n)
+                        break
+            except Exception:
+                pass
+            if src_n is None:
+                # continuation: extract from the objective
+                for ev in reversed(list(getattr(sess, 'events', []))):
+                    if ev.get('kind') == 'objective':
+                        src_n = ev.get('n', 0)
+                        break
+            if src_n is None:
+                return view
+            cache_key = ('mission_packet', src_n)
+            cached = rt.get(cache_key)
+            # Always extract the source user text first (used for stable
+            # insertion position even on cache hits).
+            latest_user_text = ""
+            for ev in reversed(list(getattr(sess, 'events', []))):
+                if ev.get('kind') == 'user':
+                    latest_user_text = str(ev.get('text', ''))
+                    break
+            if cached:
+                block = cached
+            else:
+                cwd = getattr(e, 'cwd', None)
+                if not cwd:
+                    return view
+                from pathlib import Path as _P
+                from . import codegraph as _cg
+                root = _P(cwd)
+                # (a) explicit paths via regex from the latest user text
+                paths: list[str] = []
+                blocks: list[str] = []
+                latest_user_text = ""
+                for ev in reversed(list(getattr(sess, 'events', []))):
+                    if ev.get('kind') == 'user':
+                        latest_user_text = str(ev.get('text', ''))
+                        break
+                import re as _re
+                p_rx = _re.compile(r"(?:[\w.\-]+/)*[\w.\-]+\.(?:py|js|ts|tsx|jsx|rs|go|md|toml|json|ya?ml|css|html|sh|sql)")
+                for m in p_rx.finditer(latest_user_text):
+                    p = m.group(0)
+                    if (root / p).exists() and p not in paths:
+                        paths.append(p)
+                        if len(paths) >= 3:
+                            break
+                # (b) bare words len>=3 matched against codegraph module stems
+                stems = set()
+                try:
+                    g = _cg.CodeGraph(str(root))
+                    g.refresh()
+                    for k in (g.modules or {}).keys():
+                        stems.add(k.lower().split('/')[-1].rsplit('.', 1)[0])
+                except Exception:
+                    pass
+                tokens = [w for w in _re.findall(r"\w{3,}", latest_user_text)]
+                wanted = []
+                for w in tokens[:30]:
+                    wl = w.lower()
+                    if wl in stems and wl not in wanted:
+                        wanted.append(wl)
+                        if len(wanted) >= 3:
+                            break
+                # (c) exact-symbol find (cap 2)
+                try:
+                    for w in wanted:
+                        out = g.find(w) if 'g' in locals() else ""
+                        if out and out.strip() and not out.strip().startswith("error"):
+                            blocks.append(f"### find {w}\n{out[:400]}")
+                            if len([b for b in blocks if b.startswith('### find')]) >= 2:
+                                break
+                except Exception:
+                    pass
+                # (d) outlines for explicit paths (cap 40 lines each)
+                for p in paths:
+                    try:
+                        out = g.outline(p)
+                        if out:
+                            lines = out.splitlines()
+                            if len(lines) > 40:
+                                lines = lines[:40] + [f"... ({len(lines) - 40} more)"]
+                            blocks.append(f"### {p}\n" + "\n".join(lines))
+                    except Exception:
+                        pass
+                # (e) command block: KERN.md + env facts (cap 6)
+                kp_text = ""
+                try:
+                    kp = root / 'KERN.md'
+                    if kp.is_file():
+                        cached_kern = rt.get('kern_md_render')
+                        import os as _os
+                        mtime = kp.stat().st_mtime
+                        if cached_kern and cached_kern[0] == mtime:
+                            kp_text = cached_kern[1]
+                        else:
+                            kp_text = kp.read_text(errors='replace').strip()
+                            rt['kern_md_render'] = (mtime, kp_text)
+                except Exception:
+                    pass
+                env_lines: list[str] = []
+                try:
+                    mt = getattr(sess, '_memory', None)
+                    if mt is not None:
+                        rows = mt.find(topic='env') if hasattr(mt, 'find') else []
+                        for r in list(rows)[:6]:
+                            t = str(r.get('text', '')) if isinstance(r, dict) else str(r)
+                            if t.strip():
+                                env_lines.append(t.strip())
+                except Exception:
+                    pass
+                # assemble
+                parts: list[str] = []
+                if kp_text:
+                    parts.append("### KERN.md\n" + kp_text[:2000])
+                if env_lines:
+                    parts.append("### env facts\n" + "\n".join(f"- {l}" for l in env_lines))
+                if blocks:
+                    parts.append("### codegraph\n" + "\n\n".join(blocks))
+                if not parts:
+                    return view
+                inner = "\n\n".join(parts).strip()
+                # size cap
+                cap = min(6000, (max(1024, int(available)) // 20) * 4)
+                if len(inner) > cap:
+                    inner = inner[:cap] + "\n...[truncated]"
+                block_text = f"<mission-context>\n{inner}\n</mission-context>"
+                rt[cache_key] = block_text
+                block = block_text
+            # insertion: before the LAST view message whose text equals the
+            # source user text (fallback: before the final message). Must be
+            # stable across steps of the turn.
+            if not view:
+                return view
+            inserted = False
+            for i in range(len(view) - 1, -1, -1):
+                if view[i].get('role') == 'user' and str(view[i].get('text', '')) == latest_user_text:
+                    view = view[:i] + [{'role': 'user', 'text': block}] + view[i:]
+                    inserted = True
+                    break
+            if not inserted:
+                view = view[:-1] + [{'role': 'user', 'text': block}] + view[-1:]
+            return view
         except Exception:
             return view
 

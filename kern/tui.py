@@ -54,27 +54,24 @@ from .pager import budget
 DEFAULT_MODEL = os.environ.get("KERN_MODEL", "gemini-3.8-flash-api")
 
 # ── visual identity ──────────────────────────────────────────────────────
-# One place defines every color the TUI paints. Widgets import these instead
-# of sprinkling hex literals. The palette is a warm midnight (Tokyo Night
-# family) — deep blue-black ground, soft blue accent, calm green for success.
-# "Hug, don't bloat": the terminal background shows through everywhere;
-# identity comes from thin rails, color and rhythm, never from filled boxes.
-BG_DEEP   = "#16161e"   # deepest ground (head/foot strips)
-BG_SOFT   = "#1f2335"   # slightly lifted ground (cards, prompt)
-BG_RISE   = "#24283b"   # raised ground (pickers, modals)
-BG_LINE   = "#2f3450"   # hairline borders
-BLUE      = "#7aa2f7"   # primary accent — identity
-BLUE_SOFT = "#89ddff"   # secondary accent — links, cyan details
-GOLD      = "#e0af68"   # attention, warnings, in-flight
-GREEN     = "#9ece6a"   # success, done
-RED       = "#f7768e"   # errors, danger
-MAGENTA   = "#bb9af7"   # thinking, special
-TEXT_HI   = "#c0caf5"   # primary text
-TEXT_MID  = "#9aa5ce"   # secondary text
-TEXT_DIM  = "#565f89"   # tertiary text
+# Modern Obsidian & Tokyo Night palette with refined contrast, glowing accents,
+# crisp typography, and sleek status tokens.
+BG_DEEP   = "#13141f"   # deepest ground (head/foot strips, frame)
+BG_SOFT   = "#181926"   # lifted card surface (prompts, tool cards, cards)
+BG_RISE   = "#202234"   # raised surfaces (modals, popovers, keycaps)
+BG_LINE   = "#2c3047"   # hairline borders and separators
+BLUE      = "#7aa2f7"   # primary brand accent — electric blue
+BLUE_SOFT = "#7dcfff"   # secondary cyan accent — parameters, tags
+GOLD      = "#e0af68"   # running state, attention, warnings
+GREEN     = "#73daca"   # success, verified, active states
+RED       = "#f7768e"   # errors, failed, danger
+MAGENTA   = "#bb9af7"   # deep reasoning, capabilities
+TEXT_HI   = "#f0f4fc"   # crisp primary text
+TEXT_MID  = "#c0caf5"   # secondary readable text
+TEXT_DIM  = "#787e9d"   # tertiary metadata, subtle labels
 
-TOOL_ICON = {"read": "◱", "write": "✎", "edit": "✎", "exec": "▶", "spawn": "⑂",
-             "fetch": "◈", "todo": "☰", "proc": "⚙", "memory": "◍"}
+TOOL_ICON = {"read": "📖", "write": "📝", "edit": "✏️", "exec": "⚡", "spawn": "🤖",
+             "fetch": "🌐", "todo": "📋", "proc": "⚙️", "memory": "🧠", "py": "🐍"}
 
 # Breathing dot: the moving cursor at the tail of streamed text, the waiting
 # placeholder, the status bar, and pending tool cards. One glyph that swells
@@ -83,125 +80,308 @@ TOOL_ICON = {"read": "◱", "write": "✎", "edit": "✎", "exec": "▶", "spawn
 STREAMING_CURSOR = "··∙∙••••∙∙··"
 
 CSS = """
-/* ── ground rule ──────────────────────────────────────────────────────
-   The terminal's own background shows through EVERYWHERE in the chat
-   area: no widget below paints a background. Identity comes from thin
-   rails and color, never from filled boxes. */
+/* ── modern terminal canvas ─────────────────────────────────────────── */
 Screen { background: transparent; }
 
-/* ── chrome: slim brand strip top, live hints strip bottom.
-   These are the ONLY filled surfaces — they frame the conversation like a
-   cockpit, and the hairline border separates chrome from content crisply. */
-#topbar { dock: top; height: 1; padding: 0 2; background: #16161e;
-          border-bottom: tall #24283b; }
-#tleft  { width: auto; color: #9aa5ce; }
-#tright { width: 1fr; text-align: right; color: #565f89; }
+/* ── topbar cockpit header ─────────────────────────────────────────── */
+#topbar {
+    dock: top;
+    height: 1;
+    padding: 0 2;
+    background: #13141f;
+    border-bottom: solid #222538;
+}
+#tleft {
+    width: auto;
+    color: #c0caf5;
+}
+#tright {
+    width: 1fr;
+    text-align: right;
+    color: #787e9d;
+}
 
 #workspace { height: 1fr; }
-/* inspector: same dark ground as the chrome strips → reads as one frame
-   wrapping the conversation on two sides. */
-#inspector { width: 34; padding: 0 1; overflow-y: auto;
-             background: #16161e; border-left: tall #24283b;
-             scrollbar-color: #2f3450 transparent;
-             scrollbar-background: transparent; }
-.insp-head { color: #414868; text-style: bold; margin: 1 0 0 0; }
-#inspector-title { color: #7aa2f7; text-style: bold; margin: 0 0 1 0; padding-top: 1; }
-#work-objective { color: #9aa5ce; margin: 0 0 1 0; }
-#work-plan { margin: 0; }
-#work-mounts { margin: 1 0 0 0; color: #565f89; }
-#work-proof { margin: 1 0 0 0; color: #565f89; }
-#chat { width: 1fr; height: 1fr; padding: 0 2; background: transparent;
-        scrollbar-color: #2f3450 transparent;
-        scrollbar-background: transparent;
-        scrollbar-size: 1 1; }
+
+/* ── inspector HUD sidebar ─────────────────────────────────────────── */
+#inspector {
+    width: 36;
+    padding: 0 1;
+    overflow-y: auto;
+    background: #13141f;
+    border-left: tall #222538;
+    scrollbar-color: #2c3047 transparent;
+    scrollbar-size: 1 1;
+}
+.insp-head {
+    color: #787e9d;
+    text-style: bold;
+    margin: 1 0 0 0;
+}
+#inspector-title {
+    color: #7aa2f7;
+    text-style: bold;
+    margin: 0 0 1 0;
+    padding-top: 1;
+}
+#work-objective {
+    color: #f0f4fc;
+    margin: 0 0 1 0;
+    background: #181926;
+    border-left: tall #7aa2f7;
+    padding: 0 1;
+}
+#work-plan {
+    margin: 0 0 1 0;
+    color: #c0caf5;
+    background: #181926;
+    border-left: tall #73daca;
+    padding: 0 1;
+}
+#work-notes {
+    margin: 0 0 1 0;
+    color: #c0caf5;
+    background: #181926;
+    border-left: tall #bb9af7;
+    padding: 0 1;
+}
+#work-mounts {
+    margin: 0 0 1 0;
+    color: #e0af68;
+    background: #181926;
+    border-left: tall #e0af68;
+    padding: 0 1;
+}
+#work-proof {
+    margin: 0;
+    color: #7dcfff;
+    background: #181926;
+    border-left: tall #7dcfff;
+    padding: 0 1;
+}
+
+/* ── conversation stream & chat ────────────────────────────────────── */
+#chat {
+    width: 1fr;
+    height: 1fr;
+    padding: 0 2;
+    background: transparent;
+    scrollbar-color: #2c3047 transparent;
+    scrollbar-color-hover: #7aa2f7 transparent;
+    scrollbar-background: transparent;
+    scrollbar-size: 1 1;
+}
 
 /* activity line while a turn runs (hidden when idle) */
-#status { dock: bottom; height: 1; padding: 0 2; color: #e0af68;
-          background: #16161e; }
+#status {
+    dock: bottom;
+    height: 1;
+    padding: 0 2;
+    color: #e0af68;
+    background: #13141f;
+    border-top: solid #222538;
+}
 
-/* ── prompt: the one elevated card in the UI. Soft lift, rounded;
-   focusing it lights the border blue — you always know where typing goes. */
-#prompt { border: round #2f3450; color: #c0caf5; height: auto;
-          max-height: 9; min-height: 3; background: #1f2335;
-          padding: 0 1; margin: 0 0 0 0;
-          scrollbar-color: #2f3450 transparent;
-          scrollbar-background: transparent; }
-#prompt:focus { border: round #7aa2f7; }
-/* Cursor: a solid bright block, like a terminal caret.
-   Textual's :ansi default is text-style: reverse with ansi_default colors —
-   most terminals render "reverse of default" as BLACK, which read as a
-   black background eating the first placeholder letter. Instead we paint
-   the cursor cell with the foreground color (no reverse), so it's a solid
-   light block that blinks in place and never looks like a missing letter
-   or a black bar. Character under it is painted the same color (invisible). */
+/* ── command prompt area ───────────────────────────────────────────── */
+#prompt {
+    border: round #2c3047;
+    color: #f0f4fc;
+    height: auto;
+    max-height: 9;
+    min-height: 3;
+    background: #181926;
+    padding: 0 1;
+    margin: 0 0 0 0;
+    scrollbar-color: #2c3047 transparent;
+    scrollbar-background: transparent;
+}
+#prompt:focus {
+    border: round #7aa2f7;
+    background: #1a1c2c;
+}
 #prompt .text-area--cursor {
-    background: $foreground;
-    color: $foreground;
+    background: #c0caf5;
+    color: #13141f;
     text-style: none;
 }
-/* Cursor line: keep it transparent — Textual's default paints it $boost,
-   which resolves to near-black in :ansi and reads as a black bar behind
-   the typed text. */
 #prompt .text-area--cursor-line {
+    background: #202234;
+}
+
+/* ── footer status bar ─────────────────────────────────────────────── */
+#bar {
+    dock: bottom;
+    height: 1;
+    padding: 0 2;
+    background: #13141f;
+    border-top: solid #222538;
+    color: #787e9d;
+}
+
+/* ── conversation stream cards & rails ─────────────────────────────── */
+.user {
+    border-left: thick #7aa2f7;
+    padding: 0 1;
+    margin: 1 0 0 1;
+    color: #f0f4fc;
+    background: #181926;
+}
+.assistant {
+    padding: 0 1 0 1;
+    margin-left: 1;
+    color: #c0caf5;
+}
+.assistant Markdown {
     background: transparent;
 }
-#bar { dock: bottom; height: 1; color: #565f89; padding: 0 2;
-       background: #16161e; border-top: tall #24283b; }
+.stream {
+    padding: 0 1 0 1;
+    margin-left: 1;
+    border-left: tall #7aa2f7;
+}
 
-/* ── conversation: rails, not boxes. The chat column keeps the terminal's
-   own background so replies breathe; only structure gets color. ───────── */
-/* you: bright cyan rail + bold — unmistakably YOUR voice */
-.user    { border-left: thick #89ddff; padding: 0 1; margin: 1 0 0 1;
-           color: #89ddff; text-style: bold; }
-/* kern answering (final): no rail, calm alignment under your text */
-.assistant { padding: 0 1 0 1; margin-left: 1; color: #c0caf5; }
-.assistant Markdown { background: transparent; }
-/* kern streaming: blue rail = "kern is speaking now" */
-.stream  { padding: 0 1 0 1; margin-left: 1; border-left: tall #7aa2f7; }
+.thinking {
+    background: transparent;
+    border: none;
+    padding: 0;
+    margin: 1 0 0 1;
+}
+.thinking .thinking-text {
+    color: #787e9d;
+    text-style: italic;
+}
+CollapsibleTitle {
+    color: #bb9af7;
+    background: transparent;
+    padding: 0;
+}
 
-.thinking { background: transparent; border: none; padding: 0; margin: 0 0 0 1; }
-.thinking .thinking-text { color: #565f89; text-style: italic; }
-CollapsibleTitle { color: #565f89; text-style: italic; background: transparent; padding: 0; }
+.tool {
+    border-left: tall #bb9af7;
+    padding: 0 1 0 1;
+    margin: 1 0 0 1;
+    background: #181926;
+    border: round #222538;
+}
+.tool.running {
+    border-left: tall #e0af68;
+}
+.tool.ok {
+    border-left: tall #73daca;
+}
+.tool.failed {
+    border-left: tall #f7768e;
+    background: #1e161c;
+}
 
-/* tool calls: outcome-colored rail + soft panel so a wall of tool calls
-   scans as discrete steps instead of undifferentiated text */
-.tool    { border-left: tall #bb9af7; padding: 0 1 0 1; margin: 0 0 0 1;
-           background: #1a1b26; }
-.tool.running { border-left: tall #e0af68; }
-.tool.ok      { border-left: tall #9ece6a; }
-.tool.failed  { border-left: tall #f7768e; }
-.note    { color: #565f89; padding: 0 1 0 2; text-style: italic; }
-.hello   { padding: 1 2; margin: 1 0; color: #9aa5ce;
-           border: round #2f3450; background: #1a1b26; }
-.error   { border-left: tall #f7768e; padding: 0 1 0 1; margin: 0 0 0 1; color: #f7768e; }
-.todo    { border-left: tall #7dcfff; padding: 0 1 0 1; margin: 0 0 0 1; }
-.queued  { color: #e0af68; padding: 0 1 0 2; text-style: italic; }
-/* The waiting placeholder IS the assistant container, alive from the first
-   frame: same rail as .stream, so pressing enter never looks dead. */
-.waiting { padding: 0 1 0 1; margin-left: 1; border-left: tall #7aa2f7;
-           color: #565f89; text-style: italic; }
+.note {
+    color: #787e9d;
+    padding: 0 1 0 2;
+    text-style: italic;
+}
+.hello {
+    padding: 1 2;
+    margin: 1 0;
+    color: #c0caf5;
+    border: round #2c3047;
+    background: #181926;
+}
+.error {
+    border-left: tall #f7768e;
+    padding: 0 1 0 1;
+    margin: 1 0 0 1;
+    color: #f7768e;
+    background: #1e161c;
+}
+.todo {
+    border-left: tall #73daca;
+    padding: 0 1 0 1;
+    margin: 1 0 0 1;
+    background: #181926;
+    border: round #222538;
+}
+.queued {
+    color: #e0af68;
+    padding: 0 1 0 2;
+    text-style: italic;
+}
+.waiting {
+    padding: 0 1 0 1;
+    margin-left: 1;
+    border-left: tall #7aa2f7;
+    color: #787e9d;
+    text-style: italic;
+}
 
-Approve { align: center middle; }
-#dlg { width: 84; height: auto; max-height: 26; background: #1f2335;
-       border: round #e0af68; padding: 1 2; }
-#dlg .q { color: #c0caf5; margin-bottom: 1; }
-#dlg .diff { color: $text; }
-#dlg Button { margin: 0 1; }
+/* ── modals ────────────────────────────────────────────────────────── */
+Approve {
+    align: center middle;
+}
+#dlg {
+    width: 86;
+    height: auto;
+    max-height: 28;
+    background: #181926;
+    border: round #e0af68;
+    padding: 1 2;
+}
+#dlg .q {
+    color: #f0f4fc;
+    margin-bottom: 1;
+}
+#dlg .diff {
+    color: #c0caf5;
+}
+#dlg Button {
+    margin: 0 1;
+    background: #202234;
+    color: #c0caf5;
+    border: round #2c3047;
+}
+#dlg Button:hover {
+    background: #7aa2f7;
+    color: #13141f;
+}
 
-ModelPicker { align: center middle; }
-SessionPicker { align: center middle; }
-/* pickers: elevated panel in the same family as the prompt card — a modal
-   should feel like part of kern, not a gray foreign object */
-#mp { width: 86; max-width: 92%; height: auto; max-height: 26;
-      background: #1f2335; border: round #7aa2f7; padding: 0 1; }
-#mp ListView { height: auto; max-height: 20; background: transparent;
-               border: none;
-               scrollbar-color: #2f3450; scrollbar-background: #1f2335; }
-#mp ListItem { padding: 0 1; color: #9aa5ce; }
-#mp ListItem:hover { background: #24283b; }
-#mp ListItem.-highlight { background: #24283b; color: #c0caf5;
-                          text-style: bold; border-left: tall #7aa2f7; }
-#mp ListView > Contents { scrollbar-color: #2f3450 transparent; }
+ModelPicker {
+    align: center middle;
+}
+SessionPicker {
+    align: center middle;
+}
+#mp {
+    width: 88;
+    max-width: 92%;
+    height: auto;
+    max-height: 28;
+    background: #181926;
+    border: round #7aa2f7;
+    padding: 1 2;
+}
+#mp ListView {
+    height: auto;
+    max-height: 20;
+    background: transparent;
+    border: solid #222538;
+    scrollbar-color: #2c3047 transparent;
+}
+#mp ListItem {
+    padding: 0 1;
+    color: #c0caf5;
+}
+#mp ListItem:hover {
+    background: #202234;
+    color: #f0f4fc;
+}
+#mp ListItem.-highlight {
+    background: #24273c;
+    color: #7dcfff;
+    text-style: bold;
+    border-left: tall #7aa2f7;
+}
+#mp ListView > Contents {
+    scrollbar-color: #2c3047 transparent;
+}
 """
 
 
@@ -760,8 +940,17 @@ class KernApp(App):
                     else: mounted.pop(ev['name'],None)
             self.query_one('#work-mounts').update('CAPABILITIES\n' + (', '.join(mounted) or 'Nothing mounted'))
             rows = receipts(events)[-5:]
+            # WP7: append a one-line hygiene summary from the last hygiene
+            # event so the operator can see request efficiency in the TUI.
+            _hyg = next((ev for ev in reversed(events) if ev.get("kind") == "hygiene"), None)
+            _hyg_line = ""
+            if _hyg:
+                _hyg_line = (f"\nhygiene: {_hyg.get('reads', 0)} reads "
+                             f"({_hyg.get('reads_absorbed', 0)} absorbed) "
+                             f"· {_hyg.get('mutations', 0)} mutations "
+                             f"· {_hyg.get('requests', 0)} req")
             self.query_one('#work-proof').update('RECENT RESULTS\n' + ('\n'.join(
-                f"{r['name']}: {r['status']}" for r in rows) or 'No results'))
+                f"{r['name']}: {r['status']}" for r in rows) or 'No results') + _hyg_line)
         except Exception:
             pass
 
@@ -1187,7 +1376,7 @@ class KernApp(App):
         """A key-cap hint: the key sits on a small raised chip, the verb
         beside it stays quiet. Reading the footer should feel like looking
         at a keyboard, not a sentence."""
-        return f"[#c0caf5 on #2f3450] {key} [/] [dim]{word}[/]"
+        return f"[#f0f4fc on #202234] {key} [/] [dim #787e9d]{word}[/]"
 
     def _bar_hints(self) -> str:
         # width-adaptive: the footer never wraps or truncates mid-hint —
@@ -1205,13 +1394,37 @@ class KernApp(App):
 
     def _refresh_chrome(self):
         self._last_ctx_events_len = -1
+        # Brand pill + Model pill with status indicator
+        model_name = safe(self.model)
+        branch = self._git_branch()
+        branch_str = f" [dim]⎇ {safe(branch)}[/]" if branch else ""
+        # WP8 nit: idle/busy chip so the operator can tell at a glance
+        # whether the loop is running or parked. Use _turn_running() as the
+        # source of truth (it checks both turn_worker and remote).
+        state_chip = "[#9ece6a]● idle[/]" if not self._turn_running() else "[#f7768e]● busy[/]"
         self.query_one("#tleft").update(
-            f" [#7aa2f7 b]◆ kern[/] [dim]·[/] [#9ece6a]{safe(self.model)}[/]")
+            f" [#7aa2f7 b]⚡ KERN[/] [dim]v{safe(KERN_VERSION)}[/]  "
+            f"{state_chip}  [#7dcfff b]{model_name}[/]{branch_str}")
         self.query_one("#tright").update(
-            f"[dim]{safe(self._short_cwd())}[/] [dim]·[/] [dim]{safe(self.session.id)}[/] ")
+            f"[dim #787e9d]📁 {safe(self._short_cwd())}[/]  "
+            f"[dim #565f89]id:[/] [dim]{safe(self.session.id[:8])}[/] ")
+
+    def _git_branch(self) -> str:
+        try:
+            out = subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=self.cwd, stderr=subprocess.DEVNULL, timeout=0.4
+            ).decode().strip()
+            return out if out and out != "HEAD" else ""
+        except Exception:
+            return ""
 
     def _short_cwd(self):
-        return self.cwd if len(self.cwd) < 46 else "…" + self.cwd[-45:]
+        home = os.path.expanduser("~")
+        cwd = self.cwd
+        if cwd.startswith(home):
+            cwd = "~" + cwd[len(home):]
+        return cwd if len(cwd) < 42 else "…" + cwd[-41:]
 
     _SPIN = STREAMING_CURSOR
 
@@ -1252,10 +1465,10 @@ class KernApp(App):
 
     def _welcome(self):
         self.chat.mount(Static(
-            "[#7aa2f7 b]◆ kern[/] [dim]v" + safe(KERN_VERSION) + "[/]\n"
-            "[dim]one model, no baggage — ask anything, watch it work.[/]\n"
-            "[dim]type[/] [#89ddff]/help[/] [dim]for commands · tools mount themselves: try[/] "
-            "[#89ddff][mount: toy][/]",
+            f"[#7aa2f7 b]⚡ KERN[/] [dim #787e9d]v{safe(KERN_VERSION)}[/]  [#73daca]●[/] [dim]ready[/]\n"
+            "[dim]Autonomous execution engine · Instant feel · Verified results[/]\n"
+            "[dim]Commands:[/] [#7dcfff]/help[/] [dim]·[/] [#7dcfff]/models[/] [dim]· Tools mount on demand: e.g.[/] "
+            "[#7dcfff][mount: git-workflow][/]",
             classes="hello", markup=True))
         self.chat.scroll_end(animate=False)
 

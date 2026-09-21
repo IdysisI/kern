@@ -89,6 +89,20 @@ def detect_stack(root: Path) -> list[str]:
 
 def detect_test_command(root: Path) -> str:
     root = Path(root)
+    # WP3: prefer the uv-extra form when the repo declares a `test` extra in
+    # pyproject + has a uv.lock — saves the model 4-7 discovery exec calls.
+    try:
+        import tomllib
+        pyproject = root / "pyproject.toml"
+        uv_lock = root / "uv.lock"
+        if pyproject.is_file() and uv_lock.is_file():
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8", errors="replace"))
+            opts = (data.get("project") or {}).get("optional-dependencies") or {}
+            if isinstance(opts, dict) and "test" in opts:
+                suffix = " tests/" if (root / "tests").is_dir() else ""
+                return f"uv run --extra test pytest{suffix}"
+    except Exception:
+        pass   # fall through to the marker table — never block the model
     for _name, cmd, markers in _TEST_RUNNERS:
         for mk in markers:
             if (root / mk).exists():

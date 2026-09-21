@@ -213,6 +213,20 @@ def suppress_repeat_hard(session: Any, target: str, seen_n: int) -> tuple[str, d
     }
 
 
+def nullop_repeat(session: Any, target: Any, seen_n: int, text: str) -> tuple[str, dict]:
+    """An absorbed (cache/slate) hit repeated for the 3rd+ time this turn.
+
+    Absorbed results are free, so the model never felt the cost of an
+    absorbed loop — and every sensor reset on them, hiding the loop. This
+    keeps the content (it may be the right file) but marks the repetition
+    and feeds the circuit breaker via the engine."""
+    new_text = (str(text) + f"\n\n[constraint:nullop] absorbed hit #{seen_n} for the same call — "
+                "you already hold this content. Act on it, read a DIFFERENT slice, or answer. "
+                "Identical re-issues now count toward the circuit breaker.")
+    _log(session, "nullop.fire", target=str(target)[:80], seen=seen_n)
+    return new_text, {"constraint": "nullop", "nullop_target": str(target)[:80], "nullop_seen": seen_n}
+
+
 # ---------------------------------------------------------------------------
 # Site 5 — file truncated, more lines exist (engine.py:1370)
 # Old: appended "this file has more lines than shown" hint.
@@ -224,26 +238,28 @@ def suppress_repeat_hard(session: Any, target: str, seen_n: int) -> tuple[str, d
 _AUTO_PAGE_SIZE = 60  # lines
 
 
-def auto_paginate(session: Any, target: str, total_lines: int, text: str,
-                  args: dict | None) -> tuple[str, dict]:
+def auto_paginate(session: Any, target: str, total_lines: int,
+                  hi: int, text: str) -> tuple[str, dict]:
     """Inject a continuation pointer at the end of the read result.
 
     We don't auto-fetch the next page (that would change semantics and
     could burn context the model didn't ask for). We just *tell* the
     model where the next page starts, so a weak model that doesn't know
     about offset/limit sees a concrete next call to make.
+
+    WP2: next_offset is the line AFTER what was actually shown (hi+1),
+    not a hardcoded offset+60. Kills the overlapping re-reads.
     """
-    args = args or {}
-    shown = _AUTO_PAGE_SIZE
-    offset = int(args.get("offset") or 1)
-    next_offset = offset + shown
+    shown = max(1, int(hi))
+    next_offset = shown + 1
     cleaned = re.sub(r"\n*\[harness hint:[^\]]+\]\s*$", "", str(text))
     pointer = (
         f"\n\n[auto_paginate: file has {total_lines} lines total, you saw "
-        f"{shown}. Next page: read(path='{target}', offset={next_offset}, "
+        f"lines 1-{shown}. Next page: read(path='{target}', offset={next_offset}, "
         f"limit={shown}). Or grep first.]"
     )
-    _log(session, "auto_paginate.fire", target=target[:80], total=total_lines, next_offset=next_offset)
+    _log(session, "auto_paginate.fire", target=target[:80], total=total_lines,
+            shown=shown, next_offset=next_offset)
     return cleaned + pointer, {
         "constraint": "auto_paginate",
         "auto_paginate_target": target,
@@ -453,11 +469,20 @@ _HEAD_SUMMARY_KEEP_LINES = 30  # real content lines kept alongside the summary
 
 
 def head_summary(session: Any, path: str, text: str) -> tuple[str, dict]:
-    """For a `read` result > _HEAD_SUMMARY_LIMIT chars, prepend a structural
+    """For a `read` result with > 800 total lines, prepend a structural
     summary and keep the first _HEAD_SUMMARY_KEEP_LINES real lines. Anything
     beyond that is truncated with an explicit, honest notice — the body is
-    never silently discarded while the text claims otherwise."""
-    if len(text) <= _HEAD_SUMMARY_LIMIT:
+    never silently discarded while the text claims otherwise.
+
+    WP2: only fires when the result header reports >800 lines. Smaller
+    files return verbatim. The explicit-slice gate (header showing fewer
+    lines than the file's total) stays.
+    """
+    hdr = re.search(r"\((\d+) lines,\s*showing\s+\d+-\d+\)", str(text))
+    if not hdr:
+        return text, {}
+    total_lines = int(hdr.group(1))
+    if total_lines <= 800:
         return text, {}
     # Cheap structural summary: pull Python `def`/`class` lines and their
     # line numbers. This is language-agnostic for most agentic tasks

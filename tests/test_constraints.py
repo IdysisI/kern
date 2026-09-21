@@ -45,11 +45,32 @@ class TestHeadSummary(unittest.TestCase):
 
 
 class TestAutoPaginate(unittest.TestCase):
-    def test_pagination_hints_next_offset(self):
+    def test_200_line_default_read_of_500_line_file_yields_next_offset_201(self):
+        # WP2: hi = 200 (what was actually shown), next_offset = hi + 1 = 201.
         text, meta = c.auto_paginate(
-            None, "a.py", 1000, "body", {"offset": 1, "limit": 60}
+            None, "a.py", 500, 200, "body"
         )
-        self.assertEqual(meta.get("auto_paginate_next_offset"), 61)
+        self.assertEqual(meta.get("auto_paginate_next_offset"), 201)
+        self.assertIn("lines 1-200", text)
+
+    def test_arithmetic_at_other_hi_values(self):
+        text, meta = c.auto_paginate(None, "a.py", 1000, 400, "body")
+        self.assertEqual(meta.get("auto_paginate_next_offset"), 401)
+
+
+class TestHeadSummary(unittest.TestCase):
+    def test_silent_on_500_line_file(self):
+        # WP2: head_summary fires only when total lines > 800.
+        body = "/x.py  (500 lines, showing 1-500)\n" + ("\n".join(f"  l{i}" for i in range(500)))
+        text, meta = c.head_summary(None, "/x.py", body)
+        self.assertEqual(text, body)
+        self.assertEqual(meta, {})
+
+    def test_fires_on_1000_line_file(self):
+        body = "/x.py  (1000 lines, showing 1-1000)\n" + ("\n".join(f"  l{i}" for i in range(1000)))
+        text, meta = c.head_summary(None, "/x.py", body)
+        self.assertNotEqual(text, body)
+        self.assertIn("read_head summary", text)
 
 
 class TestMarkDedup(unittest.TestCase):

@@ -30,3 +30,49 @@ All notable changes to Kern are documented here. The format follows [Keep a Chan
 ### Packaging
 - Added `LICENSE` (MIT), `CHANGELOG.md`, and project metadata (keywords, classifiers, readme) to `pyproject.toml`.
 - Moved historical design/audit reports into `docs/`.
+
+## [0.4.0] — Unreleased (request-efficient agent loop)
+
+### Added — Slate 2.0 (WP1)
+- **`kern/fileslate.py` `record_content`/`coverage`**: the fileslate now keeps the source text of every file the agent touches plus its `covered` ranges. Reads become idempotent — a second read of a held range returns `{"fileslate": "hit"}` instead of replaying bytes.
+- **Mutation-driven slate refresh** (`kern/syscalls.py`): `write` and `edit` call `session.fileslate.record_content(path, new_src)` on success, so a bumped mtime does NOT cache stale bytes. Both the line-range and exact-match edit paths share one formatter helper.
+- **Engine hydration + nullop sensor** (`kern/engine.py`): on session start, `Engine._hydrate_slate()` scans the journal for prior reads/edits and replays their content into the fileslate. After 3 identical absorbed reads, the engine emits `[constraint:nullop]` so the model knows the read is provably redundant.
+- **Pager coverage annotation**: every read receipt includes a `coverage` line so the model can see which ranges remain unread. Pager output now shows "read returned [fileslate:hit]" for cached reads.
+
+### Added — Request economy (WP2)
+- **Read default lowered to 400 lines** (was 800). Tool description updated accordingly. `head_summary` only fires above 800 lines (parses the `==> HEAD summary <==` header).
+- **Tool descriptions rewritten** for `read`, `write`, `edit`, `exec`, `map`, `journal`, `find_callers`, `deps`, `outline`, `fileslate`, `todo`, `note`, `memory`, `scrape`, `web_search`, `spawn` — every description now tells the model the cheapest way to satisfy the request (e.g. `outline` before `read`).
+- **`auto_paginate` is now an explicit signature `(chars_per_slice, total_chars, head_chars=400)`** — kills the hardcoded-60 slice bug and lets callers control how many characters come back per slice.
+- **Kernel batching line** in the system prompt so the model knows the engine emits one request per turn.
+
+### Added — Orientation (WP3)
+- **Structural codegraph auto-refresh** on every `tool_map` call (incremental; zero LLM). `detect_test_command` now prefers `uv run --extra test` when both a `uv.lock` and the `test` extra are present, falling back to `pytest`/`make`/`npm`/`go test`. `ensure_kern_md` runs without a `.git` dir when project markers (pyproject, package.json, go.mod) are present.
+- **Mission packet** (`Engine._with_mission_packet`): cached, byte-stable, fail-open — wrapped around `prepare()` so the system prompt always opens with the latest objective/notes/mounts. No re-reads.
+- **Env-fact learning**: on `/undo`, the engine promotes a constrained fact into project memory exactly once per fact (idempotent, deterministic, no LLM).
+
+### Added — Discipline sensors (WP4)
+- **Plan-first gate** (no model tiers — applies to all models): a model that ends a turn without calling any tool is held to a one-line plan before it can claim a final answer.
+- **Drift sensor**: zero-overlap reads of unrelated files inside one turn are recorded; after 5 such reads the engine adds a `[constraint:drift]` note so the model re-orientates.
+- **Todo staleness**: 12 unchanged `todo` calls without progress trigger `[constraint:stale]` so the model revisits the plan.
+
+### Changed — No model tiers (WP5)
+- **No `classify_tier`**: removed the weak/strong distinction. Every model receives every enhancement; we no longer call out any model as weak or strong.
+- **Behavioral discipline** (`kern/kernel.py`): discipline is conveyed structurally — the same prompts go to all models.
+
+### Added — Verification receipts + review skip (WP6)
+- **`evidence_block`** in `prepare()`: each tool call now emits a one-paragraph evidence block listing the file/line/receipt that backs the action, so the model can copy-paste provenance without re-deriving it.
+- **`known_good_commands`**: `pytest -q`, `uv run --extra test pytest -q`, and `ruff check kern` are pre-acknowledged and skip the human-review gate (preserved from v0.3).
+
+### Added — Hygiene telemetry (WP7)
+- **`Engine.hygiene` counters** at every mapped site (`read`, `reads_absorbed`, `slate_hits`, `dedup_hits`, `nullop_notes`, `breaker_fires`, `force_plans`, `mutations`, `drift_notes`, `requests`).
+- **`hygiene` event** emitted in `_run_marked`'s `finally` block BEFORE `turn_end` — one per turn, snapshot of all counters.
+- **`kern.pager.budget()`** aggregates the per-turn `hygiene` events into `out["hygiene"]` so the model sees cumulative cost.
+- **TUI inspector**: the work-proof panel shows the latest hygiene line (reads / absorbed / mutations / reqs); topbar pill shows ● idle / ● busy.
+
+### Changed — En-passant (WP8)
+- **`pyproject.toml` `[tool.pytest.ini_options]`**: `testpaths = ["tests"]` + `asyncio_mode = "auto"`. Pytest stays focused on the tests/ tree; new tests can't silently regress to the wrong mode.
+- **TUI nit**: topbar shows idle/busy state via `_turn_running()`.
+
+### Added — Measurement (WP9)
+- **`kern/measure.py`**: pure `session_stats(events)` and `hygiene_replay(events)` for operator dashboards. No state, no LLM calls. Schema is locked to `Engine.hygiene` keys (`tests/test_measure.py::test_hygiene_keys_match_engine_schema`).
+- **40 new tests** across WP1-WP9 (`tests/test_slate_v2.py`, `tests/test_request_economy.py`, `tests/test_orientation.py`, `tests/test_discipline.py`, `tests/test_verification.py`, `tests/test_hygiene.py`, `tests/test_measure.py`). Total suite: 594 collected, 588 passing, 6 pre-existing failures in `tests/test_hot_update.py` (environmental: checkout has no `.git` dir).
