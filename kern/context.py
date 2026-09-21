@@ -40,6 +40,18 @@ def summary_fields(data):
     return result
 
 
+def _one_line(value) -> str:
+    """Any journal value as a single whitespace-collapsed line.
+
+    Hoisted out of the f-strings in `_digest_line`: a backslash inside an
+    f-string expression is a SyntaxError before Python 3.12 (PEP 701) and this
+    package declares `requires-python >=3.11`. It also replaces three copies of
+    an over-escaped raw pattern that matched a literal backslash followed by
+    's' instead of whitespace, so nothing was ever collapsed.
+    """
+    return re.sub(r"\s+", " ", str(value))
+
+
 def _digest_line(ev):
     """One useful, information-dense line per journal event.
 
@@ -58,7 +70,14 @@ def _digest_line(ev):
             blob = ' '.join(f'{k}={v}' for k, v in list(args.items())[:3])
         else:
             blob = str(args)
-        return f'{n} {kind} {name}: {re.sub(r"\\s+", " ", blob)[:150]}'
+        # Hoisted out of the f-string: a backslash inside an f-string
+        # expression is a SyntaxError before Python 3.12 (PEP 701), and this
+        # package declares requires-python >=3.11. Also repairs an
+        # over-escaped r"\\s+" — that pattern matched a literal backslash
+        # followed by 's', so multi-line argument blobs were never collapsed
+        # into the single line this function promises.
+        blob = re.sub(r"\s+", " ", blob)[:150]
+        return f'{n} {kind} {name}: {blob}'
     if kind == 'tool_result':
         txt = (ev.get('summary') or ev.get('excerpt') or ev.get('text') or '')
         if not isinstance(txt, str):
@@ -81,11 +100,11 @@ def _digest_line(ev):
             flat = flat[:100] + ' … ' + flat[-160:]
         return f'{n} {kind}: {flat[:400]}'
     if kind == 'note':
-        return f'{n} note: {re.sub(r"\\s+", " ", str(ev.get("text", "")))[:200]}'
+        return f'{n} note: {_one_line(ev.get("text", ""))[:200]}'
     if kind in ('constraint_fired', 'todo'):
-        return f'{n} {kind}: {re.sub(r"\\s+", " ", str(ev.get("text") or ev.get("constraint") or ""))[:150]}'
+        return f'{n} {kind}: {_one_line(ev.get("text") or ev.get("constraint") or "")[:150]}'
     txt = ev.get('text') or ev.get('summary') or ''
-    return f'{n} {kind}: {re.sub(r"\\s+", " ", str(txt))[:150]}'
+    return f'{n} {kind}: {_one_line(txt)[:150]}'
 
 
 def _digest_events(events, cap=240):

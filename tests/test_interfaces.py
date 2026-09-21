@@ -22,7 +22,12 @@ cli._headless = lambda *args: cli._cb('text', '\\u2713 \\U0001f43e')
 sys.argv = ['kern', '--task', 'synthetic']
 cli.main()
 '''
-    run = subprocess.run([sys.executable, '-c', code], capture_output=True)
+    # The CLI refuses to start without a credential and CI has none. This test
+    # is about an ASCII-reconfigured stdout carrying a unicode callback, not
+    # about auth, so hand the child an explicit dummy key — `_headless` is
+    # stubbed above, so nothing reaches the network.
+    env = {**os.environ, 'KERN_API_KEY': '[redacted-by-kern]'}
+    run = subprocess.run([sys.executable, '-c', code], capture_output=True, env=env)
     assert run.returncode == 0, run.stderr
     assert run.stdout.decode('utf-8') == '\u2713 \U0001f43e'
 

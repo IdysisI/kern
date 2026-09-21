@@ -17,7 +17,6 @@ The mechanisms under test:
 """
 import os
 import time
-from pathlib import Path
 
 import pytest
 
@@ -46,10 +45,18 @@ def _tc(name, args, cid="c1"):
 
 
 def test_detect_test_command_uv_extra(tmp_path):
-    """For this repo: pyproject has [project.optional-dependencies].test
-    AND uv.lock exists → return the uv-extra form."""
+    """pyproject declares a `test` extra AND uv.lock exists → the uv-extra
+    form. Built in tmp_path so the expectation does not depend on where this
+    repo happens to be checked out (it used to assert against a hard-coded
+    absolute path and therefore failed on every machine but one)."""
     from kern.kernfile import detect_test_command
-    assert detect_test_command(Path("/home/marty/kern")) == "uv run --extra test pytest tests/"
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname="x"\n'
+        '[project.optional-dependencies]\ntest = ["pytest>=8"]\n'
+    )
+    (tmp_path / "uv.lock").write_text('version = 1\n')
+    (tmp_path / "tests").mkdir()
+    assert detect_test_command(tmp_path) == "uv run --extra test pytest tests/"
 
 
 def test_detect_test_command_falls_back_without_uv_lock(tmp_path):

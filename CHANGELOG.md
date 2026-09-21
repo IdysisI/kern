@@ -97,6 +97,21 @@ All notable changes to Kern are documented here. The format follows [Keep a Chan
   the tag; `kern/linker.py` now reports the package version in the MCP
   `clientInfo` handshake instead of a hardcoded literal.
 
+- **Python 3.11 floor honored**: `requires-python = ">=3.11"` and CI tests 3.11,
+  but `kern/context.py` and `kern/pager.py` put backslashes inside f-string
+  expressions — a `SyntaxError` before Python 3.12 (PEP 701) — so the package
+  could not even be imported on the oldest version it claims to support. Those
+  expressions are hoisted into a shared `_one_line()` helper, which also repairs
+  an over-escaped raw pattern that matched a literal backslash instead of
+  whitespace: journal digest lines are now actually collapsed onto one line.
+- **Environment-independent tests**: the headless unicode test handed the child
+  CLI whatever credentials the developer happened to have and failed in CI where
+  there are none (it now passes an explicit dummy key — `_headless` is stubbed,
+  so nothing reaches the network), and the `detect_test_command` uv-extra test
+  asserted against a hard-coded absolute checkout path, so it could only ever
+  pass on one machine (it now builds the repo shape in `tmp_path`). With those
+  fixed the whole matrix is green: 631 tests on Python 3.11, 3.12 and 3.14.
+
 ## [0.3.0] — 2026-09-17
 
 ### Added

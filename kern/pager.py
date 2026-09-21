@@ -315,9 +315,13 @@ def materialize(events: list[dict], session) -> list[dict]:
             elif i not in keep_inline and n - i > STALE_AGE and len(text) > STALE_MIN \
                     :
                 path = session.offload(f"t{ev['n']}", text)
+                # Hoisted out of the f-string: a backslash inside an f-string
+                # expression is a SyntaxError before Python 3.12 (PEP 701),
+                # and this package declares requires-python >=3.11.
+                head = re.sub(r'\s+', ' ', text[:140]).strip()
                 cleared = (f"[old tool result cleared: {ev.get('name', '?')} — "
                            f"{len(text):,} bytes -> {path}. "
-                           f"Head: {re.sub(r'\s+', ' ', text[:140]).strip()!r}. "
+                           f"Head: {head!r}. "
                            f"Use read(path) if you need it again.]")
                 if ev.get("coverage"):
                     cleared += f"\n[{ev['coverage']}]"
