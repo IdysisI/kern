@@ -356,6 +356,31 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 400,
             )
             return msg, {"fileslate": "hit", "path": str(p)}
 
+    # KnowledgeLedger: scratch duplicate detection (Continuity Phase 4).
+    # If the model reads a scratch file that duplicates content we already
+    # recorded (from a file_read or earlier tool result), return a pointer
+    # instead of re-rendering the full content.
+    if session is not None:
+        try:
+            _knowledge = (getattr(session, '_runtime', None) or {}).get('knowledge')
+            _resolved = str(p)
+            if _knowledge is not None and '/scratch/' in _resolved:
+                _dup = _knowledge.find_scratch_duplicate(_resolved)
+                if _dup is not None:
+                    return (
+                        f"[knowledge-ledger duplicate: scratch file duplicates "
+                        f"{_dup.source_path} {_dup.coverage}, already held from "
+                        f"this session. Use existing knowledge. Full artifact "
+                        f"remains at {_resolved} if genuinely needed.]"
+                    ), {
+                        "knowledge_duplicate_scratch": True,
+                        "path": _resolved,
+                        "original_source": _dup.source_path,
+                        "coverage": _dup.coverage,
+                    }
+        except Exception:
+            pass
+
     if p.is_dir():
         entries = sorted(os.listdir(p))[:200]
         return f"{res_prefix}{p}/ (directory)\n" + "\n".join(entries), {"path": str(p)}
@@ -367,7 +392,6 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 400,
     size = p.stat().st_size
     suffix = p.suffix.lower()
 
-    # Multimodal Media: Images
     IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
     if suffix in IMAGE_EXTS:
         import base64, mimetypes
@@ -400,6 +424,95 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 400,
         except Exception:
             pass
 
+    # KnowledgeLedger outline-first progressive disclosure (Continuity Phase 5):
+    # For large code files not yet acquired this session, return outline + head
+    # instead of a blind 400-line slice. Stops the read 1-400 / realize wrong
+    # range / read again loop. Toggled by KERN_OUTLINE_FIRST, default-on.
+    if (
+        os.environ.get("KERN_OUTLINE_FIRST", "1") != "0"
+        and not full
+        and offset == 1
+        and limit == 400
+        and session is not None
+        and p.exists()
+        and not p.is_dir()
+        and suffix not in BINARY_EXTS
+    ):
+        try:
+            _knowledge = (getattr(session, '_runtime', None) or {}).get('knowledge')
+            _code_exts = (".py", ".js", ".ts", ".rs", ".go", ".c", ".cpp",
+                          ".java", ".css", ".html", ".json", ".toml",
+                          ".yaml", ".yml", ".sh", ".jsx", ".tsx", ".rb")
+            _already = False
+            if _knowledge is not None:
+                try:
+                    _ov = _knowledge.find_overlapping_read(str(p), 1, 1)
+                    _already = (
+                        (_ov is not None and _ov.status in ("covered", "partial"))
+                        or _knowledge.find_outline(str(p)) is not None
+                    )
+                except Exception:
+                    _already = False
+            if (not _already) and suffix in _code_exts:
+                _total_lines = 0
+                try:
+                    with p.open("r", encoding="utf-8", errors="replace") as _f:
+                        for _line in _f:
+                            _total_lines += 1
+                except Exception:
+                    _total_lines = 0
+                if _total_lines > 1200:
+                    try:
+                        _rel = str(p)
+                        if _knowledge is not None and hasattr(_knowledge, "_rel"):
+                            try:
+                                _rel = _knowledge._rel(str(p))
+                            except Exception:
+                                _rel = str(p)
+                    except Exception:
+                        _rel = str(p)
+                    _outline = "(outline unavailable)"
+                    try:
+                        from .codegraph import CodeGraph
+                        _cg = CodeGraph(str(p.parent))
+                        _outline = _cg.outline(_rel, max_items=40)
+                    except Exception:
+                        try:
+                            _outline = "(codegraph unavailable)"
+                        except Exception:
+                            pass
+                    _head = []
+                    try:
+                        with p.open("r", encoding="utf-8", errors="replace") as _f:
+                            for _i, _ln in enumerate(_f, 1):
+                                if _i > 30:
+                                    break
+                                _head.append(f"   {_i}\t{_ln.rstrip()}\n")
+                    except Exception:
+                        pass
+                    msg = (
+                        f"{res_prefix}[large unread file: {_rel} ({_total_lines} lines)\n"
+                        f"Outline:\n{_outline}\n\n"
+                        f"First 30 lines:\n" + "".join(_head) +
+                        f"\nNext steps:\n"
+                        f"- read(path='{_rel}', offset=N, limit=M) for targeted slice\n"
+                        f"- read(path='{_rel}', full=true) if whole file is genuinely needed\n"
+                        f"- map(action='find', name='symbol') to locate symbols]"
+                    )
+                    try:
+                        if _knowledge is not None:
+                            _knowledge.record_outline(_rel, _outline)
+                    except Exception:
+                        pass
+                    return msg, {
+                        "outline_first": "served",
+                        "path": str(p),
+                        "total_lines": _total_lines,
+                    }
+        except Exception:
+            pass
+
+    # Multimodal Media: Images
     if is_binary:
         import mimetypes
         mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"

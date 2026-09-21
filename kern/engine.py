@@ -441,6 +441,8 @@ class Engine:
         # Survives across turns like the fetch cache; dies with the session.
         from .fileslate import FileSlate
         self.fileslate = runtime.setdefault("fileslate", FileSlate(cwd))
+        from .knowledge import KnowledgeLedger
+        self.knowledge = runtime.setdefault("knowledge", KnowledgeLedger(cwd))
         # No model tier — the operator's direction: every model gets every
 # enhancement; we never say "this model is weak or strong". Tiering is
 # intentionally absent so the harness is uniform.
@@ -455,7 +457,9 @@ class Engine:
         self.hygiene = {"requests": 0, "reads": 0, "reads_absorbed": 0,
                         "slate_hits": 0, "dedup_hits": 0,
                         "nullop_notes": 0, "breaker_fires": 0, "force_plans": 0,
-                        "mutations": 0, "drift_notes": 0}   # WP7 telemetry
+                        "mutations": 0, "drift_notes": 0,
+                        "knowledge_hits": 0, "knowledge_intercepts": 0, "knowledge_force_rereads": 0,
+                        "knowledge_duplicates_scratch": 0, "outline_first_served": 0, "knowledge_loop_warnings": 0}   # WP7 telemetry
         self._failed_execs = session._runtime.setdefault(
             "failed_execs", __import__("collections").deque(maxlen=5))   # WP3 env learning
         self.depth = subagent_depth
@@ -476,6 +480,10 @@ class Engine:
         self._run_targets: set = set()   # distinct targets seen in current read-run (typed breaker)
         self._last_inspection_target: str | None = None  # most recent inspection target (breaker diagnostics)
         self._read_limit_hinted: set = set()  # files already nudged once toward offset/limit reads
+        # KnowledgeLedger: per-turn counters for interceptor/loop governor
+        self._current_turn: int = 0
+        self._knowledge_hits_this_turn: int = 0
+        self._knowledge_warned_this_turn: bool = False
         # In-turn read-only dedup cache: (tool, canonical args) -> (result, meta).
         # An identical successful read-only call returns the cached result instead of
         # re-executing, so a model that re-reads a file it already has pays ~zero for it.
@@ -1434,6 +1442,15 @@ class Engine:
             has_obj = any(ev.get("kind") == "objective" for ev in self.session.events)
             if not _is_continuation_prompt(user_text, has_active_objective=has_obj):
                 self.session.emit("objective", text=user_text)
+            # KnowledgeLedger: bump turn counter so current_turn_at_record is correct
+            try:
+                self._current_turn += 1
+                self._knowledge_hits_this_turn = 0
+                self._knowledge_warned_this_turn = False
+                if hasattr(self, "knowledge") and self.knowledge is not None:
+                    self.knowledge.set_current_turn(self._current_turn)
+            except Exception:
+                pass
             return await self._run_marked(max_steps=max_steps)
 
     async def resume(self, max_steps: int | None = None) -> str:
@@ -1641,12 +1658,18 @@ class Engine:
             max_attempts = self._retry_budget.max_billed + 2
             for attempt in range(max_attempts):
                 text_parts = []
+                thinking_parts = []
+                thinking_signatures = []
                 calls = []
                 error = ""
                 truncated = False
                 async for ev in self.client.stream_chat(self.model, view, system=system, tools=tools, max_tokens=self.output_budget):
                     if ev.kind == "thinking":
-                        self.stream_cb("thinking", ev.text)
+                        if ev.text:
+                            thinking_parts.append(ev.text)
+                            self.stream_cb("thinking", ev.text)
+                        if ev.signature:
+                            thinking_signatures.append(ev.signature)
                     elif ev.kind == "finish" and ev.text == "length":
                         truncated = True
                         self.stream_cb("note", "⚠ The model hit its output token limit (max_tokens).")
@@ -1748,7 +1771,12 @@ class Engine:
                 if not isinstance(call.get("arguments"), dict):
                     call["arguments"] = {}
                     call["kern_error"] = "error: tool arguments must be an object"
-            self.session.emit("assistant", text=display, tool_calls=calls)
+            assistant_kwargs = {"text": display, "tool_calls": calls}
+            if thinking_parts:
+                assistant_kwargs["thinking"] = "".join(thinking_parts)
+            if thinking_signatures:
+                assistant_kwargs["thinking_signature"] = "".join(thinking_signatures)
+            self.session.emit("assistant", **assistant_kwargs)
             final_text = display
 
             # mount directives (work in both protocols) — journaled AFTER the
@@ -1918,6 +1946,84 @@ class Engine:
                     # is the fix for the measured re-read waste (343 reads of
                     # one file across 269 slices in a single session).
                     if name == "read":
+                        # --- KnowledgeLedger pre-acquisition interceptor (Continuity) ---
+                        # Stops redundant reads of unchanged content before they cost a request.
+                        try:
+                            _kforce = bool((args or {}).pop("_kern_force_reread", False))
+                            _kreason = (args or {}).pop("_kern_reason", None)
+                            if _kforce:
+                                self.hygiene["knowledge_force_rereads"] += 1
+                                if self.hygiene["knowledge_force_rereads"] >= 3:
+                                    _dbg(self.session, "knowledge.force_limit",
+                                         reason=_kreason or "", count=self.hygiene["knowledge_force_rereads"])
+                        except Exception:
+                            _kforce = False
+                            _kreason = None
+                        try:
+                            _kpath = str(args.get("path", ""))
+                            _koverlap = self.knowledge.find_overlapping_read(
+                                _kpath, args.get("offset", 1), args.get("limit", 400),
+                            )
+                            if (not _kforce) and _koverlap.status == "covered" and _koverlap.entry is not None:
+                                # Same content was acquired earlier in this session.
+                                # If it was current-turn, the model likely still has it in context:
+                                # emit a short pointer, not the full content.
+                                _entry = _koverlap.entry
+                                if _entry.current_turn_at_record:
+                                    _dbg(self.session, "knowledge.hit_current",
+                                         target=_kpath[:60], coverage=_entry.coverage)
+                                    self.hygiene["knowledge_hits"] += 1
+                                    self.hygiene["knowledge_intercepts"] += 1
+                                    self._knowledge_hits_this_turn += 1
+                                    _hint = (
+                                        f"[knowledge-ledger hit: {_kpath} {_entry.coverage} already held from this turn; "
+                                        f"file unchanged. Content is byte-identical. Re-reading costs a request and adds no information. "
+                                        f"Use held knowledge."
+                                    )
+                                    _next = ""
+                                    if _entry.range_hi > 0 and _entry.total_lines > _entry.range_hi:
+                                        _next = (
+                                            f" If you need lines {_entry.range_hi + 1}-{_entry.total_lines}, "
+                                            f"read(path='{_kpath}', offset={_entry.range_hi + 1}, "
+                                            f"limit={min(400, _entry.total_lines - _entry.range_hi)})."
+                                        )
+                                    _hit_text = _hint + _next + "]"
+                                    _hit_meta = {
+                                        "fileslate": "knowledge_hit",
+                                        "path": _kpath,
+                                        "coverage": _entry.coverage,
+                                        "constraint": "knowledge_intercept",
+                                        "status": "knowledge_hit",
+                                    }
+                                    # Knowledge-loop warning: emit once per turn when hits climb
+                                    if self._knowledge_hits_this_turn >= 5 and not self._knowledge_warned_this_turn:
+                                        _hit_text += (
+                                            f"\n[knowledge-loop: {self._knowledge_hits_this_turn} acquisition attempts were "
+                                            f"redirected to already-held knowledge this turn. You are likely searching for "
+                                            f"information not present in held state. Either state precisely what is missing and "
+                                            f"query a different source, or proceed to implementation/verification using held "
+                                            f"knowledge.]"
+                                        )
+                                        _hit_meta["knowledge_loop_warning"] = True
+                                        self.hygiene["knowledge_loop_warnings"] += 1
+                                        self._knowledge_warned_this_turn = True
+                                    self.session.emit("action", call_id=cid, name=name, arguments=args)
+                                    self.session.emit("tool_result", call_id=cid, name=name,
+                                                       text=_hit_text, status="knowledge_hit",
+                                                       constraint="knowledge_intercept",
+                                                       coverage=_entry.coverage)
+                                    self.stream_cb("result", _hit_text)
+                                    self.hygiene["reads_absorbed"] += 1
+                                    continue
+                                else:
+                                    # Older turn: try to serve the slice from fileslate.
+                                    _dbg(self.session, "knowledge.hit_old",
+                                         target=_kpath[:60], coverage=_entry.coverage)
+                                    self.hygiene["knowledge_intercepts"] += 1
+                                    self.hygiene["knowledge_hits"] += 1
+                        except Exception:
+                            pass
+
                         try:
                             _sl = self.fileslate.covered_slice(
                                 args.get("path", ""), args.get("offset", 1),
@@ -1979,6 +2085,20 @@ class Engine:
                                             str((args or {}).get("path", "")), str(text))
                                     except Exception:
                                         pass
+                                    # KnowledgeLedger: record what the model just acquired
+                                    try:
+                                        _kread_path = str((args or {}).get("path", ""))
+                                        _kread_full = bool((args or {}).get("full", False))
+                                        _kread_offset = int((args or {}).get("offset", 1))
+                                        _kread_limit = int((args or {}).get("limit", 400))
+                                        self.knowledge.record_file_read(
+                                            _kread_path, str(text),
+                                            offset=_kread_offset, limit=_kread_limit,
+                                            full=_kread_full,
+                                            event_n=cid, turn_id=self._current_turn,
+                                        )
+                                    except Exception:
+                                        pass
                         elif not _is_read_only(name, args):
                             # FileSlate: SURGICAL invalidation. edit/write touch
                             # exactly one file — wiping the whole read cache for
@@ -2007,6 +2127,11 @@ class Engine:
                                 for _k in [k for k in self._ro_cache
                                            if k[0] in ("read", "map") and _pk in k[1]]:
                                     del self._ro_cache[_k]
+                                # KnowledgeLedger: mark previous entries stale
+                                try:
+                                    self.knowledge.invalidate_path(str(_mut_path))
+                                except Exception:
+                                    pass
                             else:
                                 if self._ro_cache:
                                     _dbg(self.session, "dedup.invalidate", tool=name, cleared=len(self._ro_cache))
@@ -2017,6 +2142,29 @@ class Engine:
                                 self.fileslate.record_read(str((args or {}).get("path", "")), str(text))
                             except Exception:
                                 pass
+                    # KnowledgeLedger: capture map / memory / read-only exec / outline
+                    try:
+                        if name == "map":
+                            _maction = str((args or {}).get("action", ""))
+                            _mtarget = str((args or {}).get("name", "")) or str((args or {}).get("path", ""))
+                            self.knowledge.record_map_result(
+                                _maction, _mtarget, str(text),
+                                event_n=cid, turn_id=self._current_turn,
+                            )
+                        elif name == "memory":
+                            _mpat = str((args or {}).get("action", "")) + ":" + str((args or {}).get("key", ""))
+                            self.knowledge.record_memory_result(
+                                _mpat, str(text),
+                                event_n=cid, turn_id=self._current_turn,
+                            )
+                        elif name == "exec" and _is_read_only(name, args):
+                            _ecmd = str((args or {}).get("cmd", ""))
+                            self.knowledge.record_readonly_exec(
+                                _ecmd, str(text),
+                                event_n=cid, turn_id=self._current_turn,
+                            )
+                    except Exception:
+                        pass
                 if prior is not None and not _is_read_only(name, args):
                     # Only warn for side-effecting repeats. Re-running a read-only
                     # status/log/read is harmless and must not be flagged (F3).

@@ -157,6 +157,16 @@ def _slate(events: list[dict], session=None) -> str:
     except Exception:
         pass
 
+    # KnowledgeLedger: compact knowledge-state block surviving compaction
+    try:
+        knowledge = (getattr(session, '_runtime', None) or {}).get('knowledge')
+        if knowledge is not None:
+            k_block = knowledge.state_block()
+            if k_block:
+                lines.append(k_block)
+    except Exception:
+        pass
+
     lines.append("</work-state>")
     return "\n".join(lines)
 
@@ -246,6 +256,10 @@ def materialize(events: list[dict], session) -> list[dict]:
             msgs.append(m)
         elif kind == "assistant":
             m = {"role": "assistant", "text": ev.get("text", "")}
+            if ev.get("thinking"):
+                m["thinking"] = ev["thinking"]
+            if ev.get("thinking_signature"):
+                m["thinking_signature"] = ev["thinking_signature"]
             if ev.get("tool_calls"):
                 m["tool_calls"] = [{k: v for k, v in tc.items() if not k.startswith("_")
                                     and k not in ("kern_error", "provider_id")}
@@ -344,7 +358,7 @@ def budget(events: list[dict], session) -> dict:
     view = materialize(events, session)
     out = {"events": len(events), "assistant_bytes": 0, "user_bytes": 0, "tool_bytes": 0}
     for m in view:
-        size = len(m.get("text", "")) + len(json.dumps(m.get("tool_calls", "")))
+        size = len(m.get("text", "")) + len(m.get("thinking", "")) + len(json.dumps(m.get("tool_calls", "")))
         media = m.get("media")
         if isinstance(media, dict):
             # base64 payload ships in the request body; count it so /context

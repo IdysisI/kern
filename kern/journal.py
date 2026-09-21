@@ -339,11 +339,19 @@ class Session:
         # it so the path we return is the one that actually exists.
         existing = sorted(self.scratch.glob(f"*-{digest}.txt"))
         if existing:
-            return str(existing[0])
-        p = self.scratch / f"{tag}-{digest}.txt"
-        if not p.exists():
-            atomic_write(p, content)
-        return str(p)
+            ret_path = str(existing[0])
+        else:
+            p = self.scratch / f"{tag}-{digest}.txt"
+            if not p.exists():
+                atomic_write(p, content)
+            ret_path = str(p)
+        try:
+            runtime = getattr(self, "_runtime", None)
+            if runtime and "knowledge" in runtime:
+                runtime["knowledge"].record_scratch(ret_path, content)
+        except Exception:
+            pass
+        return ret_path
 
 
 def create_session(cwd: str | None = None, parent: str | None = None,

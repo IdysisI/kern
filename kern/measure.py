@@ -25,6 +25,8 @@ HYGIENE_KEYS = (
     "requests", "reads", "reads_absorbed", "slate_hits", "dedup_hits",
     "nullop_notes", "breaker_fires", "force_plans",
     "mutations", "drift_notes",
+    "knowledge_hits", "knowledge_intercepts", "knowledge_force_rereads",
+    "knowledge_duplicates_scratch", "outline_first_served", "knowledge_loop_warnings",
 )
 
 

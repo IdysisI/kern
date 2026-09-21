@@ -92,8 +92,6 @@ def test_engine_init_hygiene_counters():
     """Engine starts with all counters at zero."""
     s = create_session("/tmp")
     e = Engine(_Model([]), "test", s, "/tmp")
-    expected = {"requests", "reads", "reads_absorbed", "slate_hits",
-                "dedup_hits", "nullop_notes", "breaker_fires",
-                "force_plans", "mutations", "drift_notes"}
-    assert set(e.hygiene.keys()) == expected
+    from kern.measure import HYGIENE_KEYS
+    assert set(e.hygiene.keys()) == set(HYGIENE_KEYS)
     assert all(v == 0 for v in e.hygiene.values())
