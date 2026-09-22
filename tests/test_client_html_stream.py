@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from kern.client import Client
+from kern.resilience import RetryBudget, classify_error, decide_retry
 
 
 def _html_client(monkeypatch, status: int, headers: dict, body: str):
@@ -61,3 +62,30 @@ async def test_non200_html_still_stage_api(monkeypatch):
     errs = [e for e in events if e.kind == "error"]
     assert errs and errs[0].error.startswith("stage=api http status=401")
     assert "Invalid key" in errs[0].error
+
+
+@pytest.mark.asyncio
+async def test_status502_html_gateway_page_is_api_error_free_retry(monkeypatch):
+    """Fixture: a Cloudflare-style 502 gateway HTML page (the operator's weird
+    provider). Through the real client stream this must surface as ONE
+    stage=api error carrying the page gist — never raw markup in the journal,
+    never 'incomplete stream' transport noise — and resilience must treat it
+    as a server fault: free (unbilled) retry, not a fatal content error."""
+    page = ('<!DOCTYPE html>\n<!--[if lt IE 7]> <html class="no-js ie6 oldie">'
+            "<head><title>502 Bad Gateway</title></head>"
+            "<body><h1>Error 502</h1>cloudflare-nginx</body></html>")
+    _html_client(monkeypatch, 502, {"content-type": "text/html"}, page)
+    events = [e async for e in Client().stream_chat("test", [])]
+    errs = [e for e in events if e.kind == "error"]
+    assert len(errs) == 1, errs
+    msg = errs[0].error
+    assert msg.startswith("stage=api http status=502"), msg
+    assert "<html" not in msg and "DOCTYPE" not in msg and "ie6" not in msg
+    assert "Bad Gateway" in msg                 # the page's real message survives as gist
+    assert "not an API error" not in msg
+    assert not [e for e in events if e.kind == "tool_call"]
+    # 5xx HTML => server fault => free retry (status beats any stage= marker)
+    assert classify_error(msg) == "server"
+    d = decide_retry(msg, produced_output=False, attempt=0,
+                     budget=RetryBudget(max_billed=3))
+    assert d.retry and d.billed is False
