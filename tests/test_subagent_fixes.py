@@ -94,7 +94,7 @@ async def test_delegation_loop_guard(tmp_path):
     """A depth-1 subagent spawning many grandchildren gets a soft block."""
     e = _engine(tmp_path, _ReplyClient(), depth=1)
     # pretend it already has _DELEGATE_SPAWN_LIMIT live children
-    from kern.engine import core as eng_mod
+    from kern.engine import subagents as eng_mod  # Phase 2: limit global lives in subagents
     for i in range(eng_mod._DELEGATE_SPAWN_LIMIT):
         e.subagents[f"sub_{i+1}"] = {
             "task": "t", "started": time.time(), "completed": False,
@@ -119,9 +119,9 @@ async def test_stall_watchdog_cancels_hung_subagent(tmp_path, monkeypatch):
     """A subagent making zero progress is cancelled after the stall window —
     not a wall-clock limit: productive subagents are never touched."""
     monkeypatch.setenv("KERN_SUBAGENT_STALL_S", "0.2")  # fast for the test
-    import importlib
     from kern.engine import core as eng_mod
-    importlib.reload(eng_mod)                            # pick up the env var
+    # Phase 2: the stall window is read from os.environ at CALL time inside
+    # subagents._tool_spawn — no module reload needed.
 
     sess = create_session(str(tmp_path))
     e = eng_mod.Engine(_StubClient(), "m", sess, str(tmp_path))
@@ -149,9 +149,8 @@ async def test_productive_subagent_not_killed(tmp_path, monkeypatch):
     """A subagent actively streaming text must NOT be stall-cancelled even if
     it runs longer than the stall window — progress resets the clock."""
     monkeypatch.setenv("KERN_SUBAGENT_STALL_S", "0.3")
-    import importlib
     from kern.engine import core as eng_mod
-    importlib.reload(eng_mod)
+    # Phase 2: stall window read at CALL time in subagents._tool_spawn — no reload needed.
 
     class SlowProductive:
         def __init__(self): self.requests = 0
@@ -182,9 +181,8 @@ async def test_stall_watchdog_salvages_partial_report(tmp_path, monkeypatch):
     structural answer to subagent drowning — graceful partial delivery,
     not a text wall telling the model to hurry up.)"""
     monkeypatch.setenv("KERN_SUBAGENT_STALL_S", "0.2")
-    import importlib
     from kern.engine import core as eng_mod
-    importlib.reload(eng_mod)
+    # Phase 2: stall window read at CALL time in subagents._tool_spawn — no reload needed.
 
     sess = create_session(str(tmp_path))
     e = eng_mod.Engine(_StubClient(), "m", sess, str(tmp_path))
