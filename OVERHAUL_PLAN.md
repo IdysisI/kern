@@ -12,7 +12,7 @@ step (per directive §1.5).
 | Phase | Title                                              | Status      | Notes |
 |------:|----------------------------------------------------|-------------|-------|
 | §1    | Mission externalization                            | done        | File + memory + KERN.md pointer + todo; committed dd2db05; suite 631/631 green |
-| 0     | Baseline & loop autopsy                            | done        | LOOP_AUTOPSY.md; tests/test_phase0_loop_autopsy.py committed RED (3 fail on axis B; 631 pre-existing pass); commit pending |
+| 0     | Baseline & loop autopsy                            | done        | LOOP_AUTOPSY.md; tests/test_phase0_loop_autopsy.py committed RED (3 fail on axis B; 631 pre-existing pass); commit `31ec3ab` |
 | 1     | Kill the loop (highest impact)                     | not-started |       |
 | 2     | Engine decomposition (mechanical)                  | not-started |       |
 | 3     | Capability-measured adaptation                     | not-started |       |
