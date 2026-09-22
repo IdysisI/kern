@@ -16,7 +16,7 @@ step (per directive §1.5).
 | 1     | Kill the loop (highest impact)                     | done        | P1.1 facade `kern/plane.py` + 9 tests (commit `251c801`); P1.2 quiet results stripping F03 advice from 7 injection sites (commit `2913ca3`); P1.3 state machine `kern/progress.py` + 15 tests (commit `9feb9ed`); P1.4 regression test GREEN; suite 658 passed |
 | 2     | Engine decomposition (mechanical)                  | not-started | next: phase 2 moves scattered counters to engine package + integrates the plane |
 | 3     | Capability-measured adaptation                     | not-started |       |
-| 4     | Context engine v2                                   | not-started |       |
+| 4     | Context engine v2                                   | in-progress | P4.1 F01 double-injection FIXED (commit `5696fa8`, 4 tests); P4.2 F08 mission-packet rewrite DONE (commit `52ab614`, 5 tests, latent dead-code bug found+fixed); P4.3 episodes / P4.4 objective dedup / P4.5 estimate honesty remain |
 | 5     | Orchestration & throughput                         | not-started |       |
 | 6     | Consolidation, observability & release             | not-started |       |
 
@@ -33,14 +33,14 @@ overhaul). Update file/function on verification.
 
 | ID    | One-line summary                                                                                  | Status   | File / Function |
 |------:|---------------------------------------------------------------------------------------------------|----------|-----------------|
-| F01   | Double injection in `ContextManager.prepare()` — return line re-applies all 3 injections              | pending  | kern/context.py  |
+| F01   | Double injection in `ContextManager.prepare()` — return line re-applies all 3 injections              | applied   | Fixed in P4.1 (`5696fa8`): return-line now `return view`; live evidence pre-fix = 2 mission-context blocks per prepare() |
 | F02   | `serve.py` `Conn`/`handler` classes are DEAD CODE (web.py imports daemon.handler; serve.main delegates) | pending  | kern/serve.py    |
 | F03   | Constraint soup — advisory text injected into tool_results drives small-model meta-loops           | applied   | Fixed in P1.2 (`2913ca3`). Every `[constraint:…]` injection site stripped of imperative language; sensors still fire (constraint_fired journal events + hygiene counters) but model-visible text is facts + pointer framing only |
 | F04   | Six scattered loop sensors with tangled resets                                                    | applied   | P1.3 (`9feb9ed`) adds `kern/progress.py` — the ONE decision point per turn. Migration of all six counters into it is the P2 mechanical work |
 | F05   | Triple read-dedup at three inline points (`_ro_cache`, FileSlate, KnowledgeLedger)                | applied   | P1.1 (`251c801`) adds `kern/plane.py` facade with one `(text, meta, served_from)` response shape; migration of all three engine call sites to use the facade is the P2 mechanical work |
 | F06   | Token estimate inconsistency: context.estimate ÷3 vs pager.budget ÷4, neither calibrated            | pending  | kern/context.py, kern/pager.py |
 | F07   | Naive episode selection: set(objective.lower().split()) substring matching                         | pending  | kern/pager.py    |
-| F08   | `_with_mission_packet` internal mess — regex per call, `'g' in locals()`, possible adjacency break | pending  | kern/context.py  |
+| F08   | `_with_mission_packet` internal mess — regex per call, `'g' in locals()`, possible adjacency break | applied   | Fixed in P4.2 (`52ab614`): module-level regexes, _safe_codegraph, single extraction, adjacency-safe fallback; latent dead-code stems bug found (CodeGraph.modules never existed) and fixed via new module_paths() API |
 | F09   | No tool-argument repair + fenced-mode full-schema dump                                             | pending  | kern/client.py   |
 | F10   | Fixed harness regardless of measured capability                                                   | pending  | kern/client.py, kern/engine.py |
 | F11   | Subagents don't inherit parent knowledge                                                          | pending  | kern/engine.py, kern/kernel.py |
@@ -165,6 +165,50 @@ advice phrases per 20-call loop returns 0 today.
   in the engine. The plane facade is the new entry point; full migration
   to call it is mechanical.
 
+### Phase 4 (partial) — Context engine v2 — 2026-09-22
+
+**P4.1 — F01 double-injection FIXED (commit `5696fa8`).** The final
+return line in `ContextManager.prepare()` re-applied all three injectors
+after the main flow (and fold loop) had already applied them. Live
+evidence pre-fix: `prepare()` on the real repo produced 2
+`<mission-context>` blocks. Fix: `return view`. 4 regression tests in
+`tests/test_phase4_f01_single_injection.py` assert each block appears
+exactly once.
+
+**P4.2 — F08 mission-packet rewrite DONE (commit `52ab614`).** Four
+hygiene fixes: module-level compiled regexes (`_PATH_RX`, `_WORD_RX`);
+`_safe_codegraph` helper replacing the `'g' in locals()` smell; single
+`latest_user_text` extraction (duplicate reversed loop removed); and the
+adjacency fix — the old fallback (`view[:-1] + [block] + view[-1:]`)
+could insert the packet between an assistant tool_call and its tool
+results; the new fallback inserts only before a user message or right
+after the leading system message, never mid-exchange.
+
+**Latent bug found during P4.2:** the module-stems feature read a
+non-existent `CodeGraph.modules` attribute; the AttributeError was
+silently swallowed, so stems matching had been dead code since it
+shipped. Added the honest API `CodeGraph.module_paths()` (raw module node
+paths, the data behind `map()`) and wired `_with_mission_packet` to it,
+guarded so a graph hiccup degrades to no stems rather than a lost
+packet. 5 tests in `tests/test_phase4_f08_mission_packet.py`.
+
+**P4.5 — estimate honesty (verified as side-effect of P4.1).** The size
+estimate is computed on the final view (post fold + injections) at the
+same point where `e.context_stats` is set; with the F01 return-line
+re-application gone, `context_stats.estimated_tokens` now reflects the
+view actually sent. The /context command and TUI meter read
+`e.context_stats` — same number.
+
+**Remaining in Phase 4:** P4.3 (episode dedup: replace inline
+3×5000-char episode blocks with ONE BM25-ranked episode via
+recall.tokenize + compact index pointer) and P4.4 (objective dedup
+beyond the work-state cap — audit view assembly for repo-map vs
+mission-packet overlap). Both deferred to the next session.
+
+Suite after P4.1 + P4.2: **667 passed** (631 baseline + 3 P0 + 15 P1.3 +
+9 P1.1 + 4 F01 + 5 F08).
+
+
 ## Open Questions / Blocked Items
 
-- None.
+- None pending beyond the deferred P4.3/P4.4 items listed in the Phase 4 report.
