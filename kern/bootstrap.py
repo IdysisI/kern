@@ -138,22 +138,45 @@ def is_frozen_snapshot() -> bool:
         return True
 
 
-def _hash_dir(pkg: Path) -> str:
-    """Content hash of every top-level .py in a kern package (excl. __init__).
+def _iter_py_files(pkg: Path):
+    """Sorted (relpath, fullpath) for every .py under pkg — recursive.
 
-    Same recipe as kern.__init__._source_version so hashes are comparable
+    Phase 2 prep: subpackages (kern/engine/...) are real code and must be
+    covered by the version hash and the hot-reload fingerprint. The
+    TOP-LEVEL __init__.py is excluded; subpackage __init__.py files are
+    included. Must stay byte-identical to kern.__init__._iter_py_files so
+    hashes are comparable across copies.
+    """
+    out = []
+    for dirpath, dirnames, filenames in os.walk(pkg):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            full = Path(dirpath) / fn
+            rel = full.relative_to(pkg).as_posix()
+            if rel == "__init__.py":
+                continue
+            out.append((rel, full))
+    out.sort()
+    return out
+
+
+def _hash_dir(pkg: Path) -> str:
+    """Content hash of every .py in a kern package tree (excl. top-level __init__).
+
+    Same recipe as kern.__init__._hash_pkg so hashes are comparable
     across copies.
     """
     h = hashlib.sha256()
     try:
-        names = sorted(n for n in os.listdir(pkg)
-                       if n.endswith(".py") and n != "__init__.py")
+        files = _iter_py_files(pkg)
     except OSError:
         return _STATIC
-    for n in names:
+    for rel, full in files:
         try:
-            with open(pkg / n, "rb") as f:
-                h.update(f"{n}:".encode() + f.read())
+            with open(full, "rb") as f:
+                h.update(f"{rel}:".encode() + f.read())
         except OSError:
             pass
     return f"{_STATIC}+{h.hexdigest()[:10]}"
@@ -163,20 +186,22 @@ _sig_cache: dict[str, tuple[float, int, str]] = {}
 
 
 def _dir_fingerprint(pkg: Path) -> tuple[float, int]:
-    """Cheap (max_mtime, total_size) fingerprint of a package dir.
+    """Cheap (max_mtime, total_size) fingerprint of a package tree.
 
     Hashing ~26 source files on every 2s poll is wasteful; mtimes let us skip
     the hash entirely when nothing was touched. Only used as a cache key — the
     authoritative value is still the content hash.
+
+    Recursive (Phase 2 prep): must cover exactly the same file set as
+    `_hash_dir` — subpackages included — or edits inside kern/engine/
+    would never invalidate the cached signature.
     """
     newest = 0.0
     total = 0
     try:
-        for n in os.listdir(pkg):
-            if not n.endswith(".py") or n == "__init__.py":
-                continue
+        for _rel, full in _iter_py_files(pkg):
             try:
-                st = os.stat(pkg / n)
+                st = os.stat(full)
             except OSError:
                 continue
             newest = max(newest, st.st_mtime)

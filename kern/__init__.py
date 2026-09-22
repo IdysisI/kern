@@ -35,23 +35,49 @@ from pathlib import Path
 _STATIC = "0.4.0"
 
 
-def _hash_pkg(pkg_dir: Path) -> str:
-    """Content hash of every top-level .py in a kern package (excl. __init__).
+def _iter_py_files(pkg_dir: Path):
+    """Yield sorted (relpath, fullpath) for every .py under pkg_dir.
 
-    Deterministic across machines: sorted filenames + file bytes. Two copies of
-    the same source produce the same string, so a version mismatch always means
-    a real source difference.
+    Recursive (Phase 2 prep): subpackages like kern/engine/ are real code
+    and must be covered by the version hash and the hot-reload
+    fingerprint. The TOP-LEVEL __init__.py is excluded (it defines the
+    version itself); subpackage __init__.py files ARE included (they are
+    ordinary module code). __pycache__ is skipped.
+
+    Both this recipe and bootstrap._hash_dir must stay byte-identical so
+    hashes are comparable across copies.
+    """
+    out = []
+    for dirpath, dirnames, filenames in os.walk(pkg_dir):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for fn in filenames:
+            if not fn.endswith(".py"):
+                continue
+            full = Path(dirpath) / fn
+            rel = full.relative_to(pkg_dir).as_posix()
+            if rel == "__init__.py":
+                continue
+            out.append((rel, full))
+    out.sort()
+    return out
+
+
+def _hash_pkg(pkg_dir: Path) -> str:
+    """Content hash of every .py in a kern package tree (excl. top-level __init__).
+
+    Deterministic across machines: sorted relative paths + file bytes. Two
+    copies of the same source produce the same string, so a version
+    mismatch always means a real source difference.
     """
     h = hashlib.sha256()
     try:
-        names = sorted(n for n in os.listdir(pkg_dir)
-                       if n.endswith(".py") and n != "__init__.py")
+        files = _iter_py_files(pkg_dir)
     except OSError:
         return _STATIC
-    for n in names:
+    for rel, full in files:
         try:
-            with open(pkg_dir / n, "rb") as f:
-                h.update(f"{n}:".encode() + f.read())
+            with open(full, "rb") as f:
+                h.update(f"{rel}:".encode() + f.read())
         except OSError:
             pass  # unreadable file: skip rather than crash import
     return f"{_STATIC}+{h.hexdigest()[:10]}"
