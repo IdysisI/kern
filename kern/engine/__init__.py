@@ -5,10 +5,10 @@ public and underscore names the codebase imports, so every existing
 ``from kern.engine import X`` — and every ``getattr(engine_mod, "_x")``
 probe in tests — keeps working unchanged.
 
-Later Phase 2 steps extract cohesive modules from ``core.py``
-(``mounts.py``, ``subagents.py``, ``review.py``, ``pipeline.py``,
-``loop.py``) — each move verbatim, full suite green after each — and the
-re-exports below move with them.
+Phase 2 extraction status: ``mounts.py``, ``subagents.py`` and
+``review.py`` are out of ``core.py`` (verbatim, mixin-based); remaining:
+``pipeline.py`` and ``loop.py`` — each move verbatim, full suite green
+after each — and the re-exports below move with them.
 
 Deliberate caveat: names are re-exported BY VALUE at import time. That
 is correct for functions, classes, regexes and constants. It is NOT
@@ -20,7 +20,7 @@ imports ``kern.engine.subagents`` directly.
 """
 
 from . import core  # noqa: F401  (kern.engine.core must resolve)
-from . import mounts, subagents  # noqa: F401  (submodules must resolve)
+from . import mounts, review, subagents  # noqa: F401  (submodules must resolve)
 from .core import *  # noqa: F401,F403  (public names, incl. re-exported imports)
 
 # Re-export every underscore name (functions, classes, compiled regexes,
@@ -35,7 +35,7 @@ from .core import *  # noqa: F401,F403  (public names, incl. re-exported imports
 # (_DELEGATE_SPAWN_LIMIT) must target the OWNING module
 # (kern.engine.subagents) directly — rebinding the shim's copy is not
 # seen by the owner's code.
-for _mod in (mounts, subagents, core):
+for _mod in (mounts, review, subagents, core):
     globals().update({
         _k: _v for _k, _v in vars(_mod).items()
         if _k.startswith("_") and not _k.startswith("__")
