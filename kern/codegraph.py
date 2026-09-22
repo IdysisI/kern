@@ -342,6 +342,22 @@ class CodeGraph:
             lines.append(f"  {m['path']}  ({m['syms']} symbols, {m['imps']} imports)")
         return '\n'.join(lines)
 
+    def module_paths(self, max_modules: int = 400):
+        """Repo-relative module paths, up to a cap.
+
+        Phase 4 P4.2 (F08 fallout): `_with_mission_packet` used to read a
+        non-existent `CodeGraph.modules` attribute — an AttributeError the
+        old code silently swallowed, so the module-stems feature had been
+        dead code. This is the honest API for that use: the raw node paths
+        (what `map()` renders as text), as a list.
+        """
+        self._maybe_refresh()
+        with self._conn() as db:
+            rows = db.execute(
+                "SELECT path FROM nodes WHERE kind='module' ORDER BY path LIMIT ?",
+                (max_modules,)).fetchall()
+        return [r['path'] for r in rows]
+
     def _norm(self, path: str) -> str:
         """Normalize a user-supplied path to a repo-relative id."""
         p = Path(path)

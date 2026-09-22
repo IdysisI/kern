@@ -19,6 +19,26 @@ from .storage import atomic_write
 # context, so there is no circular dependency.
 from .journal import _scrub_compact_text
 
+# Module-level compiled regexes (Phase 4 P4.2 — F08).
+# Hoisted out of `_with_mission_packet` so they are compiled once per
+# process, not once per call.
+_PATH_RX = re.compile(r"(?:[\w.\-]+/)*[\w.\-]+\.(?:py|js|ts|tsx|jsx|rs|go|md|toml|json|ya?ml|css|html|sh|sql)")
+_WORD_RX = re.compile(r"\w{3,}")
+
+
+def _safe_codegraph(root):
+    """Return a CodeGraph rooted at ``root``, or ``None`` if it can't be
+    built (Phase 4 P4.2 — F08). Replaces the `'g' in locals()` smell that
+    used to guard the missing-graph case. Callers bind the return value
+    once and test it normally."""
+    try:
+        import kern.codegraph as _cg
+        cg = _cg.CodeGraph(str(root))
+        cg.refresh()
+        return cg
+    except Exception:
+        return None
+
 
 def summary_fields(data):
     """Normalize equivalent JSON note shapes without accepting arbitrary objects."""
@@ -520,34 +540,36 @@ class ContextManager:
                 if not cwd:
                     return view
                 from pathlib import Path as _P
-                from . import codegraph as _cg
                 root = _P(cwd)
                 # (a) explicit paths via regex from the latest user text
+                # (Phase 4 P4.2 — F08: single user-text extraction — the
+                # loop above at lines ~531 already pulled latest_user_text;
+                # regexes are compiled once at module level)
                 paths: list[str] = []
                 blocks: list[str] = []
-                latest_user_text = ""
-                for ev in reversed(list(getattr(sess, 'events', []))):
-                    if ev.get('kind') == 'user':
-                        latest_user_text = str(ev.get('text', ''))
-                        break
-                import re as _re
-                p_rx = _re.compile(r"(?:[\w.\-]+/)*[\w.\-]+\.(?:py|js|ts|tsx|jsx|rs|go|md|toml|json|ya?ml|css|html|sh|sql)")
-                for m in p_rx.finditer(latest_user_text):
+                for m in _PATH_RX.finditer(latest_user_text):
                     p = m.group(0)
                     if (root / p).exists() and p not in paths:
                         paths.append(p)
                         if len(paths) >= 3:
                             break
                 # (b) bare words len>=3 matched against codegraph module stems
-                stems = set()
-                try:
-                    g = _cg.CodeGraph(str(root))
-                    g.refresh()
-                    for k in (g.modules or {}).keys():
-                        stems.add(k.lower().split('/')[-1].rsplit('.', 1)[0])
-                except Exception:
-                    pass
-                tokens = [w for w in _re.findall(r"\w{3,}", latest_user_text)]
+                # (Phase 4 P4.2 — F08: `_safe_codegraph` binds a clean
+                # None-on-failure value instead of the `'g' in locals()` smell.
+                # F08 fallout: the old code read a non-existent `.modules`
+                # attribute and silently swallowed the AttributeError, so
+                # the stems feature was dead code. `module_paths()` is the
+                # honest API; guarded so a graph hiccup degrades to no
+                # stems, not a lost packet.)
+                cg = _safe_codegraph(root)
+                stems: set[str] = set()
+                if cg is not None:
+                    try:
+                        for k in cg.module_paths():
+                            stems.add(k.lower().split('/')[-1].rsplit('.', 1)[0])
+                    except Exception:
+                        pass
+                tokens = _WORD_RX.findall(latest_user_text)
                 wanted = []
                 for w in tokens[:30]:
                     wl = w.lower()
@@ -556,26 +578,30 @@ class ContextManager:
                         if len(wanted) >= 3:
                             break
                 # (c) exact-symbol find (cap 2)
-                try:
+                if cg is not None:
+                    find_count = 0
                     for w in wanted:
-                        out = g.find(w) if 'g' in locals() else ""
+                        if find_count >= 2:
+                            break
+                        try:
+                            out = cg.find(w)
+                        except Exception:
+                            out = ""
                         if out and out.strip() and not out.strip().startswith("error"):
                             blocks.append(f"### find {w}\n{out[:400]}")
-                            if len([b for b in blocks if b.startswith('### find')]) >= 2:
-                                break
-                except Exception:
-                    pass
+                            find_count += 1
                 # (d) outlines for explicit paths (cap 40 lines each)
-                for p in paths:
-                    try:
-                        out = g.outline(p)
+                if cg is not None:
+                    for p in paths:
+                        try:
+                            out = cg.outline(p)
+                        except Exception:
+                            out = ""
                         if out:
                             lines = out.splitlines()
                             if len(lines) > 40:
                                 lines = lines[:40] + [f"... ({len(lines) - 40} more)"]
                             blocks.append(f"### {p}\n" + "\n".join(lines))
-                    except Exception:
-                        pass
                 # (e) command block: KERN.md + env facts (cap 6)
                 kp_text = ""
                 try:
@@ -621,8 +647,9 @@ class ContextManager:
                 rt[cache_key] = block_text
                 block = block_text
             # insertion: before the LAST view message whose text equals the
-            # source user text (fallback: before the final message). Must be
-            # stable across steps of the turn.
+            # source user text (fallback: before the first user message, or
+            # after the leading system message — never mid-exchange; see
+            # Phase 4 P4.2 / F08). Must be stable across steps of the turn.
             if not view:
                 return view
             inserted = False
@@ -632,7 +659,22 @@ class ContextManager:
                     inserted = True
                     break
             if not inserted:
-                view = view[:-1] + [{'role': 'user', 'text': block}] + view[-1:]
+                # Phase 4 P4.2 — F08: the old fallback
+                # (`view[:-1] + [block] + view[-1:]`) inserted before the
+                # final view message, which can be a tool result — splitting
+                # an assistant tool_call from its tool results breaks
+                # exchange adjacency for strict providers. Insert only
+                # before a user message (a completed boundary), or right
+                # after the leading system message when no user message
+                # exists (never mid-exchange).
+                pos = None
+                for i, m in enumerate(view):
+                    if m.get('role') == 'user':
+                        pos = i
+                        break
+                if pos is None:
+                    pos = 1 if (view and view[0].get('role') == 'system') else 0
+                view = view[:pos] + [{'role': 'user', 'text': block}] + view[pos:]
             return view
         except Exception:
             return view
