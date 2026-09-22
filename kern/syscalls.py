@@ -34,6 +34,27 @@ from .storage import atomic_write, file_lock, path_key
 
 KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))
 
+# P3.4: Compact one-liner descriptions for proven native-tool models.
+# When the profile is "minimal", these replace the full descriptions to
+# save ~2k tokens per turn without losing usability for capable models.
+COMPACT_DESC: dict[str, str] = {
+    "read": "Read a file (numbered lines). full=true for whole file ≤2000 lines; offset/limit for slices.",
+    "write": "Create or fully rewrite a file. Use edit for partial changes.",
+    "edit": "Replace an exact unique string (or checked line range) in a file.",
+    "exec": "Run a shell command. background=true for long-running. Batch with &&.",
+    "proc": "Manage a background process (logs/status/kill).",
+    "fetch": "Fetch a URL, return clean text.",
+    "search": "Web search. Returns title/url/snippet.",
+    "scrape": "Scrape a web page into markdown (multi-stage pipeline).",
+    "memory": "Query/annotate project persistent memory.",
+    "map": "Structural repo index: map/outline/find/callers/deps/dependents.",
+    "py": "Run Python in a persistent interpreter.",
+    "note": "Record conclusions (anchors, root causes, decisions).",
+    "todo": "Set/update the plan (3-8 verifiable items).",
+    "spawn": "Spawn an isolated subagent for parallel work.",
+    "subagent": "Monitor/wait/cancel a background subagent.",
+}
+
 SCHEMAS = [
     {"type": "function", "function": {
         "name": "read",

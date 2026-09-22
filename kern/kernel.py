@@ -48,6 +48,25 @@ CAP_BLOCK = """
 </capability-index>"""
 
 
+# P3.5: Fenced-mode contract summary. Appended to the system prompt when the
+# health probe says native_tools=False. Gives the model a compact reference
+# for the tool-calling protocol without repeating the full block every turn.
+FENCED_CONTRACT = (
+    "\n## Tool Calling Protocol (fenced mode)\n"
+    "\n"
+    "You produce action blocks for the automation runtime.\n"
+    "Each block starts with the literal two-at-sign marker followed by\n"
+    "CALL_TOOL name=TheToolName, then ARG blocks for each argument,\n"
+    "then END_ARG, then END_CALL.\n"
+    "\n"
+    "Hard rules:\n"
+    "- Emit a block ONLY when a tool is needed; otherwise reply plain text.\n"
+    "- Use exact tool and argument names from the schema.\n"
+    "- Provide every required argument.\n"
+    "- Never nest action blocks.\n"
+    "- Values are copied verbatim: preserve whitespace exactly.\n"
+)
+
 def system_prompt(cwd: str, model: str, date: str, git: str, cap_lines: list[str]) -> str:
     """Static kernel first (cache-stable), small volatile suffix last."""
     parts = [KERNEL]

@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from .. import kernel, syscalls, resilience, auth
+from .. import kernel, syscalls, resilience, auth, profiles
 from ..storage import turn_lease
 from ..client import Client, health_of, invalidate_health
 from ..journal import Session, create_session
@@ -514,6 +514,9 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
         todo gets one nudge per turn. Escapes after 2 rejections and never
         blocks read-only tools."""
         try:
+            _prof = profiles.resolve(self.model, health_of(self.model))
+            if not _prof.plan_gate:
+                return None
             if getattr(self, "_plan_first_rejections", 0) >= 2:
                 return None
             if name == "exec" and syscalls.is_safe_readonly(str((args or {}).get("cmd", ""))):
@@ -649,12 +652,18 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
         # prefix. A one-line pointer keeps the cached prefix stable and the prompt lean.
         for name, ref in self.mounts.skills.items():
             sys_text += f"\n<mounted-skill name={name!r} source={ref!r}>instructions in the mount note and at {ref}</mounted-skill>"
+        # P3.5: fenced-mode contract summary — models without native tool
+        # calling get a compact protocol reference in the system prompt.
+        h = health_of(self.model)
+        if h and h.get("ok") and not h.get("native_tools", True):
+            sys_text += "\n" + kernel.FENCED_CONTRACT
         return sys_text + "\nPython interpreter: " + sys.executable
 
     def _tools(self, include_fenced: bool = False) -> list[dict] | None:
         if self.forced_fenced and not include_fenced:
             return None
         h = health_of(self.model)
+        profile = profiles.resolve(self.model, h)
         # If model has been probed and native_tools is explicitly False, use fenced mode
         if h and h.get("ok") and not h.get("native_tools", True) and not include_fenced:
             return None
@@ -671,6 +680,7 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
             getattr(self, "depth", 0),
             getattr(self.mounts, "version", 0),
             bool(getattr(self, "_repeat_seen", False)),
+            profile.name,
         )
         cached = getattr(self, "_tools_cache", None)
         if cached is not None and cached[0] == cache_key and not include_fenced:
@@ -684,7 +694,7 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
         # tool (audit r3-smallmodel #5). Inject it only after a repeat was
         # actually blocked once; the block message itself teaches the field,
         # so the escape hatch is never missing when needed.
-        if getattr(self, "_repeat_seen", False):
+        if getattr(self, "_repeat_seen", False) or profile.repeat_rationale_eager:
             for tool in tools:
                 fn = tool['function']
                 if fn['name'] in ('write', 'edit', 'exec', 'py') or '__' in fn['name']:
@@ -694,10 +704,20 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
         # py REPL is CAPABILITY-GATED: the probe measures whether this model
         # actually uses it correctly; models that never proved it do not even
         # see the schema. KERN_FORCE_PY overrides.
-        if not (h.get("py_repl") or os.environ.get("KERN_FORCE_PY")):
+        if profile.py_gate and not (h.get("py_repl") or os.environ.get("KERN_FORCE_PY")):
             tools = [t for t in tools if t.get("function", {}).get("name") != "py"]
-        if getattr(self, 'depth', 0) >= 2:
+        if profile.spawn_gate and getattr(self, 'depth', 0) >= 2:
             tools = [t for t in tools if t.get("function", {}).get("name") != "spawn"]
+
+        # P3.4: adaptive tool descriptions — minimal-profile models get
+        # compact one-liners instead of the full multi-sentence descriptions,
+        # saving ~2k tokens/turn without losing usability for capable models.
+        if profile.name == "minimal":
+            for t in tools:
+                fn = t.get("function", {})
+                compact = syscalls.COMPACT_DESC.get(fn.get("name", ""))
+                if compact:
+                    fn["description"] = compact
 
         self._tools_cache = (cache_key, tools)
         return tools
