@@ -38,7 +38,9 @@ def test_repo_path_finds_real_repo_and_persists_anchor(tmp_path, monkeypatch):
     monkeypatch.delenv('KERN_REPO', raising=False)
     root = B.repo_path()
     assert root is not None, 'should find the real kern repo from the test checkout'
-    assert (root / 'kern' / 'engine.py').exists()
+    # layout-agnostic: the agent core may be kern/engine.py (legacy) or the
+    # kern/engine/ package (Phase 2) — _is_kern_pkg is the contract repo_path uses.
+    assert B._is_kern_pkg(root / 'kern')
     # anchor is written so a process with ANY cwd can resolve the repo
     assert (tmp_path / 'repo_path').exists()
     assert (tmp_path / 'repo_path').read_text().strip() == str(root)
@@ -68,7 +70,7 @@ def test_stale_anchor_is_dropped_and_rediscovered(tmp_path, monkeypatch):
     (tmp_path / 'repo_path').write_text(str(gone))
     root = B.repo_path()
     assert root != gone
-    assert root is None or (root / 'kern' / 'engine.py').exists()
+    assert root is None or B._is_kern_pkg(root / 'kern')
 
 
 def test_ensure_repo_on_path_pins_front_and_is_idempotent(tmp_path, monkeypatch):
@@ -203,7 +205,9 @@ def test_repo_path_falls_back_to_running_package_git_root(tmp_path, monkeypatch)
     from kern import bootstrap
     root = bootstrap.repo_path(persist=False)
     assert root is not None
-    assert (root / 'kern' / 'engine.py').exists()
+    # layout-agnostic (Phase 2): engine core may be kern/engine.py or the
+    # kern/engine/ package.
+    assert bootstrap._is_kern_pkg(root / 'kern')
 
 
 # ---------------------------------------------------------------------------

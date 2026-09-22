@@ -41,7 +41,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from kern import engine as engine_mod
+from kern.engine import core as engine_mod  # Phase 2: rebinds _SUBAGENT_SEMAPHORE — must hit core, not the shim
 from kern import journal
 from kern.client import StreamEvent
 from kern.engine import Engine

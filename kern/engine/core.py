@@ -21,14 +21,14 @@ import sys
 import time
 from pathlib import Path
 
-from . import kernel, syscalls, resilience, auth
-from .storage import turn_lease
-from .client import Client, health_of, invalidate_health
-from .journal import Session, create_session
-from . import linker
-from .linker import CapabilityIndex, MCPClient, MountTable
-from .debuglog import dbg as _dbg, dbg_exc as _dbg_exc
-from . import constraints
+from .. import kernel, syscalls, resilience, auth
+from ..storage import turn_lease
+from ..client import Client, health_of, invalidate_health
+from ..journal import Session, create_session
+from .. import linker
+from ..linker import CapabilityIndex, MCPClient, MountTable
+from ..debuglog import dbg as _dbg, dbg_exc as _dbg_exc
+from .. import constraints
 
 
 def _parse_xml_invoke(text: str) -> list[dict]:
@@ -439,9 +439,9 @@ class Engine:
         self.mounts = runtime['mounts']
         # FileSlate: session-scoped file-knowledge ledger (see kern/fileslate.py).
         # Survives across turns like the fetch cache; dies with the session.
-        from .fileslate import FileSlate
+        from ..fileslate import FileSlate
         self.fileslate = runtime.setdefault("fileslate", FileSlate(cwd))
-        from .knowledge import KnowledgeLedger
+        from ..knowledge import KnowledgeLedger
         self.knowledge = runtime.setdefault("knowledge", KnowledgeLedger(cwd))
         # No model tier — the operator's direction: every model gets every
 # enhancement; we never say "this model is weak or strong". Tiering is
@@ -618,7 +618,7 @@ class Engine:
         todo items share any vocabulary. Returns the BEST overlap across
         open items, or 0 if none."""
         try:
-            from .recall import tokenize
+            from ..recall import tokenize
             call_tokens = set(tokenize(str(args))[:40])
             best = 0
             for it in self.todo:
@@ -905,7 +905,7 @@ class Engine:
         return f"{name}({json.dumps(args, ensure_ascii=False)[:200]})"
 
     def _prior_execution(self, name: str, args: dict) -> str | None:
-        from .context import receipts
+        from ..context import receipts
         for row in reversed(receipts(self.session.events)):
             previous = {k:v for k,v in row['arguments'].items() if k != '_kern_repeat_reason'}
             if row['name'] == name and previous == args and row['status'] not in ('not_started','denied'):
@@ -938,7 +938,7 @@ class Engine:
             self._last_inspection_target = _inspection_target(name, args)
 
     def _repeat_guard(self, name, args, reason):
-        from .context import receipts
+        from ..context import receipts
         if name not in ('write', 'edit', 'exec', 'py') and '__' not in name:
             return None
         if name == 'exec' and syscalls.is_safe_readonly(str(args.get('cmd', ''))):
@@ -1558,11 +1558,11 @@ class Engine:
         return max(0, getattr(self.client, "requests", 0) - getattr(self, "_req0", 0))
 
     def _build_facts(self, events):
-        from .context import evidence_block
+        from ..context import evidence_block
         return evidence_block(events, self.session)
 
     async def _review_completion(self, final_text):
-        from .context import receipts, evidence_block, estimate
+        from ..context import receipts, evidence_block, estimate
         # Opt-out for users who find the review noisy. Default ON: the review is a
         # safety feature — it drives missing verification (e.g. "said it wrote the
         # file but never read it back") even on write/edit turns. See test_core
@@ -1606,7 +1606,7 @@ class Engine:
         # discovery round-trip.
         kgc = list(self._env_atoms or []) if isinstance(getattr(self, "_env_atoms", None), list) else []
         try:
-            from .kernfile import detect_test_command
+            from ..kernfile import detect_test_command
             from pathlib import Path as _P
             kgc.append(detect_test_command(_P(self.cwd)))
         except Exception:
@@ -1633,7 +1633,7 @@ class Engine:
                 if chunk.kind=='text':
                     answer += chunk.text
                 elif chunk.kind=='error':
-                    from .resilience import sanitize_error
+                    from ..resilience import sanitize_error
                     raise RuntimeError(sanitize_error(chunk.error))
                 elif chunk.kind=='usage':
                     self.usage_in += chunk.usage.get('prompt_tokens',chunk.usage.get('input_tokens',0))
@@ -1673,7 +1673,7 @@ class Engine:
                 system += ("\n\nTo act, emit a fenced block exactly like:\n"
                            "```tool\n{\"name\": \"exec\", \"arguments\": {\"cmd\": \"pwd\"}}\n```"
                            "\nAvailable tool contracts:\n" + json.dumps(self._tools(include_fenced=True),ensure_ascii=False))
-            from .context import ContextManager
+            from ..context import ContextManager
             view = await ContextManager(self).prepare(system, tools)
 
             text_parts: list[str] = []
@@ -1715,7 +1715,7 @@ class Engine:
                     elif ev.kind == "error":
                         error = ev.error
                         if error:
-                            from .resilience import sanitize_error
+                            from ..resilience import sanitize_error
                             error = sanitize_error(error)
                         # never silent: a stream error in a MIXED turn (text and/or
                         # valid calls present) must still be journaled and shown.
@@ -2145,7 +2145,7 @@ class Engine:
                                 # later and force a re-read). Only the outline is
                                 # refreshed so <file-state> stays structural.
                                 try:
-                                    from .fileslate import quick_outline
+                                    from ..fileslate import quick_outline
                                     self.fileslate.set_outline(
                                         str(_mut_path),
                                         quick_outline(str(self.fs.resolve(str(_mut_path)))))
@@ -2517,7 +2517,7 @@ class Engine:
                         # Build a view the normal way (system + prepared context), but with
                         # tools=None so the model can only answer in text, and append the
                         # directive as the final user message so it is the last thing seen.
-                        from .context import ContextManager
+                        from ..context import ContextManager
                         sys_text = self._system()
                         view = await ContextManager(self).prepare(sys_text, None)
                         view = list(view) + [{"role": "user", "content": directive}]

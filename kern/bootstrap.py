@@ -58,7 +58,13 @@ def anchor_file() -> Path:
 
 
 def _is_kern_pkg(d: Path) -> bool:
-    return (d / "__init__.py").exists() and (d / "engine.py").exists()
+    """A directory is a kern package if it has ``__init__.py`` plus the
+    agent core — either the legacy single module (``engine.py``) or the
+    Phase-2 package form (``engine/core.py``). Accepting both keeps old
+    snapshot installs and new checkouts equally detectable."""
+    if not (d / "__init__.py").exists():
+        return False
+    return (d / "engine.py").exists() or (d / "engine" / "core.py").exists()
 
 
 def _git_toplevel(start: Path) -> Path | None:
