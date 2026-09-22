@@ -14,7 +14,7 @@ step (per directive §1.5).
 | §1    | Mission externalization                            | done        | File + memory + KERN.md pointer + todo; committed dd2db05; suite 631/631 green |
 | 0     | Baseline & loop autopsy                            | done        | LOOP_AUTOPSY.md; tests/test_phase0_loop_autopsy.py committed RED (3 fail on axis B; 631 pre-existing pass); commit `31ec3ab` |
 | 1     | Kill the loop (highest impact)                     | done        | P1.1 facade `kern/plane.py` + 9 tests (commit `251c801`); P1.2 quiet results stripping F03 advice from 7 injection sites (commit `2913ca3`); P1.3 state machine `kern/progress.py` + 15 tests (commit `9feb9ed`); P1.4 regression test GREEN; suite 658 passed |
-| 2     | Engine decomposition (mechanical)                  | in-progress | Step 1 DONE (`727ef9c`): kern/engine/ package + shim, recursive walkers prerequisite (`bf19ab0`), both recorded traps fixed. Step 2 DONE (`adcae3b`): mounts.py MountsMixin verbatim. Steps 3-6 remain: subagents.py, review.py (+F14), pipeline.py (wire plane+progress), loop.py |
+Phase 2: in-progress (steps 1-5 + HTML-error fix done, 685 green; pipeline.py + report remaining)
 | 3     | Capability-measured adaptation                     | not-started |       |
 | 4     | Context engine v2                                   | done        | P4.1 F01 FIXED (`5696fa8`); P4.2 F08 DONE (`52ab614`); P4.3 F07 BM25 episodes (`49f6727`); P4.4 KERN.md double-embed dedup (`0432148`, 4 tests); P4.5 verified as F01 side-effect. Suite 679 |
 | 5     | Orchestration & throughput                         | not-started |       |
@@ -228,6 +228,17 @@ F01 bug was duplication; absence after dedup is legitimate). 4 tests in
 Suite after P4.1 + P4.2: **667 passed** (631 baseline + 3 P0 + 15 P1.3 +
 9 P1.1 + 4 F01 + 5 F08).
 
+
+### Phase 2 (in progress) — Engine decomposition — 2026-09-22
+
+Steps 1-5 done, each a verbatim move with the suite green after it:
+- step 1 (727ef9c): kern/engine.py -> kern/engine/ package + shim re-exports.
+- step 2 (adcae3b): mounts.py (MountsMixin).
+- step 3 (615a43e): subagents.py (SubagentsMixin; _looks_like_error/_salvage_text moved with their only consumers, re-exported from core for the shim).
+- step 4 (e1b1ec0): review.py (ReviewMixin: _build_facts/_review_completion).
+- step 5 (94db399): loop.py (LoopMixin: _loop, ~899 lines). core.py 1825 -> 939 lines; every kern/engine module now under the ~1500-line target.
+- HTML-as-API-error fix (operator provider encodes API errors as HTML pages): 347419a — non-200 HTTP errors carry `stage=api http status=N`; classify_error lets an explicit status beat stage= markers (4xx content/fatal, 5xx server, 429 rate_limit); _sanitize_error_body keeps HTML collapsed but preserves a bounded gist and drops the false "not an API error / not billed" claims. 53c06bc — status-200 or mislabeled-content-type HTML bodies caught by a content-type guard plus a bounded raw-head tee (_capture_raw) so the incomplete-stream guard can prove HTML vs truncated SSE; one `stage=api` error event with the page gist, never raw markup, never transport noise; resilience maps status<400 + stage=api to server (free retry). Tests: tests/test_client_html_stream.py (3 new) + classify_error assertions in test_resilience/test_audit_fixes. Suite: 685 passed (receipt: pytest tests/ exit=0, commit 53c06bc).
+Remaining: pipeline.py middleware chain (dedup -> plane -> repeat-guard -> gates -> approve -> execute -> post-process) with per-stage ordering tests; then the final Phase 2 completion report.
 
 ## Open Questions / Blocked Items
 
