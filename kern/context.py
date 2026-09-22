@@ -524,7 +524,18 @@ class ContextManager:
                         break
             if src_n is None:
                 return view
-            cache_key = ('mission_packet', src_n)
+            # Phase 4 P4.4 (F08 fallout / objective-dedup audit): on turn 1
+            # the system message already carries the full KERN.md via
+            # `_with_repo_context`'s <project-instructions>; the mission
+            # packet must not duplicate it. The packet cache is keyed on
+            # that presence so the turn-1 variant (without KERN.md) and the
+            # later-turn variant (with KERN.md, since repo-context is
+            # turn-1-only) never poison each other.
+            repo_ctx_present = any(
+                '<project-instructions source="KERN.md">' in str(m.get('text', ''))
+                for m in view
+            )
+            cache_key = ('mission_packet', src_n, repo_ctx_present)
             cached = rt.get(cache_key)
             # Always extract the source user text first (used for stable
             # insertion position even on cache hits).
@@ -630,7 +641,9 @@ class ContextManager:
                     pass
                 # assemble
                 parts: list[str] = []
-                if kp_text:
+                # P4.4: skip KERN.md when the system message already carries
+                # it via <project-instructions> (turn-1 repo context).
+                if kp_text and not repo_ctx_present:
                     parts.append("### KERN.md\n" + kp_text[:2000])
                 if env_lines:
                     parts.append("### env facts\n" + "\n".join(f"- {l}" for l in env_lines))

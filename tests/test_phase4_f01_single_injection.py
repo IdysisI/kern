@@ -43,13 +43,18 @@ def _count_blocks(view, marker: str) -> int:
     return sum(1 for m in view if marker in str(m.get("text", "")))
 
 
-def test_mission_packet_appears_exactly_once(engine_in_repo):
+def test_mission_packet_appears_at_most_once(engine_in_repo):
     cm = ContextManager(engine=engine_in_repo)
     view = asyncio.run(cm.prepare(system="You are a helpful assistant.", tools=[]))
     n = _count_blocks(view, "<mission-context>")
-    assert n == 1, (
+    # F01 bug was DUPLICATION (2 blocks per prepare()). After the P4.4
+    # dedup, the packet may also be legitimately ABSENT on turn 1 when
+    # its only content was the KERN.md copy the system message already
+    # carries (parts empty → existing guard returns the view unchanged).
+    # The contract is: never more than one.
+    assert n <= 1, (
         f"F01: <mission-context> appears {n} times in the view; the "
-        f"directive says exactly once. Got view blocks:\n"
+        f"directive says at most once. Got view blocks:\n"
         + "\n---\n".join(str(m.get("text", ""))[:200] for m in view)
     )
 
@@ -75,22 +80,22 @@ def test_recall_appears_at_most_once(engine_in_repo):
     )
 
 
-def test_objective_in_mission_context_appears_exactly_once(engine_in_repo):
-    """F01 scope: the objective text is embedded inside the
-    `<mission-context>` block (the KERN.md portion references it). After
-    the F01 fix, that block appears exactly once, so the objective must
-    appear at most once inside it."""
+def test_objective_in_mission_context_appears_at_most_once(engine_in_repo):
+    """F01 scope: when the `<mission-context>` block is present, the
+    objective text must appear at most once inside it. After the P4.4
+    dedup the block may be absent on turn 1 (its only content was the
+    KERN.md copy the system message already carries) — absence is fine,
+    duplication is not."""
     cm = ContextManager(engine=engine_in_repo)
     view = asyncio.run(cm.prepare(system="You are a helpful assistant.", tools=[]))
     mission_messages = [m for m in view if "<mission-context>" in str(m.get("text", ""))]
-    assert len(mission_messages) == 1
-    # the embedded KERN.md reference must not contain the objective text
-    # twice inside the same mission packet.
-    text = str(mission_messages[0].get("text", ""))
-    assert text.count("Fix the audit hook bug.") <= 1, (
-        "F01 fix should prevent the mission packet from duplicating its "
-        "embedded KERN.md / objective text."
-    )
+    assert len(mission_messages) <= 1
+    for mm in mission_messages:
+        text = str(mm.get("text", ""))
+        assert text.count("Fix the audit hook bug.") <= 1, (
+            "F01 fix should prevent the mission packet from duplicating its "
+            "embedded KERN.md / objective text."
+        )
     # NOTE: the broader P4.4 objective-dedup contract (objective text
     # once in dialogue + once as a capped pointer in <work-state>) is
-    # tracked separately in Phase 4 P4.4.
+    # covered by tests/test_phase4_p44_dedup.py.
