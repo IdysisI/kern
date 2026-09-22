@@ -231,4 +231,55 @@ Suite after P4.1 + P4.2: **667 passed** (631 baseline + 3 P0 + 15 P1.3 +
 
 ## Open Questions / Blocked Items
 
-- None pending beyond the deferred P4.3/P4.4 items listed in the Phase 4 report.
+- None pending beyond the deferred items below.
+
+### Phase 2 preparation — risk assessment (done 2026-09-22, not yet executed)
+
+The package conversion `kern/engine.py` → `kern/engine/` was assessed and
+deferred to a fresh session (this session completed Phases 0/1/4). Findings
+so the next session doesn't re-derive them:
+
+**Import surface (all must keep working via `kern/engine/__init__.py`
+re-exports):**
+- `from kern.engine import Engine` — `__main__.py`, `daemon.py`, `gui.py`,
+  `serve.py`, `tui.py`, many tests.
+- `from .engine import _is_continuation_prompt` — `kern/context.py:506`.
+- Underscore names accessed via the module namespace: `_step_is_progress`
+  (test_breaker), `_inspection_target` (test_inspection_target,
+  test_repeat_key), `_salvage_text` (test_salvage_caps),
+  `_DELEGATE_SPAWN_LIMIT` (test_subagent_fixes).
+
+**THE ONE REAL TRAP:** `tests/test_subagent_lifecycle.py:111,124` REBINDS
+the module global: `engine_mod._SUBAGENT_SEMAPHORE = None` and expects
+`_get_subagent_semaphore()` (which does `global _SUBAGENT_SEMAPHORE`) to
+see it. A `from .core import _SUBAGENT_SEMAPHORE` shim copies the VALUE —
+rebinding the package attribute would not affect core's internal global.
+Fix when converting: point that test at `kern.engine.core` (the directive
+anticipates test import fixes), or keep the semaphore accessor reading
+through a mutable holder.
+
+**Safe patterns verified:** `monkeypatch.setattr(eng.Engine, "chat", ...)`
+(test_salvage_caps:107, test_subagent_reliability:66) patches the CLASS
+object — works through any re-export (same object identity). All other
+`eng_mod.X` / `engine_mod.X` uses are attribute READS, not rebindings.
+
+**Recommended conversion order (suite green after each):**
+1. `git mv kern/engine.py kern/engine/core.py`; write `__init__.py`
+   re-exporting `Engine` + the underscore names above; fix the
+   `_SUBAGENT_SEMAPHORE` test; run suite.
+2. Extract `mounts.py` (MountTable usage + `_tool_mount` family) — smallest
+   cohesive piece.
+3. Extract `subagents.py` (`_tool_spawn`/`_tool_subagent`/`_setup_worktree`
+   /semaphore) — needs the `_SUBAGENT_SEMAPHORE` holder decision.
+4. Extract `review.py` (`_review_completion` + verify-receipt regexes —
+   also lands F14 shared-helper).
+5. Extract `pipeline.py` — the ordered middleware chain (dedup → plane →
+   repeat-guard → gates → approve → execute → post-process) as classes
+   with `handle(call) -> Intercepted | None`; this is where `kern/plane.py`
+   (P1.1) and `kern/progress.py` (P1.3) get wired in, replacing the three
+   inline interception sites and the six scattered counters.
+6. Extract `loop.py` (stream/parse/emit) last — it orchestrates everything.
+
+**Do NOT** do the skeleton-only conversion (package + shim, no split): it
+adds a layer without removing one — contrary to the prime directive — so
+step 1 should land together with at least step 2.
