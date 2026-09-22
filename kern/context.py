@@ -357,7 +357,15 @@ class ContextManager:
                                + aborted +
                                ' Use memory history/artifact slices or configure the verified model context window.')
         e.output_budget = min(default_max_output_tokens(e.model), max(256, window-size-1024))
-        return self._with_recall(self._with_mission_packet(self._with_repo_context(view, e), e, available), e)
+        # Phase 4 P4.1 — fix F01. The main flow above (and the fold-loop
+        # body) already applied the three injectors; re-applying them on
+        # the return line inserted `<mission-context>` twice every turn
+        # (and the user objective text twice). `_with_recall` happens to
+        # self-dedupe via its O1 anti-circularity filter, but the other
+        # two do not. The fix is to return the view as built. The fold
+        # loop already re-injects post-compact when reapplication is
+        # needed; this return path takes the view as-is.
+        return view
 
     # ---- Repo orientation: compact code map + KERN.md, first turn only ------
     def _with_repo_context(self, view, e):
