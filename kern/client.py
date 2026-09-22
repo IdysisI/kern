@@ -108,6 +108,86 @@ HEALTH_PATH = os.path.join(KERN_HOME, "health-" + hashlib.sha256(BASE_URL.rstrip
 # every turn silently dumb — each of those turns is a paid request wasted).
 HEALTH_TTL = float(os.environ.get("KERN_HEALTH_TTL", str(7 * 24 * 3600)))
 
+# ---- calibration (overhaul P3.1): measured bytes-per-prompt-token ----------
+# Every usage event pairs the size of the prompt payload we actually sent with
+# the provider-reported prompt_tokens. The running median per model replaces
+# the guesswork ÷3 (context.estimate) vs ÷4 (pager.budget) split with ONE
+# estimator (estimate_tokens). Samples live inside health.json under
+# "calibration"; every path is fail-open (an unreadable file just means the
+# conservative fallback).
+_CAL_SAMPLES = 24        # per-model ratio window (running median)
+_CAL_MIN_SAMPLES = 3     # below this many samples: not calibrated yet
+
+
+def _cal_load() -> dict:
+    try:
+        with open(HEALTH_PATH, encoding="utf-8") as f:
+            cal = json.load(f).get("calibration")
+        return cal if isinstance(cal, dict) else {}
+    except Exception:
+        return {}
+
+
+def _cal_save(cal: dict) -> None:
+    try:
+        try:
+            with open(HEALTH_PATH, encoding="utf-8") as f:
+                doc = json.load(f)
+        except Exception:
+            doc = {}
+        doc["calibration"] = cal
+        atomic_write(HEALTH_PATH, json.dumps(doc, indent=1))
+    except Exception:
+        pass
+
+
+def record_calibration(model: str, prompt_bytes: int, prompt_tokens: int) -> None:
+    """One observed bytes/token sample from a real usage event."""
+    if not model or prompt_tokens <= 0 or prompt_bytes <= 0:
+        return
+    ratio = prompt_bytes / prompt_tokens
+    if not 0.5 <= ratio <= 16.0:      # garbage-in guard (malformed usage shape)
+        return
+    cal = _cal_load()
+    samples = cal.get(model)
+    if not isinstance(samples, list):
+        samples = []
+    samples.append(round(ratio, 3))
+    cal[model] = samples[-_CAL_SAMPLES:]
+    _cal_save(cal)
+
+
+def _median(xs: list[float]):
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return None
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def calibrated_bytes_per_token(model: str | None = None):
+    """Running median bytes/token for ``model``; pooled median across models
+    when that model has too few samples; None when nothing is calibrated."""
+    cal = _cal_load()
+    own = cal.get(model) if model else None
+    if isinstance(own, list) and len(own) >= _CAL_MIN_SAMPLES:
+        return _median([x for x in own if isinstance(x, (int, float))])
+    pooled = [x for v in cal.values() if isinstance(v, list)
+              for x in v if isinstance(x, (int, float))]
+    if len(pooled) >= _CAL_MIN_SAMPLES:
+        return _median(pooled)
+    return None
+
+
+def estimate_tokens(raw_bytes: int, model: str | None = None) -> int:
+    """THE token estimator (P3.1): calibrated bytes/token when measured, else
+    the historic conservative ÷3. context.estimate() and pager.budget() both
+    call this, so /context, the TUI meter and compaction share one number."""
+    ratio = calibrated_bytes_per_token(model)
+    if ratio:
+        return int(round(raw_bytes / ratio))
+    return (raw_bytes + 2) // 3
+
 # ---------------------------------------------------------------- events ---
 
 @dataclass
@@ -398,6 +478,16 @@ class Client:
                         except json.JSONDecodeError:
                             continue
                         if chunk.get("usage"):
+                            _pt = int(chunk["usage"].get("prompt_tokens") or 0)
+                            if _pt > 0:
+                                # P3.1 calibration: size of the prompt payload we
+                                # actually sent vs provider-reported prompt tokens.
+                                record_calibration(
+                                    model,
+                                    len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+                                    + len(str(system).encode("utf-8"))
+                                    + len(json.dumps(tools or [], ensure_ascii=False).encode("utf-8")),
+                                    _pt)
                             yield StreamEvent("usage", usage=chunk["usage"])
                         for choice in chunk.get("choices", []):
                             if choice.get('index', 0) != 0:
@@ -520,6 +610,15 @@ class Client:
                         elif et == "error":
                             yield StreamEvent("error", error=json.dumps(ev.get("error", {}))[:400])
             if usage:
+                _pt = int(usage.get('input_tokens') or 0)
+                if _pt > 0:
+                    # P3.1 calibration: prompt payload bytes vs input_tokens.
+                    record_calibration(
+                        model,
+                        len(json.dumps(messages, ensure_ascii=False).encode('utf-8'))
+                        + len(str(system).encode('utf-8'))
+                        + len(json.dumps(tools or [], ensure_ascii=False).encode('utf-8')),
+                        _pt)
                 yield StreamEvent('usage', usage=usage)
             if not finished or pending:
                 _head = "\n".join(raw_head)[:512].lower()

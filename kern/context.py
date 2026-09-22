@@ -283,7 +283,10 @@ def estimate(messages, system='', tools=None):
     raw = json.dumps(text_payload(messages), ensure_ascii=False) + system + json.dumps(tools or [], ensure_ascii=False)
     # Base64 is transport encoding, not text tokens. Providers resize/tokenize
     # images differently; reserve a configurable allowance, clearly estimated.
-    return (len(raw.encode('utf-8')) + 2) // 3 + image_count * int(os.environ.get('KERN_IMAGE_TOKEN_ESTIMATE','8192'))
+    # P3.1: ONE calibrated estimator (measured bytes/token from usage events,
+    # fallback ÷3) — lazy import keeps client free of a context dependency.
+    from .client import estimate_tokens as _estimate_tokens
+    return _estimate_tokens(len(raw.encode('utf-8'))) + image_count * int(os.environ.get('KERN_IMAGE_TOKEN_ESTIMATE','8192'))
 
 
 class ContextManager:

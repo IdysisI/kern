@@ -449,7 +449,9 @@ def budget(events: list[dict], session) -> dict:
             out["user_bytes"] += size
         elif m["role"] == "tool":
             out["tool_bytes"] += size
-    out["approx_tokens"] = (out["assistant_bytes"] + out["user_bytes"] + out["tool_bytes"]) // 4
+    # P3.1: same calibrated estimator as context.estimate — kills the ÷3 vs ÷4 split.
+    from .client import estimate_tokens as _estimate_tokens
+    out["approx_tokens"] = _estimate_tokens(out["assistant_bytes"] + out["user_bytes"] + out["tool_bytes"])
     out["scope"] = "projected messages only; full system/tools budget is enforced by ContextManager"
     # WP7: aggregate hygiene counters across all turn_end events. Sums per
     # key — multiple turns in the journal sum naturally.
