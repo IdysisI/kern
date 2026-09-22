@@ -298,6 +298,96 @@ def protocol_for(model: str) -> str:
     return "openai"
 
 
+# ---- tool-argument repair (overhaul P3.3) -----------------------------------
+# Small models emit near-JSON: smart quotes, trailing commas, raw newlines
+# inside strings, Python literals. ONE deterministic, string-state-aware pass
+# rescues those; everything else fails with a schema-informed error instead.
+_SMART_QUOTES = str.maketrans({"“": '"', "”": '"', "‘": "'", "’": "'"})
+_PY_LITERAL = {"None": "null", "True": "true", "False": "false"}
+
+
+def repair_tool_args(raw: str) -> str | None:
+    """Return a repaired copy of ``raw``, or None when no repair applies.
+
+    Single left-to-right pass: smart quotes become straight quotes first
+    (translate), then inside strings raw newlines/tabs/CR become \\n \\t \\r
+    escapes, and outside strings Python literals become JSON literals and a
+    comma whose next non-space char is } or ] is dropped (trailing comma).
+    Values, key order and nesting are otherwise verbatim; keys are NEVER
+    invented — the caller re-parses and validates against the tool schema.
+    """
+    fixed = raw.translate(_SMART_QUOTES)
+    changed = fixed != raw
+    out: list[str] = []
+    in_str = False
+    i, n = 0, len(fixed)
+    while i < n:
+        ch = fixed[i]
+        if in_str:
+            if ch == "\\" and i + 1 < n:
+                out.append(fixed[i:i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            elif ch == "\n":
+                out.append("\\n"); changed = True; i += 1; continue
+            elif ch == "\t":
+                out.append("\\t"); changed = True; i += 1; continue
+            elif ch == "\r":
+                out.append("\\r"); changed = True; i += 1; continue
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == ",":
+            j = i + 1
+            while j < n and fixed[j] in " \t\r\n":
+                j += 1
+            if j < n and fixed[j] in "}]":
+                changed = True
+                i += 1
+                continue
+        elif ch.isalpha() or ch == "_":
+            j = i
+            while j < n and (fixed[j].isalnum() or fixed[j] == "_"):
+                j += 1
+            word = fixed[i:j]
+            if word in _PY_LITERAL:
+                changed = True
+                out.append(_PY_LITERAL[word])
+                i = j
+                continue
+            out.append(word)
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out) if changed else None
+
+
+def _arg_schema_hint(name: str) -> str:
+    """Schema-informed help for a failed arg parse (P3.3): parameter types,
+    required list, and a corrected-shape EXAMPLE built from placeholders only
+    (missing required args are never fabricated). Degrades gracefully when the
+    tool has no known schema."""
+    try:
+        from . import syscalls
+        sch = next((s for s in syscalls.SCHEMAS if s.get("name") == name), None)
+    except Exception:
+        sch = None
+    if not isinstance(sch, dict):
+        return "schema: unknown tool; arguments must be a single JSON object."
+    params = sch.get("parameters") if isinstance(sch.get("parameters"), dict) else sch
+    props = params.get("properties") or {}
+    required = [r for r in (params.get("required") or []) if isinstance(r, str)]
+    types = ", ".join(f"{k}: {v.get('type', 'any')}" for k, v in props.items()) or "no parameters"
+    example = ", ".join(f'"{k}": "<{props.get(k, {}).get("type", 'any')}>"' for k in required)
+    return (f"schema: {name}({types}); required=[{', '.join(required) or 'none'}]. "
+            f"corrected shape example: {{{example}}}")
+
+
 class Client:
     def __init__(self, base_url: str = BASE_URL, timeout: float = 600.0):
         self.base_url = base_url.rstrip("/").removesuffix('/v1')
@@ -401,24 +491,44 @@ class Client:
     @staticmethod
     def _finalize_pending(pending: dict[int, dict]):
         """Yield events for streamed tool calls whose JSON arguments were
-        assembled across chunks. A call whose arguments do not parse is NEVER
-        dropped silently: it is yielded with `kern_error` so the engine can
-        answer it with a proper tool_result (valid protocol path) and the model
-        can re-issue the call. A classified diagnostic error is also yielded.
-        No arbitrary repair is attempted."""
+        assembled across chunks. A call whose arguments do not parse gets ONE
+        deterministic repair attempt (P3.3: repair_tool_args); a repaired call
+        proceeds like a clean one, flagged args_repaired. If it still does not
+        parse the call is NEVER dropped silently: it is yielded with
+        `kern_error` carrying the exact parse position, a raw snippet around
+        it, and the tool's schema + a corrected-shape example (placeholders
+        only — missing required args are never fabricated), so the engine can
+        answer it with a proper tool_result and the model can re-issue."""
         for slot in pending.values():
             raw = slot["args"] or "{}"
             cid = slot["id"] or "call_0"
             name = slot["name"] or "?"
+            args, err, repaired = None, None, False
             try:
                 args = json.loads(raw)
+            except (json.JSONDecodeError, ValueError) as e:
+                err = e
+                fixed = repair_tool_args(raw)
+                if fixed is not None:
+                    try:
+                        args = json.loads(fixed)
+                        repaired, err = True, None
+                    except (json.JSONDecodeError, ValueError):
+                        pass        # one attempt max; fall through to error
+            try:
+                if args is None:
+                    raise err or ValueError("unparseable tool arguments")
                 if not isinstance(args, dict):
                     raise ValueError(f"arguments must be a JSON object, got {type(args).__name__}")
                 tc_data = {"id": cid, "name": slot["name"], "arguments": args}
+                if repaired:
+                    tc_data["args_repaired"] = True
                 if slot.get("extra_content"):
                     tc_data["extra_content"] = slot["extra_content"]
                 yield StreamEvent("tool_call", tool_call=tc_data)
             except (json.JSONDecodeError, ValueError) as e:
+                pos = getattr(e, "pos", None)
+                near = raw[max(0, (pos or 0) - 40):(pos or 0) + 40]
                 yield StreamEvent(
                     "error",
                     error=f"[tool={name} id={cid}] stage=arg-parse invalid-json: {e} "
@@ -426,7 +536,9 @@ class Client:
                 tc_data = {
                     "id": cid, "name": slot["name"], "arguments": {},
                     "kern_error": (f"error: malformed tool arguments (stage=arg-parse, "
-                                   f"tool={name}): {e}. No repair attempted. "
+                                   f"tool={name}): {e} at pos={pos} near {near!r}. "
+                                   f"One deterministic repair attempt was made and "
+                                   f"did not parse. {_arg_schema_hint(name)} "
                                    f"Re-issue the tool call with valid JSON arguments.")}
                 if slot.get("extra_content"):
                     tc_data["extra_content"] = slot["extra_content"]
