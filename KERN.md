@@ -37,3 +37,12 @@ Hygiene counters exposed in `kern/measure.HYGIENE_KEYS`:
 All ledger calls are exception-safe and fail open. The control plane never
 adds an LLM request.
 
+## Self-Overhaul — in progress
+
+- **ONGOING: self-overhaul — see `OVERHAUL_PLAN.md` before any other work.**
+  Phased mission to kill the loop, decompose the engine, and adapt the
+  harness to measured capability. Resume rule: read `OVERHAUL_PLAN.md`,
+  mark what's done, continue at the first non-done phase. Do not refactor
+  on red; do not add inline special cases; prime directive is fewer
+  moving parts, not more.
+
