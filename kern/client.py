@@ -159,6 +159,20 @@ def invalidate_health(model: str, reason: str = "") -> None:
 
 # ---------------------------------------------------------------- client ---
 
+async def _capture_raw(aiter, sink: list, cap: int = 4096):
+    """Tee the first bytes of a streamed response into ``sink`` (bounded) so the
+    incomplete-stream guard can tell an HTML error page (a provider API error
+    under a wrong/missing content-type) from a genuinely truncated SSE stream.
+    An HTML body is an API-layer error (operator provider report), never a
+    transport fault — but only the raw bytes can prove that."""
+    used = 0
+    async for line in aiter:
+        if used < cap:
+            sink.append(line)
+            used += len(line) + 1
+        yield line
+
+
 async def _lines_with_stall(r, model: str):
     """Yield SSE lines; raise StallError if the upstream goes silent."""
     ait = r.aiter_lines()
@@ -356,13 +370,23 @@ class Client:
             async with httpx.AsyncClient(**_client_kwargs(self.base_url, self.timeout)) as c:
                 async with c.stream("POST", f"{self.base_url}/v1/chat/completions",
                                     headers=headers, json=body) as r:
+                    _ct = r.headers.get("content-type", "")
+                    if r.status_code == 200 and "text/html" in _ct:
+                        # Status 200 carrying an HTML error page: the provider's
+                        # API-error FORMAT (operator report), not a stream. One
+                        # stage=api error with the page's gist; never SSE-parse it.
+                        _page = await r.aread()
+                        yield StreamEvent("error", error="stage=api http status=200: %s"
+                                          % _sanitize_error_body(_page))
+                        return
                     if r.status_code != 200:
                         # An HTTP response means transport SUCCEEDED: the error is
                         # API-layer (status is authoritative), not a connection fault.
                         yield StreamEvent("error", error="stage=api http status=%d: %s"
                                           % (r.status_code, _sanitize_error_body(await r.aread())))
                         return
-                    async for line in _lines_with_stall(r, model):
+                    raw_head: list[str] = []
+                    async for line in _capture_raw(_lines_with_stall(r, model), raw_head):
                         if not line.startswith("data:"):
                             continue
                         payload = line[5:].strip()
@@ -400,7 +424,14 @@ class Client:
                                 if fn.get("arguments"):
                                     slot["args"] += fn["arguments"]
             if not finished:
-                yield StreamEvent('error', error='stage=transport incomplete stream: no finish marker; no pending tools executed')
+                _head = "\n".join(raw_head)[:512].lower()
+                if "<!doctype html" in _head or "<html" in _head:
+                    # HTML body under a mislabeled content-type: API-layer error,
+                    # not a truncated stream (transport would retry a rejected req).
+                    yield StreamEvent("error", error="stage=api http status=%d: %s"
+                                      % (r.status_code, _sanitize_error_body("\n".join(raw_head).encode())))
+                else:
+                    yield StreamEvent('error', error='stage=transport incomplete stream: no finish marker; no pending tools executed')
             else:
                 for ev in Client._finalize_pending(pending):
                     yield ev
@@ -434,13 +465,23 @@ class Client:
             async with httpx.AsyncClient(**_client_kwargs(self.base_url, self.timeout)) as c:
                 async with c.stream("POST", f"{self.base_url}/v1/messages",
                                     headers=headers, json=body) as r:
+                    _ct = r.headers.get("content-type", "")
+                    if r.status_code == 200 and "text/html" in _ct:
+                        # Status 200 carrying an HTML error page: the provider's
+                        # API-error FORMAT (operator report), not a stream. One
+                        # stage=api error with the page's gist; never SSE-parse it.
+                        _page = await r.aread()
+                        yield StreamEvent("error", error="stage=api http status=200: %s"
+                                          % _sanitize_error_body(_page))
+                        return
                     if r.status_code != 200:
                         # An HTTP response means transport SUCCEEDED: the error is
                         # API-layer (status is authoritative), not a connection fault.
                         yield StreamEvent("error", error="stage=api http status=%d: %s"
                                           % (r.status_code, _sanitize_error_body(await r.aread())))
                         return
-                    async for line in _lines_with_stall(r, model):
+                    raw_head: list[str] = []
+                    async for line in _capture_raw(_lines_with_stall(r, model), raw_head):
                         if not line.startswith("data:"):
                             continue
                         try:
@@ -481,7 +522,14 @@ class Client:
             if usage:
                 yield StreamEvent('usage', usage=usage)
             if not finished or pending:
-                yield StreamEvent('error', error='stage=transport incomplete message; no pending tools executed')
+                _head = "\n".join(raw_head)[:512].lower()
+                if "<!doctype html" in _head or "<html" in _head:
+                    # HTML body under a mislabeled content-type: API-layer error,
+                    # not a truncated stream (transport would retry a rejected req).
+                    yield StreamEvent("error", error="stage=api http status=%d: %s"
+                                      % (r.status_code, _sanitize_error_body("\n".join(raw_head).encode())))
+                else:
+                    yield StreamEvent('error', error='stage=transport incomplete message; no pending tools executed')
             else:
                 for item in Client._finalize_pending(completed):
                     yield item

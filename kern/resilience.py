@@ -52,6 +52,10 @@ def classify_error(error: str) -> str:
         # the body is an HTML page or the string carries a stage= marker. Fatal
         # by design: retrying a rejected request only burns money.
         return _CONTENT
+    if status is not None and status < 400 and "stage=api" in e:
+        # Success-status carrying an API-layer error (provider HTML error page
+        # under status 200): gateway/provider fault — free retry like 5xx.
+        return _SERVER
     if "proxy_error" in e or '"code": "5' in e:
         return _SERVER
     # transport: connection-level, before/independent of an HTTP status

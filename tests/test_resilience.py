@@ -35,6 +35,8 @@ class TestClassify(unittest.TestCase):
         # explicit status beats any stage= marker (provider HTML error pages)
         self.assertEqual(classify_error("stage=api http status=400: html page"), "content")
         self.assertEqual(classify_error("stage=transport http status=401: html page"), "content")
+        # success-status carrying an API error (200 + HTML page) is a server fault
+        self.assertEqual(classify_error("stage=api http status=200: html page"), "server")
 
     def test_unknown(self):
         self.assertEqual(classify_error("some weird thing happened"), "unknown")
