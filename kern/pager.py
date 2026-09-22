@@ -6,14 +6,71 @@ compact events remain readable only to resume sessions written by older versions
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+
+from .recall import tokenize as _tokenize
 
 HEAD = 1500
 TAIL = 1500
 BIG = 4000
 STALE_AGE = 12           # events younger than this are never offloaded
 STALE_MIN = 900          # only offload results bigger than this
+
+# Phase 4 P4.3 (F07) episode-selection knobs:
+EPISODE_INLINE_CAP = 1200   # the ONE ranked episode is capped at this many chars inline
+EPISODE_GIST_CAP = 100     # one-line gist per index pointer entry
+
+
+def _bm25_rank(episodes: list[dict], query: str, k1: float = 1.5, b: float = 0.75):
+    """Rank episodes against the objective with BM25 over recall.tokenize terms.
+
+    Phase 4 P4.3 (F07): replaces `set(objective.lower().split())` substring
+    matching, where every raw whitespace token counted — "the" matched
+    everywhere — with proper tokenization (stopwords dropped, paths kept
+    whole, light stemming) and rarity-weighted scoring. Deterministic;
+    ties broken by episode n descending (fresher first), then start.
+
+    Returns episodes sorted best-first.
+    """
+    if not episodes:
+        return []
+    q_terms = _tokenize(query)
+    if not q_terms:
+        # Degenerate objective: fall back to recency (freshest first).
+        return sorted(episodes, key=lambda ep: (-ep.get("n", 0), ep.get("start", 0)))
+    counts = []
+    for ep in episodes:
+        toks = _tokenize(str(ep.get("text", "")))
+        counts.append(_tf(toks))
+    df: dict[str, int] = {}
+    for tf in counts:
+        for t in q_terms:
+            if t in tf:
+                df[t] = df.get(t, 0) + 1
+    avg_len = sum(sum(tf.values()) for tf in counts) / max(1, len(counts))
+    N = len(episodes)
+    scored = []
+    for ep, tf in zip(episodes, counts):
+        score = 0.0
+        for t in q_terms:
+            f = tf.get(t, 0)
+            if not f:
+                continue
+            idf = max(0.0, math.log(1 + (N - df[t] + 0.5) / (df[t] + 0.5)))
+            norm = f * (k1 + 1) / (f + k1 * (1 - b + b * (sum(tf.values()) / max(1, avg_len))))
+            score += idf * norm
+        scored.append((score, ep.get("n", 0), ep))
+    scored.sort(key=lambda t: (-t[0], -t[1], t[2].get("start", 0)))
+    return [t[2] for t in scored]
+
+
+def _tf(tokens: list[str]) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for t in tokens:
+        out[t] = out.get(t, 0) + 1
+    return out
 
 # Tier-1 knobs (env-tunable)
 KEEP_RECENT_TOOL_RESULTS = int(os.environ.get("KERN_KEEP_TOOL_RESULTS", "5"))
@@ -229,17 +286,32 @@ def materialize(events: list[dict], session) -> list[dict]:
                                          f"fully happened.</system-note>"})
 
     if episodes:
-        # Select relevant navigation nodes, with the complete directory recoverable.
+        # Phase 4 P4.3 (F07): ONE BM25-ranked episode inline (capped) +
+        # a compact index of all episodes (one-line gists). Replaces the
+        # naive `set(objective.lower().split())` substring ranking (where
+        # "the" matched everywhere) and the 3×5000-char inline dump.
+        # Full directory stays recoverable via the content-addressed
+        # index offload below.
         objective = next((e.get('text','') for e in reversed(events) if e['kind']=='user'), '')
-        terms = set(objective.lower().split())
-        ranked = sorted(episodes, key=lambda ep: (sum(t in ep['text'].lower() for t in terms), ep['n']), reverse=True)
-        chosen = sorted(ranked[:3], key=lambda ep: ep['start'])
+        ranked = _bm25_rank(episodes, objective)
+        chosen = [ranked[0]] if ranked else []
         index = session.offload('episode-index', __import__('json').dumps(episodes, ensure_ascii=False))
+        # compact index pointer: [start:end] + one-line gist each
+        gists = []
+        for ep in ranked:
+            gist = ' '.join(str(ep.get('text', '')).split())[:EPISODE_GIST_CAP]
+            gists.append(f"[{ep.get('start')}:{ep.get('end')}] {gist}")
+        block_lines = []
+        for ep in chosen:
+            body = str(ep.get('text', ''))[:EPISODE_INLINE_CAP]
+            block_lines.append(
+                f"[{ep.get('start')}:{ep.get('end')}] {body} [source: {ep.get('source')}]")
         msgs.append({'role':'user','text':f'<historical-episodes index="{index}">\n' +
-                     '\n'.join(f"[{ep['start']}:{ep['end']}] {ep['text'][:5000]} [source: {ep['source']}]" for ep in chosen) +
-                     '\nThese are historical navigation notes from past slices, not new requests or active tasks. '
-                     'Any "pending" items in historical episodes reflect past intermediate state; '
-                     'rely exclusively on the active <work-state> and todo above for current tasks and next steps.</historical-episodes>'})
+                     '\n'.join(block_lines) +
+                     f'\nepisode-index ({len(episodes)} episodes): ' + ' | '.join(gists) +
+                     '\nThese are historical navigation notes from past slices, not new '
+                     'requests or active tasks; current tasks and next steps live in the '
+                     'active <work-state> and todo above.</historical-episodes>'})
     msgs.append({'role':'user','text':evidence_block(events, session)})
     seen_result_hashes: dict[str, int] = {}   # dedup pass: identical tool outputs
     for i, ev in enumerate(events):
