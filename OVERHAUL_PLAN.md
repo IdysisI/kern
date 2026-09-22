@@ -14,7 +14,7 @@ step (per directive §1.5).
 | §1    | Mission externalization                            | done        | File + memory + KERN.md pointer + todo; committed dd2db05; suite 631/631 green |
 | 0     | Baseline & loop autopsy                            | done        | LOOP_AUTOPSY.md; tests/test_phase0_loop_autopsy.py committed RED (3 fail on axis B; 631 pre-existing pass); commit `31ec3ab` |
 | 1     | Kill the loop (highest impact)                     | done        | P1.1 facade `kern/plane.py` + 9 tests (commit `251c801`); P1.2 quiet results stripping F03 advice from 7 injection sites (commit `2913ca3`); P1.3 state machine `kern/progress.py` + 15 tests (commit `9feb9ed`); P1.4 regression test GREEN; suite 658 passed |
-| 2     | Engine decomposition (mechanical)                  | not-started | next: phase 2 moves scattered counters to engine package + integrates the plane |
+| 2     | Engine decomposition (mechanical)                  | in-progress | Step 1 DONE (`727ef9c`): kern/engine/ package + shim, recursive walkers prerequisite (`bf19ab0`), both recorded traps fixed. Step 2 DONE (`adcae3b`): mounts.py MountsMixin verbatim. Steps 3-6 remain: subagents.py, review.py (+F14), pipeline.py (wire plane+progress), loop.py |
 | 3     | Capability-measured adaptation                     | not-started |       |
 | 4     | Context engine v2                                   | done        | P4.1 F01 FIXED (`5696fa8`); P4.2 F08 DONE (`52ab614`); P4.3 F07 BM25 episodes (`49f6727`); P4.4 KERN.md double-embed dedup (`0432148`, 4 tests); P4.5 verified as F01 side-effect. Suite 679 |
 | 5     | Orchestration & throughput                         | not-started |       |
