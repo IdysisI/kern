@@ -374,7 +374,12 @@ def _arg_schema_hint(name: str) -> str:
     tool has no known schema."""
     try:
         from . import syscalls
-        sch = next((s for s in syscalls.SCHEMAS if s.get("name") == name), None)
+        # SCHEMAS entries are OpenAI-wrapped ({"type": "function",
+        # "function": {...}}): unwrap the envelope before matching the name,
+        # else every hint degrades to "unknown tool" (P3.3 test caught it).
+        sch = next((s.get("function", s) for s in syscalls.SCHEMAS
+                    if isinstance(s, dict)
+                    and s.get("function", s).get("name") == name), None)
     except Exception:
         sch = None
     if not isinstance(sch, dict):

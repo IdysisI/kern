@@ -14,7 +14,7 @@ step (per directive §1.5).
 | §1    | Mission externalization                            | done        | File + memory + KERN.md pointer + todo; committed dd2db05; suite 631/631 green |
 | 0     | Baseline & loop autopsy                            | done        | LOOP_AUTOPSY.md; tests/test_phase0_loop_autopsy.py committed RED (3 fail on axis B; 631 pre-existing pass); commit `31ec3ab` |
 | 1     | Kill the loop (highest impact)                     | done        | P1.1 facade `kern/plane.py` + 9 tests (commit `251c801`); P1.2 quiet results stripping F03 advice from 7 injection sites (commit `2913ca3`); P1.3 state machine `kern/progress.py` + 15 tests (commit `9feb9ed`); P1.4 regression test GREEN; suite 658 passed |
-Phase 2: in-progress (steps 1-5 + HTML-error fix done, 685 green; pipeline.py + report remaining)
+| 2     | Engine decomposition (mechanical)              | in-progress | steps 1-5 + HTML-error fix (347419a, 53c06bc); suite 685 green; report 19027f2; step 6 pipeline.py blocked (see Open Questions) |
 | 3     | Capability-measured adaptation                     | not-started |       |
 | 4     | Context engine v2                                   | done        | P4.1 F01 FIXED (`5696fa8`); P4.2 F08 DONE (`52ab614`); P4.3 F07 BM25 episodes (`49f6727`); P4.4 KERN.md double-embed dedup (`0432148`, 4 tests); P4.5 verified as F01 side-effect. Suite 679 |
 | 5     | Orchestration & throughput                         | not-started |       |
@@ -240,7 +240,36 @@ Steps 1-5 done, each a verbatim move with the suite green after it:
 - HTML-as-API-error fix (operator provider encodes API errors as HTML pages): 347419a — non-200 HTTP errors carry `stage=api http status=N`; classify_error lets an explicit status beat stage= markers (4xx content/fatal, 5xx server, 429 rate_limit); _sanitize_error_body keeps HTML collapsed but preserves a bounded gist and drops the false "not an API error / not billed" claims. 53c06bc — status-200 or mislabeled-content-type HTML bodies caught by a content-type guard plus a bounded raw-head tee (_capture_raw) so the incomplete-stream guard can prove HTML vs truncated SSE; one `stage=api` error event with the page gist, never raw markup, never transport noise; resilience maps status<400 + stage=api to server (free retry). Tests: tests/test_client_html_stream.py (3 new) + classify_error assertions in test_resilience/test_audit_fixes. Suite: 685 passed (receipt: pytest tests/ exit=0, commit 53c06bc).
 Remaining: pipeline.py middleware chain (dedup -> plane -> repeat-guard -> gates -> approve -> execute -> post-process) with per-stage ordering tests; then the final Phase 2 completion report.
 
+### Phase 3 (in progress) — Capability-measured adaptation — 2026-09-22
+
+- P3.1 calibration (259bc05 + f32a6b8): record_calibration(model, prompt-payload bytes, provider prompt_tokens) on every usage event in both stream loops; running median per model (24-sample window, min 3 samples, 0.5-16 bytes/token garbage guard, sub-512-byte prompts ignored) under health.json 'calibration'; estimate_tokens() is the ONE estimator (calibrated ratio, fallback conservative /3) used by context.estimate() and pager.budget() - the F06 /3-vs-/4 split is gone. tests/test_calibration.py (7).
+- P3.3 arg repair (a288d0a + this commit): repair_tool_args - ONE deterministic string-state-aware pass (smart quotes, raw newlines/tabs/CR in strings, Python literals, trailing commas); _finalize_pending proceeds with a repaired call flagged args_repaired, or fails with exact parse position + raw snippet + tool schema + placeholder corrected-shape example (never fabricates required args). _arg_schema_hint now unwraps the OpenAI-style SCHEMAS envelope (before: every hint said 'unknown tool'). tests/test_arg_repair.py (10).
+- Remaining: P3.2 profiles/intrusiveness, P3.4 adaptive tool descriptions, P3.5 fenced-mode contract summary.
+
 ## Open Questions / Blocked Items
+
+### Phase 2 step 6 — pipeline.py middleware chain — BLOCKED (2026-09-22)
+
+Tried: four exploration passes over the per-call interception chain in
+kern/engine/loop.py (lines ~205-610: repeat-guard -> constraint gate ->
+plan-first -> approve -> dedup/_ro_cache -> plane serve -> execute ->
+post-process), including verbatim prints of every slice and a self-attr
+inventory (22 engine attrs, no hidden globals). No implementation attempt
+was made because: (a) the chain is coupled to _loop locals (results, turn
+counters) and uses `continue` as the interception mechanism, so a verbatim
+move into stage classes requires semantic surgery (continue -> return
+Intercepted) that cannot be validated blind; (b) repeated context compaction
+elided the printed slices before edits could be crafted, causing re-print
+loops — the exact anti-pattern this mission forbids (§2.3/§2.5).
+Resume plan: in a fresh session with clean context, read loop.py 200-620
+ONCE, then implement pipeline.py in ONE py() surgery pass with invariant
+checks (indent structure, continue count, anchor uniqueness); run the full
+suite; revert on red. Ordering tests: one per stage asserting handle()
+precedence (repeat-guard before constraint gate, gate before plan-first,
+plan-first before approve, approve before dedup/plane, dedup before execute).
+Until then Phase 2 stays in-progress; steps 1-5 + the HTML-error fix are
+committed and green (685), so the engine package decomposition itself is
+complete and usable.
 
 - None pending beyond the deferred items below.
 
