@@ -20,7 +20,7 @@ imports ``kern.engine.subagents`` directly.
 """
 
 from . import core  # noqa: F401  (kern.engine.core must resolve)
-from . import mounts, review, subagents  # noqa: F401  (submodules must resolve)
+from . import loop, mounts, review, subagents  # noqa: F401  (submodules must resolve)
 from .core import *  # noqa: F401,F403  (public names, incl. re-exported imports)
 
 # Re-export every underscore name (functions, classes, compiled regexes,
@@ -35,7 +35,7 @@ from .core import *  # noqa: F401,F403  (public names, incl. re-exported imports
 # (_DELEGATE_SPAWN_LIMIT) must target the OWNING module
 # (kern.engine.subagents) directly — rebinding the shim's copy is not
 # seen by the owner's code.
-for _mod in (mounts, review, subagents, core):
+for _mod in (loop, mounts, review, subagents, core):
     globals().update({
         _k: _v for _k, _v in vars(_mod).items()
         if _k.startswith("_") and not _k.startswith("__")
