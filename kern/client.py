@@ -117,6 +117,8 @@ HEALTH_TTL = float(os.environ.get("KERN_HEALTH_TTL", str(7 * 24 * 3600)))
 # conservative fallback).
 _CAL_SAMPLES = 24        # per-model ratio window (running median)
 _CAL_MIN_SAMPLES = 3     # below this many samples: not calibrated yet
+_CAL_MIN_BYTES = 512     # smaller prompts are noise (synthetic/test streams):
+                         # a real prompt carries the system prompt -> kilobytes
 
 
 def _cal_load() -> dict:
@@ -145,6 +147,8 @@ def record_calibration(model: str, prompt_bytes: int, prompt_tokens: int) -> Non
     """One observed bytes/token sample from a real usage event."""
     if not model or prompt_tokens <= 0 or prompt_bytes <= 0:
         return
+    if prompt_bytes < _CAL_MIN_BYTES:
+        return                      # sub-KB payloads: ratio is meaningless
     ratio = prompt_bytes / prompt_tokens
     if not 0.5 <= ratio <= 16.0:      # garbage-in guard (malformed usage shape)
         return

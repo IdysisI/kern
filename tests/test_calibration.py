@@ -74,8 +74,11 @@ async def test_stream_usage_records_calibration(tmp_path, monkeypatch):
     p.write_text("{}")
     monkeypatch.setattr(C, "HEALTH_PATH", str(p))
     original = httpx.AsyncClient
+    # prompt_tokens must stay consistent with the ~4 KB payload: the
+    # garbage-ratio guard only accepts 0.5-16 bytes/token, so 4000 bytes over
+    # 1000 tokens (~4) lands in-band; 100 tokens would be ratio ~40 = noise.
     line = ('data: {"choices":[{"index":0,"finish_reason":"stop","delta":{}}],'
-            '"usage":{"prompt_tokens":100}}')
+            '"usage":{"prompt_tokens":1000}}')
     body = line + "\n\ndata: [DONE]\n\n"
 
     def respond(request):
@@ -85,7 +88,7 @@ async def test_stream_usage_records_calibration(tmp_path, monkeypatch):
     monkeypatch.setattr(httpx, "AsyncClient",
                         lambda **kw: original(transport=httpx.MockTransport(respond), **kw))
     events = [e async for e in C.Client().stream_chat(
-        "calib-model", [{"role": "user", "text": "h" * 200}])]
+        "calib-model", [{"role": "user", "text": "h" * 4000}])]
     assert [e for e in events if e.kind == "usage"]
     cal = C._cal_load()
     assert cal.get("calib-model"), cal
