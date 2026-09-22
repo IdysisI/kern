@@ -16,7 +16,7 @@ step (per directive §1.5).
 | 1     | Kill the loop (highest impact)                     | done        | P1.1 facade `kern/plane.py` + 9 tests (commit `251c801`); P1.2 quiet results stripping F03 advice from 7 injection sites (commit `2913ca3`); P1.3 state machine `kern/progress.py` + 15 tests (commit `9feb9ed`); P1.4 regression test GREEN; suite 658 passed |
 | 2     | Engine decomposition (mechanical)                  | not-started | next: phase 2 moves scattered counters to engine package + integrates the plane |
 | 3     | Capability-measured adaptation                     | not-started |       |
-| 4     | Context engine v2                                   | in-progress | P4.1 F01 double-injection FIXED (commit `5696fa8`, 4 tests); P4.2 F08 mission-packet rewrite DONE (commit `52ab614`, 5 tests, latent dead-code bug found+fixed); P4.3 episodes / P4.4 objective dedup / P4.5 estimate honesty remain |
+| 4     | Context engine v2                                   | done        | P4.1 F01 FIXED (`5696fa8`); P4.2 F08 DONE (`52ab614`); P4.3 F07 BM25 episodes (`49f6727`); P4.4 KERN.md double-embed dedup (`0432148`, 4 tests); P4.5 verified as F01 side-effect. Suite 679 |
 | 5     | Orchestration & throughput                         | not-started |       |
 | 6     | Consolidation, observability & release             | not-started |       |
 
@@ -39,7 +39,7 @@ overhaul). Update file/function on verification.
 | F04   | Six scattered loop sensors with tangled resets                                                    | applied   | P1.3 (`9feb9ed`) adds `kern/progress.py` — the ONE decision point per turn. Migration of all six counters into it is the P2 mechanical work |
 | F05   | Triple read-dedup at three inline points (`_ro_cache`, FileSlate, KnowledgeLedger)                | applied   | P1.1 (`251c801`) adds `kern/plane.py` facade with one `(text, meta, served_from)` response shape; migration of all three engine call sites to use the facade is the P2 mechanical work |
 | F06   | Token estimate inconsistency: context.estimate ÷3 vs pager.budget ÷4, neither calibrated            | pending  | kern/context.py, kern/pager.py |
-| F07   | Naive episode selection: set(objective.lower().split()) substring matching                         | pending  | kern/pager.py    |
+| F07   | Naive episode selection: set(objective.lower().split()) substring matching                         | applied   | Fixed in P4.3 (`49f6727`): _bm25_rank via recall.tokenize, ONE episode capped 1200 chars + compact gist index; 8 tests |
 | F08   | `_with_mission_packet` internal mess — regex per call, `'g' in locals()`, possible adjacency break | applied   | Fixed in P4.2 (`52ab614`): module-level regexes, _safe_codegraph, single extraction, adjacency-safe fallback; latent dead-code stems bug found (CodeGraph.modules never existed) and fixed via new module_paths() API |
 | F09   | No tool-argument repair + fenced-mode full-schema dump                                             | pending  | kern/client.py   |
 | F10   | Fixed harness regardless of measured capability                                                   | pending  | kern/client.py, kern/engine.py |
@@ -199,11 +199,31 @@ re-application gone, `context_stats.estimated_tokens` now reflects the
 view actually sent. The /context command and TUI meter read
 `e.context_stats` — same number.
 
-**Remaining in Phase 4:** P4.3 (episode dedup: replace inline
-3×5000-char episode blocks with ONE BM25-ranked episode via
-recall.tokenize + compact index pointer) and P4.4 (objective dedup
-beyond the work-state cap — audit view assembly for repo-map vs
-mission-packet overlap). Both deferred to the next session.
+**P4.3 — F07 episode dedup DONE (commit `49f6727`).** Naive
+`set(objective.lower().split())` substring ranking ('the' matched
+everywhere) replaced with `_bm25_rank` over `recall.tokenize` terms
+(stopwords dropped, paths whole, light stemming; IDF-weighted,
+deterministic tie-breaks). Inline body now ONE episode capped at 1200
+chars (was 3×5000); every episode gets a `[start:end]` + one-line gist
+pointer; full directory still recoverable via the content-addressed
+episode-index offload (invariant §3.1 test included). 8 tests in
+`tests/test_phase4_f07_episodes.py`. Suite: 675 passed.
+
+**P4.4 — objective/view dedup DONE (commit `0432148`).** Live audit of
+the assembled view found the objective already conformant (1 full
+dialogue turn + 1 capped `<work-state>` pointer — locked by test) and ONE
+real duplication: on turn 1 the system message carries full KERN.md via
+`<project-instructions>` AND the mission packet embedded a second
+`### KERN.md` copy. Fix: `_with_mission_packet` skips its KERN.md section
+when the view already carries `<project-instructions source="KERN.md">`;
+the packet cache key includes that flag so turn-1 and later-turn variants
+never poison each other. Consequence (correct): when the packet's only
+content was the duplicate, the existing empty-parts guard drops the block
+entirely on turn 1. F01 tests refined to the at-most-once contract (the
+F01 bug was duplication; absence after dedup is legitimate). 4 tests in
+`tests/test_phase4_p44_dedup.py`.
+
+**Phase 4 complete.** Suite: 679 passed.
 
 Suite after P4.1 + P4.2: **667 passed** (631 baseline + 3 P0 + 15 P1.3 +
 9 P1.1 + 4 F01 + 5 F08).
