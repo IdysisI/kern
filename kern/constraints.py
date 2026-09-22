@@ -152,13 +152,16 @@ def constraint_gate(session: Any, name: str, meta: dict | None) -> dict | None:
         return None
     n = m.get("force_plan_consecutive", 3)
     last = m.get("force_plan_last_error", "")
+    # Phase 1 P1.2 — quiet results: this text is the model's only view of
+    # the rejection, so the factual state (which call, what counter, last
+    # error, gate consequence) is preserved. Imperative instructions
+    # ("Required next step: update your plan...", "no tool call") are
+    # removed: the model can argue with instructions, but not with facts.
     reject_text = (
         f"[constraint:force_plan] tool call `{name}` rejected — {n} consecutive "
         f"failures detected (last: {last!r}). "
-        f"Required next step: update your plan with todo(items=...) or "
-        f"reply in plain text describing the blocker (no tool call). "
-        f"The engine will not run other tools until the plan is updated "
-        f"or the turn ends."
+        f"Gate is active; the engine is not running tools other than todo/note/memory "
+        f"until the todo list changes or the turn ends."
     )
     _log(session, "force_plan.reject", tool=name, allowed=sorted(_FORCE_PLAN_ALLOWED))
     return {
@@ -202,8 +205,7 @@ def suppress_repeat_hard(session: Any, target: str, seen_n: int) -> tuple[str, d
     confusion this caused in the 2026-09-18 read-tool incident)."""
     new_text = (
         f"(suppressed: `{target}` read {seen_n}× this session; content is "
-        f"already in context above. This pointer replaces the body — make "
-        f"progress, or read a DIFFERENT slice/file.)"
+        f"already in context above. This pointer replaces the body.)"
     )
     _log(session, "suppress_repeat.hard", target=target[:80], seen=seen_n)
     return new_text, {
@@ -219,10 +221,14 @@ def nullop_repeat(session: Any, target: Any, seen_n: int, text: str) -> tuple[st
     Absorbed results are free, so the model never felt the cost of an
     absorbed loop — and every sensor reset on them, hiding the loop. This
     keeps the content (it may be the right file) but marks the repetition
-    and feeds the circuit breaker via the engine."""
-    new_text = (str(text) + f"\n\n[constraint:nullop] absorbed hit #{seen_n} for the same call — "
-                "you already hold this content. Act on it, read a DIFFERENT slice, or answer. "
-                "Identical re-issues now count toward the circuit breaker.")
+    and feeds the circuit breaker via the engine.
+
+    Phase 1 P1.2 — quiet results: the model's only view of this state is
+    the factual fact-line below. No imperative advice ("Act on it, read
+    a DIFFERENT slice, or answer…") — the model could pursue those as a
+    new task and enter a meta-loop (F03). The counter `seen_n` and the
+    constraint_fired journal event are the operator-visible record."""
+    new_text = (str(text) + f"\n\n[constraint:nullop] absorbed hit #{seen_n} for the same call.")
     _log(session, "nullop.fire", target=str(target)[:80], seen=seen_n)
     return new_text, {"constraint": "nullop", "nullop_target": str(target)[:80], "nullop_seen": seen_n}
 
@@ -421,14 +427,13 @@ def redact_py_file_reads(session: Any, name: str, code: str, text: str) -> tuple
         out = out[:1000] + "\n\n[constraint:redact_py_file_reads] file contents "
         out += f"from `{target}` redacted ({len(str(text))} chars truncated). "
         if ptr:
-            out += f"Full original output preserved at: {ptr}. "
-        out += "Use read() tool to inspect the file directly.\n\n" + out[-500:]
+            out += f"Full original output preserved at: {ptr}."
     else:
         out = (
             out
-            + f"\n\n[constraint:redact_py_file_reads] reading `{target}` via "
-            + "py()/exec() bypasses the read() tool's truncation/limits. Use "
-            + "the read() tool for file contents."
+            + f"\n\n[constraint:redact_py_file_reads] `{target}` returned via "
+            + "py()/exec(); content was not redacted but the same file may "
+            + "be available via the read() tool."
         )
     _log(session, "redact_py_file_reads.fire", target=target[:80], in_len=len(str(text)), out_len=len(out))
     return out, {

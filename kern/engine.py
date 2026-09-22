@@ -601,9 +601,15 @@ class Engine:
             if not multi:
                 return None
             self._plan_first_rejections += 1
-            return ("[constraint:plan_first] This objective is multi-step. "
-                    "Set todo(items=...) first (3-8 verifiable items), then act. "
-                    "The mutation was not executed.")
+            # Phase 1 P1.2 — quiet results: this is the model's only view
+            # of the plan-first rejection, so the factual state (which
+            # objective, why this is multi-step, that the mutation was not
+            # executed) is preserved. Imperative instructions
+            # ("Set todo(items=...) first … then act") are removed; the
+            # model could pursue those as a new task (F03).
+            return ("[constraint:plan_first] objective classified multi-step; "
+                    f"{self._plan_first_rejections}/2 plan-first rejections used; "
+                    "mutation not executed.")
         except Exception:
             return None
 
@@ -625,9 +631,20 @@ class Engine:
             return 0
 
     def _check_drift_and_staleness(self, name, args, text: str) -> str:
-        """WP4: append a drift note if the last 5 calls share no vocab with
-        any open todo item; append a staleness nudge if the todo hasn't
-        changed for 12+ calls. Once per turn each."""
+        """WP4 — drift + staleness sensors.
+
+        Tracks state for the progress machine (Phase 1 P1.3): counts
+        consecutive calls with zero vocab overlap against open todo
+        items, and the number of calls since the todo list last changed.
+
+        Per the overhaul directive (Phase 1 P1.2 — quiet results), this
+        function NEVER injects imperative advice into the model-visible
+        text. Sensor firings are recorded as ``constraint_fired`` journal
+        events (operator visibility) and via the ``self.hygiene`` counters;
+        the returned ``text`` is passed through unchanged.
+
+        Returns: ``text`` (the tool-result body), unmodified.
+        """
         try:
             open_items = [t for t in self.todo if t.get("status") in ("pending", "active")]
             if not open_items:
@@ -645,10 +662,15 @@ class Engine:
                 if self._drift_zero >= 5 and not getattr(self, "_drift_fired_turn", False):
                     self._drift_fired_turn = True
                     self.hygiene["drift_notes"] += 1
-                    return (text +
-                                    "\n\n[constraint:drift] the last 5 actions share no "
-                                    "vocabulary with any open todo item — update the plan or "
-                                    "explain the detour.")
+                    try:
+                        self.session.emit(
+                            "constraint_fired",
+                            constraint="drift",
+                            drift_zero=self._drift_zero,
+                            tool=name,
+                        )
+                    except Exception:
+                        pass
             else:
                 self._drift_zero = 0
             # staleness
@@ -656,10 +678,17 @@ class Engine:
                 self._calls_since_todo_change = getattr(self, "_calls_since_todo_change", 0) + 1
                 if self._calls_since_todo_change >= 12:
                     self._staleness_fired_turn = True
-                    return (text +
-                                    "\n\n[constraint:staleness] your todo list has not changed "
-                                    "for 12+ actions — review the plan (mark items done, add "
-                                    "new items, or drop stale ones).")
+                    self.hygiene.setdefault("staleness_notes", 0)
+                    self.hygiene["staleness_notes"] += 1
+                    try:
+                        self.session.emit(
+                            "constraint_fired",
+                            constraint="staleness",
+                            calls_since_todo_change=self._calls_since_todo_change,
+                            tool=name,
+                        )
+                    except Exception:
+                        pass
         except Exception:
             pass
         return text
@@ -1995,14 +2024,16 @@ class Engine:
                                         "constraint": "knowledge_intercept",
                                         "status": "knowledge_hit",
                                     }
-                                    # Knowledge-loop warning: emit once per turn when hits climb
+                                    # Knowledge-loop warning: emit once per turn when hits climb.
+                                    # Phase 1 P1.2 — quiet results: a factual one-line
+                                    # counter only. No imperative advice ("You are likely
+                                    # searching for …", "Either state precisely …"). The
+                                    # model could pursue that as a new task and enter a
+                                    # meta-loop (F03).
                                     if self._knowledge_hits_this_turn >= 5 and not self._knowledge_warned_this_turn:
                                         _hit_text += (
-                                            f"\n[knowledge-loop: {self._knowledge_hits_this_turn} acquisition attempts were "
-                                            f"redirected to already-held knowledge this turn. You are likely searching for "
-                                            f"information not present in held state. Either state precisely what is missing and "
-                                            f"query a different source, or proceed to implementation/verification using held "
-                                            f"knowledge.]"
+                                            f"\n[knowledge-loop: {self._knowledge_hits_this_turn} "
+                                            f"held-knowledge redirects this turn.]"
                                         )
                                         _hit_meta["knowledge_loop_warning"] = True
                                         self.hygiene["knowledge_loop_warnings"] += 1

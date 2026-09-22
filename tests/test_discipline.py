@@ -104,29 +104,63 @@ def test_drift_score_token_overlap(tmp_path):
 
 
 def test_check_drift_appends_constraint_at_5_zero_overlap_calls(tmp_path):
-    """Five consecutive zero-overlap calls → [constraint:drift] appended."""
+    """Five consecutive zero-overlap calls → drift sensor fires
+    (constraint_fired journal event + hygiene counter) but the
+    model-visible text is passed through unchanged (Phase 1 P1.2 —
+    quiet results, anti-F03)."""
     s = create_session(str(tmp_path))
     e = Engine(_Model([]), "test", s, str(tmp_path))
     e.todo = [{"text": "fix the engine instrumentation hook", "status": "active"}]
-    # 5 zero-overlap calls
+    drift_notes_before = e.hygiene.get("drift_notes", 0)
+    fired = []
     for i in range(5):
         text = e._check_drift_and_staleness(
             "write", {"path": f"unrelated{i}.py", "content": "pizza banana"}, "ok")
-    assert "[constraint:drift]" in text
-    # once per turn: 6th call must NOT re-fire
-    text6 = e._check_drift_and_staleness(
+        fired.append(text)
+    # Sensor fired: hygiene counter advanced and a constraint_fired journal
+    # event is recorded (anti-Goodhart — sensor is NOT silenced).
+    assert e.hygiene.get("drift_notes", 0) > drift_notes_before
+    kinds = [ev.get("kind") for ev in s.events]
+    assert "constraint_fired" in kinds
+    # But the model-visible text is unchanged on every call.
+    assert "[constraint:drift]" not in (fired[-1] or "")
+    for t in fired:
+        if t is not None:
+            assert "[constraint:" not in t, (
+                "P1.2 quiet results: synthetic serves carry facts only, "
+                "no [constraint:...] advice in tool_result text."
+            )
+    # once per turn: 6th call must NOT re-increment the counter
+    drift_notes_now = e.hygiene.get("drift_notes", 0)
+    e._check_drift_and_staleness(
         "write", {"path": "unrelated5.py", "content": "pizza"}, "ok")
-    assert "[constraint:drift]" not in text6
+    assert e.hygiene.get("drift_notes", 0) == drift_notes_now
 
 
 def test_check_staleness_fires_after_12_calls(tmp_path):
-    """After 12 calls without any todo change → [constraint:staleness]."""
+    """After 12 calls without any todo change → staleness sensor fires
+    (constraint_fired journal event + hygiene counter) but the
+    model-visible text is passed through unchanged (Phase 1 P1.2)."""
     s = create_session(str(tmp_path))
     e = Engine(_Model([]), "test", s, str(tmp_path))
     e.todo = [{"text": "fix the engine hook", "status": "active"}]
+    staleness_before = e.hygiene.get("staleness_notes", 0)
+    fired = []
     # 12 calls, all overlapping with the open item → drift won't fire,
     # but staleness will (todo hasn't changed).
     for i in range(12):
         text = e._check_drift_and_staleness(
             "write", {"path": f"engine{i}.py", "content": "fix hook"}, "ok")
-    assert "[constraint:staleness]" in text
+        fired.append(text)
+    # Sensor fired.
+    assert e.hygiene.get("staleness_notes", 0) > staleness_before
+    kinds = [ev.get("kind") for ev in s.events]
+    assert "constraint_fired" in kinds
+    # No imperative advice in the returned text.
+    assert "[constraint:staleness]" not in (fired[-1] or "")
+    for t in fired:
+        if t is not None:
+            assert "[constraint:" not in t, (
+                "P1.2 quiet results: synthetic serves must not contain any "
+                "[constraint:...] advice phrases (F03)."
+            )

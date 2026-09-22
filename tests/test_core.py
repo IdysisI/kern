@@ -683,8 +683,17 @@ async def test_py_file_read_triggers_nudge(tmp_path):
     await e.chat('look at engine', max_steps=4)
     results = [ev for ev in s.events if ev['kind'] == 'tool_result']
     assert results, 'expected at least one tool_result'
-    assert any('bypasses the read() tool' in ev.get('text', '') for ev in results), \
-        'py() file read must append the read()/grep nudge'
+    # Phase 1 P1.2 — quiet results: model-visible text contains a factual
+    # constraint tag and a pointer to the read() tool, not an imperative
+    # "Use the read() tool …" sentence the model could pursue as a new task.
+    assert any(
+        ('[constraint:redact_py_file_reads]' in ev.get('text', '')
+         and 'read() tool' in ev.get('text', ''))
+        for ev in results
+    ), (
+        'py() file read must append a [constraint:redact_py_file_reads] '
+        'tag mentioning the read() tool — factual pointer, not imperative.'
+    )
 
 
 @pytest.mark.asyncio
