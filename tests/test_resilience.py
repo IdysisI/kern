@@ -32,6 +32,9 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(classify_error("http status=400 bad request"), "content")
         self.assertEqual(classify_error("http status=401 unauthorized"), "content")
         self.assertEqual(classify_error("http status=404 not found"), "content")
+        # explicit status beats any stage= marker (provider HTML error pages)
+        self.assertEqual(classify_error("stage=api http status=400: html page"), "content")
+        self.assertEqual(classify_error("stage=transport http status=401: html page"), "content")
 
     def test_unknown(self):
         self.assertEqual(classify_error("some weird thing happened"), "unknown")

@@ -30,7 +30,37 @@ CLOUDFLARE_502 = ("stage=transport http status=502: <!DOCTYPE html>\n"
 def test_html_error_body_collapsed():
     out = _sanitize_error_body(CLOUDFLARE_502.encode()[:1000])
     assert "<html" not in out and "DOCTYPE" not in out
-    assert "not billed" in out  # tells the model/user what actually happened
+    # HTML is the provider's error FORMAT, not "not an API error": no false
+    # claims about billing/reachability, and the page's own text survives.
+    assert "not an API error" not in out
+    assert "not billed" not in out
+    assert "Cloudflare" in out  # gist (<title>/visible text) preserved
+
+
+def test_html_error_gist_keeps_real_api_message():
+    page = ("<html><head><title>429 Rate limit exceeded — reset in 30s"
+            "</title></head><body><h1>slow down</h1></body></html>")
+    out = _sanitize_error_body(page.encode())
+    assert "Rate limit exceeded" in out and "<title>" not in out
+
+
+def test_http_4xx_html_is_fatal_api_error_not_transport():
+    """Operator report: their provider answers API errors with HTML pages.
+    A 4xx must classify as content (fatal), never as retryable transport."""
+    err = "stage=api http status=401: " + _sanitize_error_body(
+        b"<html><title>Invalid API key</title></html>")
+    assert R.classify_error(err) == "content"
+    d = R.decide_retry(err, produced_output=False, attempt=0,
+                       budget=R.RetryBudget(max_billed=3))
+    assert not d.retry
+
+
+def test_http_5xx_html_still_free_server_retry():
+    err = "stage=api http status=502: " + _sanitize_error_body(
+        b"<html><title>502 Bad Gateway</title></html>")
+    d = R.decide_retry(err, produced_output=False, attempt=0,
+                       budget=R.RetryBudget(max_billed=3))
+    assert d.retry and d.billed is False
 
 
 def test_json_error_body_passthrough():

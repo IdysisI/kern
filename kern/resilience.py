@@ -47,6 +47,11 @@ def classify_error(error: str) -> str:
         return _RATE_LIMIT
     if status is not None and 500 <= status < 600:
         return _SERVER
+    if status is not None and 400 <= status < 500:
+        # Explicit HTTP 4xx: an API-layer error (auth/payload/route) — even when
+        # the body is an HTML page or the string carries a stage= marker. Fatal
+        # by design: retrying a rejected request only burns money.
+        return _CONTENT
     if "proxy_error" in e or '"code": "5' in e:
         return _SERVER
     # transport: connection-level, before/independent of an HTTP status
@@ -55,8 +60,6 @@ def classify_error(error: str) -> str:
         "eof", "broken pipe", "conn", "refused", "name resolution", "dns",
     )):
         return _TRANSPORT
-    if status is not None and 400 <= status < 500:
-        return _CONTENT   # 400/401/403/404/422 are request/auth problems, not retryable infra
     return _UNKNOWN
 
 

@@ -44,21 +44,37 @@ _PRIVATE_NETS = (
 )
 
 _HTML_MARK = re.compile(rb"<!doctype\s+html|<html", re.I)
+_HTML_TITLE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_HTML_TAGS = re.compile(r"<[^>]+>")
+
+
+def _html_error_gist(body: str) -> str:
+    """Bounded human-readable gist of an HTML error page: <title> if present,
+    else the first visible text run. Providers that encode API errors as HTML
+    put the real message (rate limit, bad key, payload too large) in there —
+    collapsing the markup must not throw that signal away."""
+    m = _HTML_TITLE.search(body)
+    text = _HTML_TAGS.sub(" ", m.group(1) if m else body)
+    return re.sub(r"\s+", " ", text).strip()[:200]
 
 
 def _sanitize_error_body(raw: bytes) -> str:
-    """Make transport error bodies safe to surface to user AND model.
+    """Make HTTP error bodies safe to surface to user AND model.
 
-    A proxy 502 returns Cloudflare's HTML error page; dumping it verbatim
-    floods the chat and the journal with markup that helps nobody. Detect
-    HTML and collapse it to a one-line summary; otherwise pass JSON/text
-    through (capped).
+    Gateways and some providers answer errors with HTML pages; dumping them
+    verbatim floods the chat and the journal with markup that helps nobody.
+    Detect HTML and collapse it to one line — but KEEP a gist: an HTML body is
+    the provider's error FORMAT, not proof the request never arrived (one
+    operator's provider encodes every API error as HTML). The HTTP status,
+    embedded by the caller as `stage=api http status=N`, stays authoritative
+    for retry classification. Non-HTML bodies pass through (capped).
     """
     body = raw[:4000].decode("utf-8", errors="replace")
     if _HTML_MARK.search(raw[:512]) or "<!DOCTYPE html" in body[:200]:
-        return ("proxy returned an HTML error page (not an API error) — "
-                "the provider/gateway is unreachable or overloaded; this "
-                "attempt did NOT reach the model and was not billed")
+        gist = _html_error_gist(body)
+        return ("provider returned an HTML-formatted error page (this "
+                "provider encodes API errors as HTML; the status code is "
+                "authoritative)" + (f" — page says: {gist}" if gist else ""))
     return body[:400]
 
 
@@ -341,7 +357,9 @@ class Client:
                 async with c.stream("POST", f"{self.base_url}/v1/chat/completions",
                                     headers=headers, json=body) as r:
                     if r.status_code != 200:
-                        yield StreamEvent("error", error="stage=transport http status=%d: %s"
+                        # An HTTP response means transport SUCCEEDED: the error is
+                        # API-layer (status is authoritative), not a connection fault.
+                        yield StreamEvent("error", error="stage=api http status=%d: %s"
                                           % (r.status_code, _sanitize_error_body(await r.aread())))
                         return
                     async for line in _lines_with_stall(r, model):
@@ -417,7 +435,9 @@ class Client:
                 async with c.stream("POST", f"{self.base_url}/v1/messages",
                                     headers=headers, json=body) as r:
                     if r.status_code != 200:
-                        yield StreamEvent("error", error="stage=transport http status=%d: %s"
+                        # An HTTP response means transport SUCCEEDED: the error is
+                        # API-layer (status is authoritative), not a connection fault.
+                        yield StreamEvent("error", error="stage=api http status=%d: %s"
                                           % (r.status_code, _sanitize_error_body(await r.aread())))
                         return
                     async for line in _lines_with_stall(r, model):
