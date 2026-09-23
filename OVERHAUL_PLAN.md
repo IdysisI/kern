@@ -14,7 +14,7 @@ step (per directive §1.5).
 | §1    | Mission externalization                            | done        | File + memory + KERN.md pointer + todo; committed dd2db05; suite 631/631 green |
 | 0     | Baseline & loop autopsy                            | done        | LOOP_AUTOPSY.md; tests/test_phase0_loop_autopsy.py committed RED (3 fail on axis B; 631 pre-existing pass); commit `31ec3ab` |
 | 1     | Kill the loop (highest impact)                     | done        | P1.1 facade `kern/plane.py` + 9 tests (commit `251c801`); P1.2 quiet results stripping F03 advice from 7 injection sites (commit `2913ca3`); P1.3 state machine `kern/progress.py` + 15 tests (commit `9feb9ed`); P1.4 regression test GREEN; suite 658 passed |
-| 2     | Engine decomposition (mechanical)              | in-progress | steps 1-5 + HTML-error fix (347419a, 53c06bc); suite 685 green; report 19027f2; step 6 pipeline.py blocked (see Open Questions) |
+| 2     | Engine decomposition (mechanical)              | done        | steps 1-5 + HTML-error fix (347419a, 53c06bc); step 6 pipeline.py DONE 2026-09-23 (6c2f7a5 extraction, fba9797 ordering tests, e1a4664 plane wiring); suite 781 green; report in Open Questions |
 | 3     | Capability-measured adaptation                     | done        | P3.1-P3.5 all landed; commit `1030188`; suite 741 green |
 | 4     | Context engine v2                                   | done        | P4.1 F01 FIXED (`5696fa8`); P4.2 F08 DONE (`52ab614`); P4.3 F07 BM25 episodes (`49f6727`); P4.4 KERN.md double-embed dedup (`0432148`, 4 tests); P4.5 verified as F01 side-effect. Suite 679 |
 | 5     | Orchestration & throughput                         | done        | P5.1-P5.3 landed; commit `58c7cbb`; suite 761 green |
@@ -276,32 +276,47 @@ Remaining: pipeline.py middleware chain (dedup -> plane -> repeat-guard -> gates
 7. **Safety greps** ✓ — sandbox default ON (`KERN_SANDBOX` default "1" + bwrap detection); approvals still gate execution (loop.py `ok = self.approve(desc, ...)` before `_safe_call`); web loopback-only (serve/daemon HOST default 127.0.0.1; web.py rejects non-local hostnames); token indirection untouched (kern/auth.py has NO overhaul commit); injection scrubbing unified with unchanged strength (identity + all-wrapper redaction tests).
 8. **Docs + memory** ✓ — this plan complete with per-phase reports; memory atom `overhaul-active` superseded by the OVERHAUL COMPLETE atom; KERN.md self-overhaul section marked complete; docs/ENVIRONMENT.md documents KERN_PROFILE / KERN_SUBAGENT_MODEL / KERN_FOLD_MODEL.
 
-Known gaps at release (honest state): Phase 2 step 6 (pipeline.py middleware chain) remains blocked-by-design (see below); §12 items 2-4 ratio/accuracy/live-small-model sign-offs need operator-run sessions on real tasks; the daemon reports STALE (0.4.0) until the operator restarts it — expected after a version bump, hot reload already serves 0.5.0 code.
+Known gaps at release (honest state): §12 items 2-4 ratio/accuracy/live-small-model sign-offs need operator-run sessions on real tasks; the daemon reports STALE (0.4.0) until the operator restarts it — expected after a version bump, hot reload already serves 0.5.0 code. Phase 2 step 6 was completed 2026-09-23 (pipeline.py extracted, plane.py wired, progress.py wiring declined with verdict — see Open Questions).
 
 ## Open Questions / Blocked Items
 
-### Phase 2 step 6 — pipeline.py middleware chain — BLOCKED (2026-09-22)
+### Phase 2 step 6 — pipeline.py middleware chain — DONE (2026-09-23)
 
-Tried: four exploration passes over the per-call interception chain in
-kern/engine/loop.py (lines ~205-610: repeat-guard -> constraint gate ->
-plan-first -> approve -> dedup/_ro_cache -> plane serve -> execute ->
-post-process), including verbatim prints of every slice and a self-attr
-inventory (22 engine attrs, no hidden globals). No implementation attempt
-was made because: (a) the chain is coupled to _loop locals (results, turn
-counters) and uses `continue` as the interception mechanism, so a verbatim
-move into stage classes requires semantic surgery (continue -> return
-Intercepted) that cannot be validated blind; (b) repeated context compaction
-elided the printed slices before edits could be crafted, causing re-print
-loops — the exact anti-pattern this mission forbids (§2.3/§2.5).
-Resume plan: in a fresh session with clean context, read loop.py 200-620
-ONCE, then implement pipeline.py in ONE py() surgery pass with invariant
-checks (indent structure, continue count, anchor uniqueness); run the full
-suite; revert on red. Ordering tests: one per stage asserting handle()
-precedence (repeat-guard before constraint gate, gate before plan-first,
-plan-first before approve, approve before dedup/plane, dedup before execute).
-Until then Phase 2 stays in-progress; steps 1-5 + the HTML-error fix are
-committed and green (685), so the engine package decomposition itself is
-complete and usable.
+The sanctioned resume plan (one surgery pass, invariant checks, full suite,
+revert on red) was executed in a fresh session with clean context:
+
+- `6c2f7a5` — **extract pipeline.py**: verbatim move of the per-call gate
+  sequence (kern_error → repeat_guard → constraint_gate → plan_first →
+  approve → dedup/_ro_cache → serve) into ordered Stage classes with
+  `handle(eng, ctx) -> INTERCEPTED | None`. Mechanical renames only
+  (self→eng, loop locals→CallCtx attrs, the 7 interception continues →
+  `return INTERCEPTED`); execute + post-process stay in the loop.
+  loop.py 967 → 733 lines. Implemented as ONE py() surgery pass
+  (/tmp/step6_surgery.py) with anchor asserts, AST gates before every
+  write, and invariant checks (7 continues removed == 7 INTERCEPTED
+  returns). Suite 770 green.
+- `fba9797` — **ordering tests** (one precedence test per adjacent stage
+  pair + structural order + three real-gate tests). The plan-first test
+  caught a real bug blind: the moved prior line assigned a local instead
+  of ctx.prior, silently disabling the replay-warning and approval-desc
+  paths. Fixed; suite 781 green.
+- `e1a4664` — **plane.py (P1.1) wired in**: the engine constructs
+  `self.plane = KnowledgePlane(cwd, fileslate, ledger, ro_cache)` and the
+  interception stages consult the three read backends through that ONE
+  facade (plane.ro_cache / plane.fileslate / plane.ledger). Same objects,
+  zero behavior change; plane.py is no longer an orphan module.
+
+**progress.py (P1.3) wiring — DECLINED, deliberate verdict**: Progress is
+a full per-turn state machine (State/Verdict/Signal — a parallel sensor
+architecture with its own escalation semantics), not a counter container.
+Wiring it in would REPLACE the loop's evolved, tested sensor logic
+(WP1 nullop sensors, replay warnings, hygiene counters feeding
+constraint_gate) rather than consolidate it — a behavioral rewrite, not
+the mechanical wire-in the directive assumed. The six counters remain
+engine attributes; the sensors that touch them now fire from inside the
+pipeline stages, which was the consolidation step 6 actually needed.
+
+Phase 2 is complete: steps 1-6 all landed, suite 781 green.
 
 - None pending beyond the deferred items below.
 
