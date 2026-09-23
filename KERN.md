@@ -37,12 +37,15 @@ Hygiene counters exposed in `kern/measure.HYGIENE_KEYS`:
 All ledger calls are exception-safe and fail open. The control plane never
 adds an LLM request.
 
-## Self-Overhaul — in progress
+## Self-Overhaul — complete (v0.5.0, 2026-09-23)
 
-- **ONGOING: self-overhaul — see `OVERHAUL_PLAN.md` before any other work.**
-  Phased mission to kill the loop, decompose the engine, and adapt the
-  harness to measured capability. Resume rule: read `OVERHAUL_PLAN.md`,
-  mark what's done, continue at the first non-done phase. Do not refactor
-  on red; do not add inline special cases; prime directive is fewer
-  moving parts, not more.
+- **Self-overhaul v1.0 COMPLETE — full record in `OVERHAUL_PLAN.md`**:
+  per-phase reports, measured deltas, the §12 acceptance-checklist
+  verification, and the one deferred item (Phase 2 step 6, pipeline.py
+  middleware chain — blocked-by-design with rationale + resume plan).
+  Phases 0–6 landed except that one step; release 0.5.0; suite 770 green.
+  Resume rule if future work reopens it: read `OVERHAUL_PLAN.md`, mark
+  what's done, continue at the first non-done phase. Do not refactor on
+  red; do not add inline special cases; prime directive is fewer moving
+  parts, not more.
 

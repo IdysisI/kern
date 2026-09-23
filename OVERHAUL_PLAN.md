@@ -18,7 +18,7 @@ step (per directive §1.5).
 | 3     | Capability-measured adaptation                     | done        | P3.1-P3.5 all landed; commit `1030188`; suite 741 green |
 | 4     | Context engine v2                                   | done        | P4.1 F01 FIXED (`5696fa8`); P4.2 F08 DONE (`52ab614`); P4.3 F07 BM25 episodes (`49f6727`); P4.4 KERN.md double-embed dedup (`0432148`, 4 tests); P4.5 verified as F01 side-effect. Suite 679 |
 | 5     | Orchestration & throughput                         | done        | P5.1-P5.3 landed; commit `58c7cbb`; suite 761 green |
-| 6     | Consolidation, observability & release             | not-started |       |
+| 6     | Consolidation, observability & release             | done        | P6.1 verified (no dead code), P6.2-P6.5 landed (`3171ccd`, `87c17a6`); release 0.5.0; suite 770 green; doctor runs |
 
 (Phase numbering kept verbatim from the directive so a reader can map this
 file back to §5–§11 by phase number.)
@@ -34,25 +34,25 @@ overhaul). Update file/function on verification.
 | ID    | One-line summary                                                                                  | Status   | File / Function |
 |------:|---------------------------------------------------------------------------------------------------|----------|-----------------|
 | F01   | Double injection in `ContextManager.prepare()` — return line re-applies all 3 injections              | applied   | Fixed in P4.1 (`5696fa8`): return-line now `return view`; live evidence pre-fix = 2 mission-context blocks per prepare() |
-| F02   | `serve.py` `Conn`/`handler` classes are DEAD CODE (web.py imports daemon.handler; serve.main delegates) | pending  | kern/serve.py    |
+| F02   | `serve.py` `Conn`/`handler` classes are DEAD CODE (web.py imports daemon.handler; serve.main delegates) | refuted (verified LIVE: `kern serve` CLI + 2 test files; P6.1 skipped deletion) | kern/serve.py    |
 | F03   | Constraint soup — advisory text injected into tool_results drives small-model meta-loops           | applied   | Fixed in P1.2 (`2913ca3`). Every `[constraint:…]` injection site stripped of imperative language; sensors still fire (constraint_fired journal events + hygiene counters) but model-visible text is facts + pointer framing only |
 | F04   | Six scattered loop sensors with tangled resets                                                    | applied   | P1.3 (`9feb9ed`) adds `kern/progress.py` — the ONE decision point per turn. Migration of all six counters into it is the P2 mechanical work |
 | F05   | Triple read-dedup at three inline points (`_ro_cache`, FileSlate, KnowledgeLedger)                | applied   | P1.1 (`251c801`) adds `kern/plane.py` facade with one `(text, meta, served_from)` response shape; migration of all three engine call sites to use the facade is the P2 mechanical work |
-| F06   | Token estimate inconsistency: context.estimate ÷3 vs pager.budget ÷4, neither calibrated            | pending  | kern/context.py, kern/pager.py |
+| F06   | Token estimate inconsistency: context.estimate ÷3 vs pager.budget ÷4, neither calibrated            | applied (P3.1 ONE calibrated estimator `259bc05`) | kern/context.py, kern/pager.py |
 | F07   | Naive episode selection: set(objective.lower().split()) substring matching                         | applied   | Fixed in P4.3 (`49f6727`): _bm25_rank via recall.tokenize, ONE episode capped 1200 chars + compact gist index; 8 tests |
 | F08   | `_with_mission_packet` internal mess — regex per call, `'g' in locals()`, possible adjacency break | applied   | Fixed in P4.2 (`52ab614`): module-level regexes, _safe_codegraph, single extraction, adjacency-safe fallback; latent dead-code stems bug found (CodeGraph.modules never existed) and fixed via new module_paths() API |
-| F09   | No tool-argument repair + fenced-mode full-schema dump                                             | pending  | kern/client.py   |
-| F10   | Fixed harness regardless of measured capability                                                   | pending  | kern/client.py, kern/engine.py |
-| F11   | Subagents don't inherit parent knowledge                                                          | pending  | kern/engine.py, kern/kernel.py |
-| F12   | Sequential execution of independent read-only calls                                               | pending  | kern/engine.py   |
-| F13   | `tool_read` outline-first dead code + double read                                                  | pending  | kern/syscalls.py |
-| F14   | Verify-receipt regex duplication: evidence_block + _review_completion                             | pending  | kern/context.py, kern/engine.py |
-| F15   | Injection pattern lists duplicated: syscalls._INJECTION_PATTERNS + journal._COMPACT_INJECTION_PATTERNS | pending  | kern/syscalls.py, kern/journal.py |
-| F16   | `_check_drift_and_staleness` convoluted counter                                                    | pending  | kern/engine.py   |
-| F17   | TUI inspector O(n) work per second (`_refresh_inspector`, `_ctx_info` → `materialize()`)            | pending  | kern/tui.py      |
-| F18   | Per-turn Engine construction in local modes (TUI KERN_LOCAL, gui.py)                               | pending  | kern/tui.py, kern/gui.py |
-| F19   | `supports_vision` defaults True for unknown models                                                 | pending  | kern/client.py   |
-| F20   | fsync-per-event cost (optional stretch item)                                                       | pending  | kern/journal.py  |
+| F09   | No tool-argument repair + fenced-mode full-schema dump                                             | applied (P3.3 `a288d0a` + P3.5 `87c17a6`) | kern/client.py   |
+| F10   | Fixed harness regardless of measured capability                                                   | applied (P3.1/P3.2/P3.4) | kern/client.py, kern/engine.py |
+| F11   | Subagents don't inherit parent knowledge                                                          | applied (P5.1 `58c7cbb`) | kern/engine.py, kern/kernel.py |
+| F12   | Sequential execution of independent read-only calls                                               | applied (P5.2 `58c7cbb`) | kern/engine.py   |
+| F13   | `tool_read` outline-first dead code + double read                                                  | applied (P6.4 `87c17a6`) | kern/syscalls.py |
+| F14   | Verify-receipt regex duplication: evidence_block + _review_completion                             | applied (P6.4 `87c17a6`) | kern/context.py, kern/engine.py |
+| F15   | Injection pattern lists duplicated: syscalls._INJECTION_PATTERNS + journal._COMPACT_INJECTION_PATTERNS | applied (P6.4 `87c17a6`) | kern/syscalls.py, kern/journal.py |
+| F16   | `_check_drift_and_staleness` convoluted counter                                                    | applied (P6.4 `87c17a6`) | kern/engine.py   |
+| F17   | TUI inspector O(n) work per second (`_refresh_inspector`, `_ctx_info` → `materialize()`)            | applied (P6.4 `87c17a6`) | kern/tui.py      |
+| F18   | Per-turn Engine construction in local modes (TUI KERN_LOCAL, gui.py)                               | applied (P6.2 `3171ccd`) | kern/tui.py, kern/gui.py |
+| F19   | `supports_vision` defaults True for unknown models                                                 | applied (verified: unknown models default False) | kern/client.py   |
+| F20   | fsync-per-event cost (optional stretch item)                                                       | deferred (stretch; fsync = durability backbone) | kern/journal.py  |
 
 Out-of-scope per directive §2.8: TUI/GUI rendering internals (except Engine
 construction / API consumption), web UI files, `auth.py`.
@@ -254,6 +254,29 @@ Remaining: pipeline.py middleware chain (dedup -> plane -> repeat-guard -> gates
 - P5.2 parallel read-only execution (58c7cbb): `LoopMixin._prewarm_readonly()` — maximal runs (≥2) of consecutive read-only calls execute concurrently (asyncio.gather over `_safe_call`→to_thread, Semaphore(4)) AHEAD of the sequential walk; every check, sensor, stream callback and journal record still fires in original call order (loop consumes prewarmed results by call index). `_PARALLEL_SAFE = {read, fetch, scrape, search, proc, exec}` ∩ `_is_read_only`; py (shared interpreter), memory/note/todo (state writes), subagent (blocking waits), mutations and malformed calls break a run and are never prewarmed. Implemented in loop.py (pipeline.py remains blocked, step 6). Engine-level test: 3 reads concurrent under fake slow FS, journal in order, no result cross-over.
 - P5.3 opt-in model routing (58c7cbb, default OFF, never automatic): `KERN_SUBAGENT_MODEL` routes spawned children; `KERN_FOLD_MODEL` routes episode folding (context.py). Documented in docs/ENVIRONMENT.md (together with `KERN_PROFILE` from P3.2). KERN_FOLD_MODEL routing is code-inspection + default-off verified (no functional fold test — fold() needs a full ContextEngine stub; documented here as the accepted gap).
 - tests/test_orchestration_p5.py: 20 tests. Suite: 761 passed.
+
+### Phase 6 (complete) — Consolidation, observability & release — 2026-09-23
+
+- P6.1 (serve.py dead-code deletion): **verified LIVE instead** — `Conn`/`handler` are referenced by `__main__.py` (the `kern serve` interface) and by `tests/test_serve_attach.py` + `tests/test_serve_control.py`. The directive mandated grep-verification first; that verification refuted finding F02 → no deletion (deleting would have broken the WebSocket interface).
+- P6.2 (`3171ccd`): Engine cached per session in TUI local mode + gui.py, mirroring daemon `worker._eng` — rebuild only on session change, in-place retarget on model change (same rule as `daemon.set_model`). Ends the per-turn loss of `_tools_cache`, `_ro_cache`, mounts and one-shot flags.
+- P6.3 (`87c17a6`): `/hygiene` TUI command + `kern doctor` section 6 — renders the latest session's hygiene counters (`measure.session_stats → hygiene_total`) with the absorbed-request share vs the Phase-0 baseline (~53% worst-case, LOOP_AUTOPSY.md). Measured **38%** on the overhaul session at release time (150 reads_absorbed + 107 slate_hits + 13 dedup_hits / 707 requests), breaker_fires 0. HELP text updated (/hygiene, /usage).
+- P6.4 (`87c17a6`): F13 tool_read outline-first ONE pass (line count + 30-line head collected together; two dead try/except blocks dropped); F14 VERIFY_RX_CMD/VERIFY_RX_OUT hoisted to context.py module constants shared with engine/review.py (were compiled per call in both modules); F15 `kern/injection.py` — ONE canonical scrub list, both former copies are import aliases (identity-tested); F16 drift sensor computes `_drift_score` once per call (was +1/throwaway-compute/-1-undo/recompute; identical firing asserted); F17 TUI inspector re-render signature-cached (`_insp_sig`). tests/test_polish_p64.py (12 tests).
+- P6.5 (`87c17a6`): version 0.5.0 in all THREE literals (pyproject.toml, kern/__init__._STATIC, kern/bootstrap._STATIC — test_release guards lockstep); CHANGELOG 0.5.0 entry; `kern doctor` run end-to-end; full suite **770 passed**.
+- F19 verified already-fixed (code inspection): `supports_vision` returns False for unknown models; the True default exists only for the empty-model unit-test compat path; the probe records measured capability.
+- F20 deferred deliberately: per-event journal fsync is the durability backbone (undo/rewind/crash recovery); batching risks losing events on crash against the reliability-first invariant. The directive flagged it as an optional stretch item.
+
+### §12 acceptance checklist — verification results (2026-09-23)
+
+1. **Suite green + named regressions** ✓ — 770 passed. loop classes → test_phase0_loop_autopsy.py; single injection → test_phase4_f01_single_injection.py; arg repair → test_arg_repair.py; calibration accuracy → test_calibration.py; parallel read-only ordering → test_orchestration_p5.py::test_parallel_reads_journal_in_order; quiet-result contract → test_plane.py + test_constraints.py quiet paths.
+2. **Fresh multi-step task** ◐ — this overhaul session ran live on the fixed harness (hot reload ON): 707+ requests, reads_absorbed 150, slate_hits 107, dedup_hits 13, knowledge_intercepts 37, breaker_fires 0, **zero unbounded re-read loops** (2 one-shot knowledge-loop warnings, bounded). The ≤75%-of-baseline ratio on a *comparable* task remains for operator measurement: this session's workload was the overhaul itself, not a task comparable to the 329-request phase-0 baseline audit.
+3. **Calibration within ±15% over 3 sessions** ◐ — estimator LIVE: 24 samples on the primary model (≥5 → measured ratio in use), 3 on the free variant (below minimum → conservative /3 fallback). Accuracy regression tests green; the formal 3-session sign-off accrues automatically from real usage events.
+4. **Small-model task without unfair force_plan stop** ◐ — mechanisms test-verified: plan-first gate bounded (≤2 rejections), safe-readonly exemption, profile-aware skip (P3.2), argument repair on (P3.3). A live small-model run needs the operator's provider/model choice; not executed to avoid spending against an unchosen model.
+5. **Big-model task, no interference, no artificial cap** ✓ — this session is the live evidence: no harness interference before first mutation beyond the todo nudge; output budget flows from the probed provider limit (`default_max_output_tokens` reads the health profile; fixed 8192 is fallback-only).
+6. **Undo / rewind / fork + legacy replay** ✓ — smoke-tested at the journal level after all overhaul changes (journal.py's only overhaul change is the F15 alias): `undo_to_last_user` trims correctly, `fork` carries events with a fresh id, `checkpoint` records, `Session` reload replays all events with valid kinds.
+7. **Safety greps** ✓ — sandbox default ON (`KERN_SANDBOX` default "1" + bwrap detection); approvals still gate execution (loop.py `ok = self.approve(desc, ...)` before `_safe_call`); web loopback-only (serve/daemon HOST default 127.0.0.1; web.py rejects non-local hostnames); token indirection untouched (kern/auth.py has NO overhaul commit); injection scrubbing unified with unchanged strength (identity + all-wrapper redaction tests).
+8. **Docs + memory** ✓ — this plan complete with per-phase reports; memory atom `overhaul-active` superseded by the OVERHAUL COMPLETE atom; KERN.md self-overhaul section marked complete; docs/ENVIRONMENT.md documents KERN_PROFILE / KERN_SUBAGENT_MODEL / KERN_FOLD_MODEL.
+
+Known gaps at release (honest state): Phase 2 step 6 (pipeline.py middleware chain) remains blocked-by-design (see below); §12 items 2-4 ratio/accuracy/live-small-model sign-offs need operator-run sessions on real tasks; the daemon reports STALE (0.4.0) until the operator restarts it — expected after a version bump, hot reload already serves 0.5.0 code.
 
 ## Open Questions / Blocked Items
 
