@@ -9,6 +9,62 @@ module-level helpers the loop needs are imported lazily inside
 
 
 class LoopMixin:
+    # P5.2: tools eligible for concurrent prewarm execution. Subset of the
+    # _is_read_only classifier minus tools with shared interpreter state
+    # ('py'), ledger/state writes ('memory', 'note', 'todo', 'spawn') and
+    # blocking waits ('subagent') — those stay strictly sequential.
+    _PARALLEL_SAFE = frozenset({"read", "fetch", "scrape", "search", "proc", "exec"})
+
+    async def _prewarm_readonly(self, calls: list) -> dict:
+        """P5.2: concurrently execute maximal runs (>=2) of read-only calls.
+
+        Returns {call_index: (text, meta)} fetched AHEAD of the sequential
+        loop. The loop's checks, sensors, stream callbacks and journal
+        records are untouched: they consume these results in original call
+        order. Mutations and malformed calls break a run and are never
+        prewarmed. Pool bounded at 4 concurrent executions. Fail-open: any
+        error yields fewer prewarmed results and the loop awaits normally.
+        """
+        out: dict = {}
+        import asyncio  # lazy: core.py imports this module at load time
+        from .core import _is_read_only  # lazy: circular at load time
+        try:
+            runs: list = []
+            cur: list = []
+            for idx, call in enumerate(calls or []):
+                name = str(call.get("name") or "")
+                if (not call.get("kern_error")
+                        and name in self._PARALLEL_SAFE
+                        and _is_read_only(name, call.get("arguments") or {})):
+                    cur.append((idx, name, call.get("arguments") or {}))
+                    continue
+                if len(cur) >= 2:
+                    runs.append(cur)
+                cur = []
+            if len(cur) >= 2:
+                runs.append(cur)
+            if not runs:
+                return out
+            sem = asyncio.Semaphore(4)
+
+            async def _one(i, n, a):
+                async with sem:
+                    return i, await self._safe_call(n, dict(a))
+
+            for run in runs:
+                results = await asyncio.gather(
+                    *(_one(i, n, a) for i, n, a in run),
+                    return_exceptions=True)
+                for r in results:
+                    if isinstance(r, BaseException):
+                        continue
+                    out[r[0]] = r[1]
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return out
+        return out
+
     async def _loop(self, max_steps: int | None = None) -> str:
         from .core import (FENCED_RE, _PY_READS_FILE_RE, _call_is_error, _dbg, _dbg_exc, _human_desc, _inspection_target, _is_read_only, _parse_xml_invoke, _repeat_key, _step_is_progress, _top_repeats, asyncio, constraints, health_of, inspect, invalidate_health, json, os, re, resilience, syscalls, time)  # noqa: E501,F401  deferred: core.py imports this module at load time (mixin split)
         self._nudged_empty = False
@@ -202,7 +258,16 @@ class LoopMixin:
             if notes and not calls:
                 continue   # mount/list results just landed; let the model act on them
 
-            for call in calls:
+            # P5.2: parallel read-only execution. Maximal runs (>=2) of
+            # consecutive read-only calls are fetched concurrently BEFORE the
+            # sequential walk; every check, sensor, stream callback and
+            # journal record below still fires in original call order — the
+            # loop just consumes prewarmed results instead of awaiting one by
+            # one. Mutations break a run and are never prewarmed. A blocked
+            # or intercepted read may thus have been fetched in vain: reads
+            # are side-effect-free, so the waste is bounded local I/O.
+            prewarmed = await self._prewarm_readonly(calls)
+            for call_idx, call in enumerate(calls):
                 name, args, cid = call["name"], dict(call["arguments"]), call["id"]
                 repeat_reason = args.pop('_kern_repeat_reason', '')
                 self.stream_cb("tool", json.dumps({"name": name, "arguments": args},
@@ -457,7 +522,10 @@ class LoopMixin:
                     # crash mid-call leaves a dangling intent the pager can
                     # flag as "uncertain — verify before retry".
                     self.session.emit("action", call_id=cid, name=name, arguments=args)
-                    text, meta = await self._safe_call(name, args)
+                    if call_idx in prewarmed:
+                        text, meta = prewarmed.pop(call_idx)
+                    else:
+                        text, meta = await self._safe_call(name, args)
                     text = syscalls.redact(str(text))
                     # Cache / invalidate. A successful read-only call is cached; a successful
                     # mutating call invalidates the whole cache (truth may have changed).

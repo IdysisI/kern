@@ -22,7 +22,7 @@ import hashlib
 import os
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -655,6 +655,78 @@ class KnowledgeLedger:
             # Truncate gracefully
             res = res[: max_chars - 30] + "\n...\n</knowledge-state>"
         return res
+
+    # ---- P5.1: parent<->child knowledge sharing ---------------------------
+
+    def spawn_digest(self, max_chars: int = 800) -> str:
+        """Bounded digest of held FILE knowledge for a spawned child.
+
+        Tells a same-tree child WHERE the parent's knowledge already lives
+        (files + held ranges + outlines) so it never re-reads what the parent
+        already holds. Content bodies are NOT included — the child requests
+        exact missing ranges and its own interception governs. Fail-open:
+        returns '' on any error.
+        """
+        try:
+            per_file: dict[str, list[str]] = {}
+            order: list[str] = []
+            for e in self.entries:
+                if e.source_kind == "outline":
+                    tag = "outline"
+                elif e.source_kind == "file_read":
+                    tag = e.coverage or "read"
+                else:
+                    continue
+                rel = self._rel(e.source_path)
+                if rel not in per_file:
+                    per_file[rel] = []
+                    order.append(rel)
+                if tag not in per_file[rel]:
+                    per_file[rel].append(tag)
+            if not order:
+                return ""
+            head = ("Parent already holds this file knowledge (do NOT re-read "
+                    "these ranges; request only what is missing):")
+            lines: list[str] = []
+            used = len(head)
+            for rel in order:
+                line = f"- {rel}: " + ", ".join(per_file[rel][:6])
+                if used + len(line) + 1 > max_chars:
+                    break
+                lines.append(line)
+                used += len(line) + 1
+            if not lines:
+                return ""
+            return head + "\n" + "\n".join(lines)
+        except Exception:
+            return ""
+
+    def merge_outlines(self, other) -> int:
+        """Adopt another ledger's OUTLINE entries (P5.1 merge-back).
+
+        Called by the parent when a child agent finishes in the SAME working
+        tree: the child's structural knowledge (file outlines) becomes the
+        parent's, so the parent never re-derives an outline the child already
+        paid for. Content bodies are never merged — outlines are metadata +
+        pointers, validated by file_sig at lookup time. Different cwd (child
+        ran in an isolated worktree) merges nothing. Fail-open.
+        """
+        if other is None or other is self:
+            return 0
+        try:
+            if str(getattr(self, "cwd", "")) != str(getattr(other, "cwd", "")):
+                return 0
+            adopted = 0
+            for e in list(getattr(other, "entries", [])):
+                if getattr(e, "source_kind", "") != "outline":
+                    continue
+                if e.content_hash in self.by_hash:
+                    continue
+                self._add_entry(replace(e))
+                adopted += 1
+            return adopted
+        except Exception:
+            return 0
 
     def _add_entry(self, entry: KnowledgeEntry) -> None:
         self.entries.append(entry)

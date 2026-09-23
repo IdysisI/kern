@@ -310,8 +310,12 @@ class SubagentsMixin:
                 return await result if inspect.isawaitable(result) else result
 
         from .core import Engine  # deferred: core imports this module (mixin)
+        # P5.3: opt-in model routing — KERN_SUBAGENT_MODEL runs children on a
+        # different model (e.g. a cheaper one). Default OFF: children inherit
+        # the parent's model. Operator choice only; never automatic tiering.
+        child_model = os.environ.get("KERN_SUBAGENT_MODEL", "").strip() or self.model
         child_engine = Engine(
-            self.client, self.model, child_session, child_cwd,
+            self.client, child_model, child_session, child_cwd,
             approve=child_approve, stream_cb=child_stream,
             subagent_depth=self.depth + 1
         )
@@ -319,11 +323,24 @@ class SubagentsMixin:
         prompt = task.strip()
         if context.strip():
             prompt += f"\n\n<context-from-parent>\n{context.strip()}\n</context-from-parent>"
+        # P5.1: same-tree children inherit a bounded (~800 char) digest of the
+        # parent's held file knowledge (files + ranges + outlines) so they
+        # don't re-read what the parent already holds. An isolated worktree
+        # has a different cwd — the digest would point at paths that differ
+        # there, so skip it.
+        if str(child_cwd) == str(self.cwd):
+            try:
+                _kd = getattr(self, "knowledge", None)
+                _digest = _kd.spawn_digest() if _kd is not None else ""
+            except Exception:
+                _digest = ""
+            if _digest:
+                prompt += f"\n\n<parent-knowledge>\n{_digest}\n</parent-knowledge>"
 
         entry = {
             "handle": hid,
             "task": task,
-            "model": self.model,
+            "model": child_model,
             "session": child_session,
             "engine": child_engine,
             "started": time.time(),
@@ -339,7 +356,7 @@ class SubagentsMixin:
 
         # Journal the subagent spawn: preserves handles across restarts and /resume
         self.session.emit("subagent_spawn", handle=hid, task=task,
-                          session_id=child_session.id, model=self.model,
+                          session_id=child_session.id, model=child_model,
                           max_steps=steps_cap, started=entry["started"])
 
         sem = _get_subagent_semaphore()
@@ -439,6 +456,16 @@ class SubagentsMixin:
                 entry["acquired"] = True
                 try:
                     reply = await child_engine.chat(prompt, max_steps=steps_cap)
+                    # P5.1: adopt the child's OUTLINE entries (structural
+                    # metadata only — never content bodies) when it ran in
+                    # the SAME working tree, so the parent never re-derives an
+                    # outline the child already paid for.
+                    if str(child_cwd) == str(self.cwd):
+                        try:
+                            self.knowledge.merge_outlines(
+                                getattr(child_engine, "knowledge", None))
+                        except Exception:
+                            pass
                     entry["completed"] = True
                     # Verify the result is real before accepting it (P6). A 502 mid-
                     # generation must not become the deliverable — salvage instead (F2).
@@ -456,7 +483,7 @@ class SubagentsMixin:
                     report_file = self.session.scratch / f"{hid}_report.md"
                     self.session.scratch.mkdir(parents=True, exist_ok=True)
                     report_file.write_text(
-                        f"# Subagent Report ({hid})\nTask: {task}\nModel: {self.model}\n"
+                        f"# Subagent Report ({hid})\nTask: {task}\nModel: {child_model}\n"
                         f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                         f"Requests: {child_engine.requests}\n\n{reply}"
                     )
@@ -506,7 +533,7 @@ class SubagentsMixin:
             task_obj = asyncio.create_task(run_subagent())
             entry["async_task"] = task_obj
             wt_note = f"\nIsolated worktree: {worktree} (child edits land there; merge or drop it when done)." if worktree else ""
-            msg = (f"started background subagent {hid} (session: {child_session.id}, model: {self.model}, max_steps: {steps_cap}): {task[:90]}\n"
+            msg = (f"started background subagent {hid} (session: {child_session.id}, model: {child_model}, max_steps: {steps_cap}): {task[:90]}\n"
                    f"The subagent is running asynchronously in the background — you can continue working.\n"
                    f"Use subagent(handle=\"{hid}\", action=\"status\"|\"logs\"|\"wait\"|\"cancel\") to check progress or retrieve the report.{wt_note}")
             return msg, {"handle": hid, "session_id": child_session.id, **({"worktree": worktree} if worktree else {})}

@@ -56,6 +56,9 @@ Until that script lands, this file is maintained manually.
 | Variable | Default | Where | What it does |
 |----------|---------|-------|--------------|
 | `KERN_MAX_OUTPUT_TOKENS` | `8192` (from profile) | `client.py` | Cap on tokens per model response. |
+| `KERN_PROFILE` | _(inferred)_ | `profiles.py` | Force a behavior profile: `minimal`, `standard`, `guided`. Default: inferred from the health probe (P3.2). |
+| `KERN_SUBAGENT_MODEL` | _(parent model)_ | `engine/subagents.py` | Opt-in: run spawned subagents on this model instead of the parent's (P5.3). Never automatic. |
+| `KERN_FOLD_MODEL` | _(session model)_ | `context.py` | Opt-in: run episode folding/compaction on this model instead of the session model (P5.3). Never automatic. |
 | `KERN_CONTEXT_TARGET` | *(unset)* | (context compaction) | Target token count when compacting. |
 | `KERN_CONTEXT_WINDOW` | *(unset)* | (context compaction) | Hard context window; compaction triggers above this. |
 | `KERN_FOLD_BUDGET` | *(unset)* | (fold liveness) | Max folds before forcing a checkpoint. |

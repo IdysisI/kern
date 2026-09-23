@@ -915,7 +915,11 @@ class ContextManager:
                 # indefinitely; only genuine silence for fold_stall seconds ends
                 # the chunk (TimeoutError -> retry pass -> abort, see below).
                 async with asyncio.timeout(fold_stall) as _wdog:
-                    async for chunk in e.client.stream_chat(e.model, [{'role':'user','text':prompt}],
+                    # P5.3: opt-in fold routing — KERN_FOLD_MODEL sends episode
+                    # folding to a different (e.g. cheaper) model. Default OFF:
+                    # folds run on the session model. Never automatic.
+                    _fold_model = os.environ.get('KERN_FOLD_MODEL', '').strip() or e.model
+                    async for chunk in e.client.stream_chat(_fold_model, [{'role':'user','text':prompt}],
                             system='You create attributed navigation notes for an agent journal. Output only JSON.',
                             tools=None, max_tokens=output_budget):
                         _wdog.reschedule(_time.monotonic() + fold_stall)
