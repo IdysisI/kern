@@ -42,7 +42,7 @@ from pathlib import Path
 # [project].version — tests/test_release.py::test_version_is_consistent
 # fails the build if they drift. (bootstrap cannot import kern/__init__:
 # __init__ imports bootstrap, hence the duplicated literal.)
-_STATIC = "0.4.0"
+_STATIC = "0.5.0"
 
 # Anchor file in the always-writable ~/.kern — survives read-only /home because
 # ~/.kern is its own rw bind-mount/subvolume on such systems.

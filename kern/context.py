@@ -197,6 +197,13 @@ def receipts(events):
     return rows
 
 
+# P6.4/F14: ONE verify-receipt regex pair, compiled once at import. Was
+# compiled per call here AND per review in engine/review.py (same pattern,
+# two sites, drift risk).
+VERIFY_RX_CMD = re.compile(r"pytest|unittest|cargo test|go test|npm test", re.I)
+VERIFY_RX_OUT = re.compile(r"\d+ passed|\bOK\b")
+
+
 def evidence_block(events, session):
     rows = receipts(events)
     unresolved = [r for r in rows if r['status'] == 'uncertain']
@@ -205,8 +212,8 @@ def evidence_block(events, session):
     # suite and reported a passing tally. These rows render with a ✓verify
     # marker and a header count, so the review-skip predicate and the model
     # can see at a glance which turns are confirmed by tests.
-    _verify_rx_cmd = re.compile(r"pytest|unittest|cargo test|go test|npm test", re.I)
-    _verify_rx_out = re.compile(r"\d+ passed|\bOK\b")
+    _verify_rx_cmd = VERIFY_RX_CMD
+    _verify_rx_out = VERIFY_RX_OUT
     verify_count = 0
     for r in rows:
         if r.get("name") != "exec":

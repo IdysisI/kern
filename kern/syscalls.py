@@ -245,38 +245,11 @@ def _is_binary_bytes(chunk: bytes) -> bool:
     return False
 
 
-# Audit finding #5.2: known prompt-injection patterns to scrub from any text
-# the model will read (fetched web pages, compacted summaries, note bodies).
-# Patterns are case-insensitive and DOTALL so <system>...inner stuff...</system>
-# including newlines is matched as one block.
-_INJECTION_PATTERNS = [
-    (re.compile(r"<system>.*?</system>", re.IGNORECASE | re.DOTALL),
-     "[redacted: <system> block]"),
-    (re.compile(r"<ip_reminder>.*?</ip_reminder>", re.IGNORECASE | re.DOTALL),
-     "[redacted: ip_reminder block]"),
-    (re.compile(r"<harness_hint>.*?</harness_hint>", re.IGNORECASE | re.DOTALL),
-     "[redacted: harness_hint block]"),
-    (re.compile(r"<assistant-hint>.*?</assistant-hint>", re.IGNORECASE | re.DOTALL),
-     "[redacted: assistant-hint block]"),
-    # Prose patterns like "[harness hint: 3 consecutive actions failed]" — these
-    # used to be jammed into tool_result text in older Kern versions.
-    (re.compile(r"\[harness hint:[^\]]*\]", re.IGNORECASE),
-     "[redacted: harness-hint prose]"),
-]
-
-
-def _scrub_injection(text: str) -> str:
-    """Strip known prompt-injection patterns from text the model will read.
-
-    Returns text with matched regions replaced by a neutral marker. The
-    marker preserves the *fact* that something was there (so the user
-    can see the model didn't just hallucinate it away) without leaking
-    the injection content.
-    """
-    out = text
-    for pat, repl in _INJECTION_PATTERNS:
-        out = pat.sub(repl, out)
-    return out
+# Audit finding #5.2 / overhaul P6.4-F15: the canonical pattern list and
+# scrub() live in kern/injection.py (they were duplicated verbatim in
+# journal.py — now one list, two importers, zero drift).
+from .injection import INJECTION_PATTERNS as _INJECTION_PATTERNS
+from .injection import scrub as _scrub_injection
 
 
 def _numbered(p: Path, offset: int, limit: int) -> str:
@@ -475,42 +448,38 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 400,
                 except Exception:
                     _already = False
             if (not _already) and suffix in _code_exts:
+                # P6.4/F13: ONE pass — count lines and collect the 30-line
+                # head preview together (was: a full counting pass plus a
+                # second open() for the head).
                 _total_lines = 0
+                _head = []
                 try:
                     with p.open("r", encoding="utf-8", errors="replace") as _f:
-                        for _line in _f:
-                            _total_lines += 1
+                        for _i, _ln in enumerate(_f, 1):
+                            _total_lines = _i
+                            if _i <= 30:
+                                _head.append(f"   {_i}\t{_ln.rstrip()}\n")
                 except Exception:
                     _total_lines = 0
+                    _head = []
                 if _total_lines > 1200:
-                    try:
-                        _rel = str(p)
-                        if _knowledge is not None and hasattr(_knowledge, "_rel"):
-                            try:
-                                _rel = _knowledge._rel(str(p))
-                            except Exception:
-                                _rel = str(p)
-                    except Exception:
-                        _rel = str(p)
+                    # P6.4/F13: dropped the dead outer try/except — the inner
+                    # lookup already fails open to str(p).
+                    _rel = str(p)
+                    if _knowledge is not None and hasattr(_knowledge, "_rel"):
+                        try:
+                            _rel = _knowledge._rel(str(p))
+                        except Exception:
+                            _rel = str(p)
                     _outline = "(outline unavailable)"
                     try:
                         from .codegraph import CodeGraph
                         _cg = CodeGraph(str(p.parent))
                         _outline = _cg.outline(_rel, max_items=40)
                     except Exception:
-                        try:
-                            _outline = "(codegraph unavailable)"
-                        except Exception:
-                            pass
-                    _head = []
-                    try:
-                        with p.open("r", encoding="utf-8", errors="replace") as _f:
-                            for _i, _ln in enumerate(_f, 1):
-                                if _i > 30:
-                                    break
-                                _head.append(f"   {_i}\t{_ln.rstrip()}\n")
-                    except Exception:
-                        pass
+                        # P6.4/F13: plain assignment cannot raise — the old
+                        # nested try/except around it was dead code.
+                        _outline = "(codegraph unavailable)"
                     msg = (
                         f"{res_prefix}[large unread file: {_rel} ({_total_lines} lines)\n"
                         f"Outline:\n{_outline}\n\n"

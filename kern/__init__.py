@@ -32,7 +32,7 @@ from pathlib import Path
 # hand-written. Must stay in lockstep with pyproject.toml [project].version
 # and kern/bootstrap._STATIC — tests/test_release.py fails the build if they
 # drift (bootstrap duplicates the literal because __init__ imports it).
-_STATIC = "0.4.0"
+_STATIC = "0.5.0"
 
 
 def _iter_py_files(pkg_dir: Path):

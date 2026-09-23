@@ -20,29 +20,12 @@ import hashlib
 from .storage import atomic_write, file_lock, path_key, redact_value
 from pathlib import Path
 
-# Audit finding #3.1: same pattern set as kern/syscalls.py:_scrub_injection.
-# Compacted summary/facts are inlined into every subsequent model context,
-# so any injection pattern in them would leak forever. Keep these in sync
-# with syscalls.py if new patterns are added there.
-_COMPACT_INJECTION_PATTERNS = [
-    (re.compile(r"<system>.*?</system>", re.IGNORECASE | re.DOTALL),
-     "[redacted: <system> block]"),
-    (re.compile(r"<ip_reminder>.*?</ip_reminder>", re.IGNORECASE | re.DOTALL),
-     "[redacted: ip_reminder block]"),
-    (re.compile(r"<harness_hint>.*?</harness_hint>", re.IGNORECASE | re.DOTALL),
-     "[redacted: harness_hint block]"),
-    (re.compile(r"<assistant-hint>.*?</assistant-hint>", re.IGNORECASE | re.DOTALL),
-     "[redacted: assistant-hint block]"),
-    (re.compile(r"\[harness hint:[^\]]*\]", re.IGNORECASE),
-     "[redacted: harness-hint prose]"),
-]
-
-
-def _scrub_compact_text(text: str) -> str:
-    out = text
-    for pat, repl in _COMPACT_INJECTION_PATTERNS:
-        out = pat.sub(repl, out)
-    return out
+# Audit finding #3.1 / overhaul P6.4-F15: canonical list + scrub() live in
+# kern/injection.py. Compacted summary/facts are inlined into every
+# subsequent model context, so any injection pattern in them would leak
+# forever — same guarantee, one implementation.
+from .injection import INJECTION_PATTERNS as _COMPACT_INJECTION_PATTERNS
+from .injection import scrub as _scrub_compact_text
 
 
 KERN_HOME = Path(os.path.expanduser(os.environ.get("KERN_HOME", "~/.kern")))

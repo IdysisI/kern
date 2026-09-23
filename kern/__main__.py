@@ -272,7 +272,34 @@ def _doctor():
         else:
             print(f'  ✓ up to date with repo')
 
-    # 6. Verdict + the fix
+    # 6. Hygiene snapshot (P6.3): latest session's loop-hygiene counters,
+    #    with the absorbed share vs the Phase-0 baseline (LOOP_AUTOPSY.md:
+    #    worst sessions ran ~53% of requests into absorbed hits).
+    try:
+        from pathlib import Path as _P
+        from .measure import session_stats, HYGIENE_KEYS
+        _home = _P(os.environ.get('KERN_HOME', str(_P.home() / '.kern')))
+        _logs = sorted((_home / 'sessions').glob('*/events.jsonl'),
+                       key=lambda q: q.stat().st_mtime)
+        if _logs:
+            _evs = [json.loads(l) for l in
+                    _logs[-1].read_text(encoding='utf-8').splitlines() if l.strip()]
+            _st = session_stats(_evs)
+            _ht = _st.get('hygiene_total') or {}
+            _req = int(_ht.get('requests', 0) or 0)
+            _abs = sum(int(_ht.get(k, 0) or 0) for k in
+                       ('reads_absorbed', 'slate_hits', 'dedup_hits'))
+            print(f'6. hygiene (latest session {_logs[-1].parent.name})')
+            for _k in HYGIENE_KEYS:
+                if _ht.get(_k):
+                    print(f'   {_k}: {_ht[_k]}')
+            _ratio = (_abs / _req * 100) if _req else 0.0
+            print(f'   absorbed share of requests: {_ratio:.0f}% '
+                  f'(phase-0 baseline: ~53% worst-case; lower is better)')
+    except Exception as _e:
+        print(f'6. hygiene: unavailable ({type(_e).__name__})')
+
+    # 7. Verdict + the fix
     print('\n' + '─' * 62)
     if not problems:
         print('✓ healthy: running repo code, in sync with disk, hot reload active')

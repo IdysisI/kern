@@ -16,7 +16,7 @@ class ReviewMixin:
         return evidence_block(events, self.session)
 
     async def _review_completion(self, final_text):
-        from ..context import receipts, evidence_block, estimate
+        from ..context import receipts, evidence_block, estimate, VERIFY_RX_CMD, VERIFY_RX_OUT
         # Opt-out for users who find the review noisy. Default ON: the review is a
         # safety feature — it drives missing verification (e.g. "said it wrote the
         # file but never read it back") even on write/edit turns. See test_core
@@ -35,8 +35,10 @@ class ReviewMixin:
         # review pass. Saves one request per verified turn. Opt-out via env.
         if os.environ.get("KERN_REVIEW_SKIP_IF_VERIFIED", "1") != "0":
             try:
-                _v_rx_cmd = re.compile(r"pytest|unittest|cargo test|go test|npm test", re.I)
-                _v_rx_out = re.compile(r"\d+ passed|\bOK\b")
+                # P6.4/F14: shared pair from context.py (was a second copy
+                # of the same regexes compiled per review call).
+                _v_rx_cmd = VERIFY_RX_CMD
+                _v_rx_out = VERIFY_RX_OUT
                 has_verify = any(
                     r.get("name") == "exec"
                     and r.get("status") == "succeeded"

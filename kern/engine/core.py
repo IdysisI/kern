@@ -586,15 +586,12 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
             if not open_items:
                 return text
             # drift: count consecutive calls with zero overlap
-            self._drift_zero = getattr(self, "_drift_zero", 0) + 1
-            if self._drift_score(name, args) == 0:
-                # counted above; but we need to compute first to know if 0
-                pass
-            # recompute cleanly
-            self._drift_zero -= 1   # undo the unconditional +1
+            # P6.4/F16: was an unconditional +1, a throwaway score call, a
+            # -1 undo, then a second score call + conditional +1 — now one
+            # clean compute; counters and firing behavior identical.
             score = self._drift_score(name, args)
             if score == 0:
-                self._drift_zero += 1
+                self._drift_zero = getattr(self, "_drift_zero", 0) + 1
                 if self._drift_zero >= 5 and not getattr(self, "_drift_fired_turn", False):
                     self._drift_fired_turn = True
                     self.hygiene["drift_notes"] += 1

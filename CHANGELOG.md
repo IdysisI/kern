@@ -2,6 +2,26 @@
 
 All notable changes to Kern are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.5.0] — 2026-09-22 (self-overhaul: kill the loop, capability-measured adaptation, orchestration)
+
+### Added
+- **`kern/profiles.py` (P3.2)**: capability-based behavior profiles (`minimal`/`standard`/`guided`) resolved from the health probe or `KERN_PROFILE`; gates the plan-first nudge, repeat-rationale injection and py/spawn gating. Pure lookup — zero added LLM requests.
+- **Adaptive tool descriptions (P3.4)**: `COMPACT_DESC` one-liners replace the verbose schema descriptions under the minimal profile (~2k tokens/turn saved for proven-capable models).
+- **Fenced-mode contract summary (P3.5)**: `kernel.FENCED_CONTRACT` is appended to the system prompt when the probe reports no native tool calling.
+- **Parent→child knowledge sharing (P5.1)**: same-tree spawns inherit a bounded (~800-char) digest of the parent's held file knowledge (`<parent-knowledge>`); on completion the parent adopts the child's OUTLINE entries (metadata only, never content bodies).
+- **Parallel read-only execution (P5.2)**: maximal runs (≥2) of consecutive read-only calls in one message execute concurrently (pool ≤4) ahead of the sequential walk; every check, sensor and journal record still fires in original call order. Mutations remain strictly sequential.
+- **Opt-in model routing (P5.3)**: `KERN_SUBAGENT_MODEL` and `KERN_FOLD_MODEL` — default OFF, operator choice, never automatic tiering.
+- **`/hygiene` TUI command + `kern doctor` hygiene section (P6.3)**: per-session loop-hygiene counters with the absorbed-request share vs the Phase-0 baseline (~53% worst-case).
+- **Calibration estimator (P3.1)**: measured bytes/token per model (running median in health.json) replaces the ÷3-vs-÷4 guesswork; `estimate_tokens()` is the ONE estimator.
+- **Tool-argument repair (P3.3)**: ONE deterministic pass rescues near-JSON arguments; otherwise the model gets exact parse position + raw snippet + tool schema + corrected-shape example (never fabricated values).
+
+### Changed
+- Engine decomposed into the `kern/engine/` package (core / loop / subagents / mounts / review / constraints) — behavior-identical moves plus a zero-behavior-change `mounts` extraction.
+- Provider HTML error pages classify as API errors (`stage=api`) instead of retryable transport noise.
+- P6.4 polish: single canonical injection-scrub list (`kern/injection.py`, was duplicated in syscalls + journal); verify-receipt regexes hoisted to shared `context.VERIFY_RX_*` constants (was compiled per call in two modules); `tool_read` outline-first path is one pass with dead try/except dropped; drift sensor computes its score once per call (was twice + a ±1 dance); TUI inspector re-render is signature-cached.
+- TUI + GUI cache the Engine per session (daemon `worker._eng` pattern) instead of rebuilding it every turn.
+- `serve.py` `Conn`/`handler` verified LIVE (`__main__` + tests reference them) — the planned P6.1 deletion was correctly skipped.
+
 ## [0.4.0] — 2026-09-21 (request-efficient agent loop, continuity control plane, Midnight Glass TUI)
 
 ### Added — Slate 2.0 (WP1)

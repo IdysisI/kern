@@ -1099,6 +1099,14 @@ class KernApp(App):
                     fresh = Session(self.session.id)
                     self.session.events = fresh.events
             events = self.session.events
+            # P6.4/F17: signature cache — this panel is O(events) per tick;
+            # skip the whole rebuild when nothing was appended (or changed)
+            # since the last render. Remote mode re-syncs events above, so
+            # the len/id signature catches fresh log parses too.
+            _sig = (len(events), id(events[-1]) if events else None, self.model)
+            if _sig == getattr(self, "_insp_sig", None):
+                return
+            self._insp_sig = _sig
             objective = next((e.get('text','') for e in reversed(events) if e['kind']=='objective'), 'New session')
             self.query_one('#work-objective').update(objective[:600])
             items = next((e['items'] for e in reversed(events) if e['kind']=='todo'), [])
@@ -2381,6 +2389,15 @@ class KernApp(App):
                     self._chat_error(f"context failed: {e}")
             else:
                 self._chat_note(str(budget(self.session.events, self.session)))
+        elif cmd == "/hygiene":
+            # P6.3: per-session hygiene counters — the anti-Goodhart
+            # dashboard (measure.py). Local mirror events in both modes.
+            from . import measure
+            _hs = measure.session_stats(self.session.events).get("hygiene_total") or {}
+            _rows = [f"{k}: {_hs.get(k, 0)}" for k in measure.HYGIENE_KEYS
+                     if _hs.get(k)]
+            self._chat_note("hygiene (this session)\n"
+                            + ("\n".join(_rows) if _rows else "all counters zero"))
         elif cmd == "/usage":
             u_in = getattr(getattr(self, "engine", None), "usage_in", self._usage_in)
             u_out = getattr(getattr(self, "engine", None), "usage_out", self._usage_out)
@@ -2507,6 +2524,7 @@ HELP = ("/model <name> · ctrl-p model picker · /probe re-handshake\n"
         "/restart save + full restart (daemon included), same session\n"
         "/fork [n] branch · /rewind <n> checkpoint · /undo last turn\n"
         "/context budget · /tools capability index · /history <query> · /clear screen\n"
+        "/hygiene loop-hygiene counters · /usage token/cost totals\n"
         "in-chat mounts: [mount: name] · [list capabilities] · [unmount: name]")
 
 
