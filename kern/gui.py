@@ -2113,10 +2113,20 @@ class KernWindow(QMainWindow):
         return bool(self._turn and not self._turn.done())
 
     def _engine(self) -> Engine:
-        return Engine(
-            self.client, self.model, self.session, self.cwd,
-            approve=self._approve, stream_cb=self._stream,
-        )
+        # P6.2: cache the Engine per session (mirrors daemon worker._eng).
+        # Rebuild only when the session changes; retarget in place when the
+        # model changes (same rule as daemon.set_model).
+        eng = getattr(self, "_eng", None)
+        if eng is None or eng.session is not self.session:
+            eng = Engine(
+                self.client, self.model, self.session, self.cwd,
+                approve=self._approve, stream_cb=self._stream,
+            )
+            self._eng = eng
+        elif eng.model != self.model:
+            eng.model = self.model
+            eng.forced_fenced = False
+        return eng
 
     def _approve(self, desc: str, diff: str | None = None) -> bool:
         """Synchronous — the engine calls this directly inside the turn."""

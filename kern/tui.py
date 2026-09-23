@@ -1762,8 +1762,19 @@ class KernApp(App):
     # ---- engine wiring ------------------------------------------------------
 
     def _engine(self) -> Engine:
-        return Engine(self.client, self.model, self.session, self.cwd,
-                      approve=self._approve, stream_cb=self._on_stream)
+        # P6.2: cache the Engine per session (mirrors daemon worker._eng).
+        # Rebuilding per turn threw away warm state (_tools_cache, _ro_cache,
+        # mounts, one-shot flags). Rebuild only when the session changes;
+        # retarget in place when the model changes (same rule as daemon).
+        eng = getattr(self, "_eng", None)
+        if eng is None or eng.session is not self.session:
+            eng = Engine(self.client, self.model, self.session, self.cwd,
+                         approve=self._approve, stream_cb=self._on_stream)
+            self._eng = eng
+        elif eng.model != self.model:
+            eng.model = self.model
+            eng.forced_fenced = False
+        return eng
 
     async def _approve(self, desc: str, diff: str | None = None) -> bool:
         if self._always:
