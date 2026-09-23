@@ -424,6 +424,13 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
         # the on-disk/on-system truth may have changed.
         self.aborting = False   # daemon hot-reload: suppress turn_end so the turn stays resumable
         self._ro_cache: dict = {}
+        # Phase 2 step 6: the unified read-side knowledge plane. The
+        # interception pipeline (engine/pipeline.py) consults the three
+        # read backends (ro_cache / fileslate / ledger) through this ONE
+        # facade instead of through five scattered engine attributes.
+        from ..plane import KnowledgePlane
+        self.plane = KnowledgePlane(cwd=cwd, fileslate=self.fileslate,
+                                    ledger=self.knowledge, ro_cache=self._ro_cache)
         self.subagents: dict[str, dict] = runtime["subagents"]
         self._approve_lock = asyncio.Lock()
         if not self.subagents:

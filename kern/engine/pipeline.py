@@ -182,8 +182,8 @@ class DedupStage(Stage):
                 ctx.ro_key = (ctx.name, json.dumps(ctx.args, sort_keys=True, default=str))
             except (TypeError, ValueError):
                 ctx.ro_key = None
-            if ctx.ro_key is not None and ctx.ro_key in eng._ro_cache:
-                text, meta = eng._ro_cache[ctx.ro_key]
+            if ctx.ro_key is not None and ctx.ro_key in eng.plane.ro_cache:
+                text, meta = eng.plane.ro_cache[ctx.ro_key]
                 _dbg(eng.session, "dedup.hit", tool=ctx.name, target=str(_inspection_target(ctx.name, ctx.args))[:60])
                 # Direction C: silent dedup. No hint text — just a
                 # short, structural pointer + meta marker so the
@@ -262,7 +262,7 @@ class ServeStage(Stage):
                 _kreason = None
             try:
                 _kpath = str(ctx.args.get("path", ""))
-                _koverlap = eng.knowledge.find_overlapping_read(
+                _koverlap = eng.plane.ledger.find_overlapping_read(
                     _kpath, ctx.args.get("offset", 1), ctx.args.get("limit", 400),
                 )
                 if (not _kforce) and _koverlap.status == "covered" and _koverlap.entry is not None:
@@ -328,7 +328,7 @@ class ServeStage(Stage):
                 pass
 
             try:
-                _sl = eng.fileslate.covered_slice(
+                _sl = eng.plane.fileslate.covered_slice(
                     ctx.args.get("path", ""), ctx.args.get("offset", 1),
                     ctx.args.get("limit", 400))
             except Exception:
@@ -345,7 +345,7 @@ class ServeStage(Stage):
                 _sl_key = ("slate", str(ctx.args.get("path", "")),
                            ctx.args.get("offset", 1), ctx.args.get("limit", 400))
                 _sl_n = eng._count_absorbed(_sl_key)
-                _sl_meta: dict = {"coverage": eng.fileslate.coverage(str(ctx.args.get("path", ""))) or None}
+                _sl_meta: dict = {"coverage": eng.plane.fileslate.coverage(str(ctx.args.get("path", ""))) or None}
                 if _sl_n >= 3:
                     _sl, _sl_nm = constraints.nullop_repeat(
                         eng.session, _sl_key, _sl_n, _sl)
