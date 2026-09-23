@@ -15,7 +15,7 @@ step (per directive §1.5).
 | 0     | Baseline & loop autopsy                            | done        | LOOP_AUTOPSY.md; tests/test_phase0_loop_autopsy.py committed RED (3 fail on axis B; 631 pre-existing pass); commit `31ec3ab` |
 | 1     | Kill the loop (highest impact)                     | done        | P1.1 facade `kern/plane.py` + 9 tests (commit `251c801`); P1.2 quiet results stripping F03 advice from 7 injection sites (commit `2913ca3`); P1.3 state machine `kern/progress.py` + 15 tests (commit `9feb9ed`); P1.4 regression test GREEN; suite 658 passed |
 | 2     | Engine decomposition (mechanical)              | in-progress | steps 1-5 + HTML-error fix (347419a, 53c06bc); suite 685 green; report 19027f2; step 6 pipeline.py blocked (see Open Questions) |
-| 3     | Capability-measured adaptation                     | not-started |       |
+| 3     | Capability-measured adaptation                     | done        | P3.1-P3.5 all landed; commit `1030188`; suite 741 green |
 | 4     | Context engine v2                                   | done        | P4.1 F01 FIXED (`5696fa8`); P4.2 F08 DONE (`52ab614`); P4.3 F07 BM25 episodes (`49f6727`); P4.4 KERN.md double-embed dedup (`0432148`, 4 tests); P4.5 verified as F01 side-effect. Suite 679 |
 | 5     | Orchestration & throughput                         | not-started |       |
 | 6     | Consolidation, observability & release             | not-started |       |
