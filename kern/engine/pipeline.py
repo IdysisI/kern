@@ -110,7 +110,7 @@ class PlanFirstGate(Stage):
     """Plan-first nudge for weak-tier models; also computes ctx.prior."""
 
     def handle(self, eng, ctx):
-        prior = eng._prior_execution(ctx.name, ctx.args)
+        ctx.prior = eng._prior_execution(ctx.name, ctx.args)
         # WP4: plan-first gate — weak-tier models get one nudge per
         # turn before mutating on a multi-step objective without a plan.
         # Advisory-first: the gate is a soft constraint that escapes
