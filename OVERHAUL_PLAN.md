@@ -17,7 +17,7 @@ step (per directive §1.5).
 | 2     | Engine decomposition (mechanical)              | in-progress | steps 1-5 + HTML-error fix (347419a, 53c06bc); suite 685 green; report 19027f2; step 6 pipeline.py blocked (see Open Questions) |
 | 3     | Capability-measured adaptation                     | done        | P3.1-P3.5 all landed; commit `1030188`; suite 741 green |
 | 4     | Context engine v2                                   | done        | P4.1 F01 FIXED (`5696fa8`); P4.2 F08 DONE (`52ab614`); P4.3 F07 BM25 episodes (`49f6727`); P4.4 KERN.md double-embed dedup (`0432148`, 4 tests); P4.5 verified as F01 side-effect. Suite 679 |
-| 5     | Orchestration & throughput                         | not-started |       |
+| 5     | Orchestration & throughput                         | done        | P5.1-P5.3 landed; commit `58c7cbb`; suite 761 green |
 | 6     | Consolidation, observability & release             | not-started |       |
 
 (Phase numbering kept verbatim from the directive so a reader can map this
@@ -247,6 +247,13 @@ Remaining: pipeline.py middleware chain (dedup -> plane -> repeat-guard -> gates
 - P3.2 profiles/intrusiveness (this commit): kern/profiles.py — capability-based behavior profiles (minimal/standard/guided). Profile resolved from health probe (native_tools + max_output_tokens) or KERN_PROFILE env override. Wired into core.py _tools() (plan_gate, spawn_gate, py_gate, repeat_rationale_eager) and _plan_first_gate(). No LLM request added. tests/test_profiles.py (21).
 - P3.4 adaptive tool descriptions (this commit): COMPACT_DESC dict in syscalls.py (15 one-liner descriptions); _tools() swaps full descriptions for compact ones when profile == "minimal", saving ~2k tokens/turn for proven capable models.
 - P3.5 fenced-mode contract summary (this commit): kernel.FENCED_CONTRACT appended to system prompt when health probe says native_tools=False; gives fenced-mode models a compact protocol reference without the full protocol block. tests/test_adaptive_tools.py (17).
+
+### Phase 5 (complete) — Orchestration & throughput — 2026-09-22
+
+- P5.1 parent→child knowledge sharing (58c7cbb): `KnowledgeLedger.spawn_digest()` — bounded (~800-char) digest of held file knowledge (files + ranges + outlines) appended to the child prompt as `<parent-knowledge>` when the child runs in the SAME working tree (isolated worktrees differ in cwd → skipped). `KnowledgeLedger.merge_outlines()` — on child chat completion the parent adopts the child's OUTLINE entries (structural metadata only, never content bodies; dedup by content_hash; cwd mismatch merges nothing; fail-open).
+- P5.2 parallel read-only execution (58c7cbb): `LoopMixin._prewarm_readonly()` — maximal runs (≥2) of consecutive read-only calls execute concurrently (asyncio.gather over `_safe_call`→to_thread, Semaphore(4)) AHEAD of the sequential walk; every check, sensor, stream callback and journal record still fires in original call order (loop consumes prewarmed results by call index). `_PARALLEL_SAFE = {read, fetch, scrape, search, proc, exec}` ∩ `_is_read_only`; py (shared interpreter), memory/note/todo (state writes), subagent (blocking waits), mutations and malformed calls break a run and are never prewarmed. Implemented in loop.py (pipeline.py remains blocked, step 6). Engine-level test: 3 reads concurrent under fake slow FS, journal in order, no result cross-over.
+- P5.3 opt-in model routing (58c7cbb, default OFF, never automatic): `KERN_SUBAGENT_MODEL` routes spawned children; `KERN_FOLD_MODEL` routes episode folding (context.py). Documented in docs/ENVIRONMENT.md (together with `KERN_PROFILE` from P3.2). KERN_FOLD_MODEL routing is code-inspection + default-off verified (no functional fold test — fold() needs a full ContextEngine stub; documented here as the accepted gap).
+- tests/test_orchestration_p5.py: 20 tests. Suite: 761 passed.
 
 ## Open Questions / Blocked Items
 
