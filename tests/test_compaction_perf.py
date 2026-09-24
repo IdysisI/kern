@@ -185,6 +185,11 @@ def test_large_journal_capped_macro_batches():
     compaction_notes = [t for t in e.notes if 'chunk' in t]
     assert compaction_notes, 'expected compaction progress events'
     for note in compaction_notes:
-        assert '65' not in note and '50' not in note, f'chunk count exploded: {note}'
+        # F-15 fix: check only the chunk-count portion, not the full note
+        # (random temp dir paths like /tmp/tmpm_50dw8l/ contain '50').
+        import re as _re
+        _chunk_nums = _re.findall(r'(\d+)/(\d+) chunks', note)
+        for _done, _total in _chunk_nums:
+            assert int(_total) <= 8, f'chunk count exploded: {_total} chunks in {note}'
     # Confirm emitted episode exists and was cleanly summarized
     assert e.session.emitted, 'no episode emitted'

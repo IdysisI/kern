@@ -241,7 +241,7 @@ def nullop_repeat(session: Any, target: Any, seen_n: int, text: str) -> tuple[st
 # ---------------------------------------------------------------------------
 
 
-_AUTO_PAGE_SIZE = 60  # lines
+# F-28: _AUTO_PAGE_SIZE deleted (was never referenced).
 
 
 def auto_paginate(session: Any, target: str, total_lines: int,
@@ -276,30 +276,14 @@ def auto_paginate(session: Any, target: str, total_lines: int,
 # ---------------------------------------------------------------------------
 # Site 6 — 5 consecutive read-only no progress (engine.py:1385).
 # Site 7 — 10 consecutive read-only no progress (engine.py:1389).
-# Old: appended two escalating text hints.
-# New: at rung 5, return a marker that flags the next tool call as a
-# forced think/ask_user (same gate as force_plan). At rung 10, hard-halt
-# the turn — return a meta that the engine honors by stopping the loop
-# with stop_reason="stalled".
+# F-19: escalate_inspection deleted. The old rung ladder emitted metas
+# that constraint_gate never enforced. The breaker (F-17) is the only stop.
 # ---------------------------------------------------------------------------
 
 
-def escalate_inspection(session: Any, rung: int, count: int,
-                         distinct: int, top_repeats: list[tuple[str, int]]) -> dict:
-    """Return a meta that the engine interprets at gate time."""
-    _log(
-        session,
-        f"escalate.rung{rung}",
-        count=count,
-        distinct=distinct,
-        top_repeats=top_repeats[:5],
-    )
-    return {
-        "constraint": f"escalate_rung{rung}",
-        "escalate_count": count,
-        "escalate_distinct": distinct,
-        "escalate_top": top_repeats[:5],
-    }
+# F-19: escalate_inspection deleted. Its metas (escalate_rung5/10/15) were
+# never enforced by constraint_gate (which only checks force_plan). The
+# escalation ladder is now the governor's rung structure (F-17).
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +466,6 @@ __all__ = [
     "suppress_repeat",
     "suppress_repeat_hard",
     "auto_paginate",
-    "escalate_inspection",
     "redact_py_file_reads",
     "log_breaker",
 ]

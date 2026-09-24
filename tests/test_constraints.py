@@ -76,12 +76,7 @@ class TestRedactPyFileReads(unittest.TestCase):
         self.assertEqual(meta, {})
 
 
-class TestEscalate(unittest.TestCase):
-    def test_rung5_emits_escalate_constraint(self):
-        meta = c.escalate_inspection(
-            None, rung=5, count=5, distinct=3, top_repeats=[("a", 3)]
-        )
-        self.assertEqual(meta.get("constraint"), "escalate_rung5")
+# F-19: TestEscalate deleted — escalate_inspection removed (inert metas).
 
 
 class TestForcePlan(unittest.TestCase):

@@ -188,7 +188,7 @@ async def test_blocked_write_does_not_count_as_inspection(tmp_path, monkeypatch)
     # The whole point: a blocked duplicate write must NOT trip the read-only breaker.
     assert not any("[kern circuit breaker" in str(ev.get("text", "")) for ev in s.events), \
         "blocked write must not fire the inspection breaker"
-    assert e.stop_reason != "stalled", \
+    assert e.stop_reason != "breaker", \
         f"blocked write must not stamp the turn 'stalled', got {e.stop_reason!r}"
 
 

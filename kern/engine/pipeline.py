@@ -101,7 +101,9 @@ class ConstraintGate(Stage):
                               text=gate["text"], status="rejected",
                               constraint=gate["meta"].get("constraint"))
             eng.stream_cb("result", gate["text"])
-            eng._last_constraint_meta = gate["meta"]  # keep gate active
+            # F-18: rejections do NOT re-arm the gate. The gate is disarmed by
+            # (a) any allowed call, (b) any successful mutation, or (c) turn end.
+            # Re-arming on rejection caused a hard-lock for the rest of the turn.
             eng._count_rejection(ctx.name, ctx.args)
             return INTERCEPTED
 

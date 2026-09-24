@@ -73,7 +73,7 @@ async def test_circling_with_interleaved_progress_is_caught(tmp_path, monkeypatc
     e, s = _mk_engine(tmp_path, monkeypatch, CirclingModel())
     await e.chat("find the bug", max_steps=60)
     texts = " ".join(str(ev.get("text", "")) for ev in s.events)
-    assert "[kern turn sensor" in texts or e.stop_reason == "stalled", (
+    assert "[kern turn sensor" in texts or e.stop_reason == "breaker", (
         "interleaved-progress circling must be caught by the turn-level sensor")
 
 
@@ -108,7 +108,7 @@ async def test_broad_distinct_research_is_not_halted(tmp_path, monkeypatch):
     e, s = _mk_engine(tmp_path, monkeypatch, BroadResearchModel())
     reply = await e.chat("survey every module", max_steps=40)
     assert reply == "finished the survey", f"broad research must complete, got {reply!r}"
-    assert e.stop_reason != "stalled", "distinct-target research must not be stalled"
+    assert e.stop_reason != "breaker", "distinct-target research must not be stalled"
 
 
 # ---------------------------------------------- the halt must be observable to the user
@@ -116,13 +116,13 @@ async def test_broad_distinct_research_is_not_halted(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_breaker_halt_is_visible_in_journal_and_stream(tmp_path, monkeypatch):
     """When the breaker halts a looping turn the user must see WHY: a journaled
-    note event plus a streamed note, and stop_reason='stalled'."""
+    note event plus a streamed note, and stop_reason='breaker'."""
     monkeypatch.setenv("KERN_INSPECTION_BREAK", "20")
     e, s = _mk_engine(tmp_path, monkeypatch, CirclingModel())
     streamed = []
     e.stream_cb = lambda kind, text: streamed.append((kind, text))
     await e.chat("find the bug", max_steps=60)
-    assert e.stop_reason == "stalled", f"looping turn not halted: {e.stop_reason}"
+    assert e.stop_reason == "breaker", f"looping turn not halted: {e.stop_reason}"
     notes = [str(ev.get("text", "")) for ev in s.events if ev.get("kind") == "note"]
     assert any("[kern circuit breaker" in t for t in notes), \
         f"no breaker note journaled; notes={notes[:3]}"

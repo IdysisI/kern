@@ -914,6 +914,14 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
         self._drift_fired_turn = False
         self._staleness_fired_turn = False
         self._calls_since_todo_change = 0
+        # F-20: reset ALL per-turn counters (were session-cumulative, tripping
+        # per-turn thresholds on fresh turns — e.g. starting at 17/20).
+        self._consecutive_inspections = 0
+        self._consecutive_errors.clear()
+        self._inspection_targets.clear()
+        self._run_targets.clear()
+        self._read_limit_hinted.clear()
+        self._last_inspection_target = None
         try:
             reply = await self._loop(max_steps=max_steps)
             reason = self.stop_reason

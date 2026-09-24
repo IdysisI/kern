@@ -90,7 +90,16 @@ class LoopMixin:
                            "```tool\n{\"name\": \"exec\", \"arguments\": {\"cmd\": \"pwd\"}}\n```"
                            "\nAvailable tool contracts:\n" + json.dumps(self._tools(include_fenced=True),ensure_ascii=False))
             from ..context import ContextManager
-            view = await ContextManager(self).prepare(system, tools)
+            # F-15: session-scoped ContextManager — prevents duplicate folds
+            # (fresh instance per step lost _fold_task/_fold_pending guards).
+            _rt = getattr(self.session, '_runtime', None)
+            if _rt is None:
+                self.session._runtime = _rt = {}
+            ctx = _rt.get("ctx")
+            if ctx is None or ctx.engine is not self:
+                ctx = ContextManager(self)
+                _rt["ctx"] = ctx
+            view = await ctx.prepare(system, tools)
 
             text_parts: list[str] = []
             calls: list[dict] = []
@@ -413,10 +422,12 @@ class LoopMixin:
                         )
                         meta = {**(meta or {}), **fp}
                     if len(self._consecutive_errors) >= 5:
+                        # F-21: use _last_inspection_target (always defined) instead
+                        # of `tgt` which is assigned later in the iteration.
                         constraints.log_breaker(
                             self.session,
                             count=len(self._consecutive_errors),
-                            last_target=str(tgt or "")[:60],
+                            last_target=str(self._last_inspection_target or "")[:60],
                             distinct=len(set(self._consecutive_errors)),
                             top_repeats=_top_repeats(self._consecutive_errors),
                         )
@@ -519,19 +530,9 @@ class LoopMixin:
                                 )
                                 meta = {**(meta or {}), **_ameta}
 
-                # Escalating ladder on consecutive inspection-without-progress.
-                # Direction C: silent meta. At rung 5/10 the gate hard-rejects
-                # non-think/ask_user calls; at rung 15 the breaker hard-halts.
-                ci = self._consecutive_inspections
-                if ci in (5, 10, 15):
-                    emeta = constraints.escalate_inspection(
-                        self.session,
-                        rung=ci,
-                        count=ci,
-                        distinct=len(self._inspection_targets),
-                        top_repeats=_top_repeats(self._inspection_targets),
-                    )
-                    meta = {**(meta or {}), **emeta}
+                # F-19: escalate_inspection deleted. Its metas (escalate_rung5/10/15)
+                # were never enforced by constraint_gate (which only checks force_plan).
+                # The breaker at rung 20 is the only effective stop.
 
                 _dbg(self.session, "breaker.tick", step=attempt, tool=name,
                      target=tgt, novel=novel,
@@ -669,6 +670,8 @@ class LoopMixin:
             # Instead of returning an empty halt, give the model ONE forced chance to
             # produce a useful answer from what it has already read — a weak model often
             # *has* the information and just needs to be told to stop probing and speak.
+            # F-17: breaker fires forced synthesis — the turn ALWAYS ends with
+            # a user-facing answer. No "stalled" stop reason, no bare return.
             break_at = int(os.environ.get("KERN_INSPECTION_BREAK", "20"))
             if self._consecutive_inspections >= break_at:
                 _dbg(self.session, "breaker.fire", consecutive=self._consecutive_inspections,
@@ -679,7 +682,7 @@ class LoopMixin:
                         "with no file changes, plan updates or delegation — the turn was looping on inspection.]")
                 self.session.emit("note", text=note)
                 self.stream_cb("note", note)
-                # Forced recovery: one final text-only directive, no further tool calls.
+                # Forced synthesis: one final text-only request, no further tool calls.
                 if not final_text:
                     try:
                         files = ", ".join(list(self._inspection_targets)[:8]) or "the files"
@@ -688,13 +691,13 @@ class LoopMixin:
                             f"Based on everything you have already read ({files}), respond in plain text now: "
                             "either (a) describe the concrete change you would make, or (b) state your findings "
                             "and the exact next step. Do not re-read anything.")
-                        self.session.emit("note", text=directive)
-                        # Build a view the normal way (system + prepared context), but with
-                        # tools=None so the model can only answer in text, and append the
-                        # directive as the final user message so it is the last thing seen.
+                        self.session.emit("nudge", text=directive)
                         from ..context import ContextManager
                         sys_text = self._system()
-                        view = await ContextManager(self).prepare(sys_text, None)
+                        # F-15: reuse session-scoped ContextManager
+                        _rt2 = getattr(self.session, '_runtime', None) or {}
+                        _ctx2 = _rt2.get("ctx") or ContextManager(self)
+                        view = await _ctx2.prepare(sys_text, None)
                         view = list(view) + [{"role": "user", "content": directive}]
                         recovery = ""
                         async for ev in self.client.stream_chat(self.model, view, system=sys_text, tools=None, max_tokens=self.output_budget):
@@ -707,9 +710,25 @@ class LoopMixin:
                             _dbg(self.session, "breaker.recovered", chars=len(recovery))
                     except Exception as e:
                         _dbg_exc(self.session, "breaker.recovery_failed", e)
-                self.stop_reason = "stalled"
-                return final_text or note
+                # F-17/F-23: never return empty. Fallback chain:
+                # forced synthesis → last assistant text → honest failure statement.
+                if not final_text:
+                    final_text = note
+                self.stop_reason = "breaker"
+                return final_text
 
         self.stop_reason = "step_limit"
         self.session.emit("note", text="Execution step limit reached; the task may be incomplete.")
+        # F-23: _loop never returns empty string. Fallback chain:
+        # last assistant text → deterministic synthesis → honest failure.
+        if not final_text:
+            # Try to recover the last non-empty assistant text from the journal.
+            for ev in reversed(self.session.events):
+                if ev.get("kind") == "assistant" and ev.get("text", "").strip():
+                    final_text = ev["text"].strip()
+                    break
+        if not final_text:
+            final_text = ("[kern: step limit reached without producing a final answer. "
+                          "The task may be incomplete. Review the execution evidence above "
+                          "for partial results.]")
         return final_text

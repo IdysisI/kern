@@ -498,7 +498,7 @@ class SubagentsMixin:
                     entry["completed"] = True
                     # Preserve a stall diagnosis set by the watchdog (it cancelled
                     # us); don't clobber it with a generic "cancelled".
-                    if not (entry.get("error") or "").startswith("stalled"):
+                    if not (entry.get("error") or "").startswith(("stalled", "breaker")):
                         entry["error"] = "cancelled"
                     self.session.emit("subagent_finish", handle=hid, result=None,
                                       report_path=None, error=entry["error"],

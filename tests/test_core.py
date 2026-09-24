@@ -409,7 +409,7 @@ async def test_inspection_circuit_breaker_halts_looping_turn(tmp_path, monkeypat
     s = create_session(str(tmp_path))
     e = Engine(LoopModel(), 'test', s, str(tmp_path))
     reply = await e.chat('restore the web UI')
-    assert s.events[-1]['kind'] == 'turn_end' and s.events[-1]['reason'] == 'stalled'
+    assert s.events[-1]['kind'] == 'turn_end' and s.events[-1]['reason'] == 'breaker'
     assert 'circuit breaker' in reply
     notes = [ev for ev in s.events if ev['kind'] == 'note']
     assert any('circuit breaker' in ev.get('text', '') for ev in notes)
