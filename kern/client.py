@@ -945,11 +945,11 @@ def _ir_to_anthropic(messages: list[dict], model: str = "") -> list[dict]:
     for m in messages:
         if m["role"] == "assistant" and m.get("tool_calls"):
             blocks = []
-            if m.get("thinking"):
-                tb = {"type": "thinking", "thinking": m["thinking"]}
-                if m.get("thinking_signature"):
-                    tb["signature"] = m["thinking_signature"]
-                blocks.append(tb)
+            # F-62: drop thinking block entirely when no signature is present.
+            # An unsigned thinking block is rejected by the Anthropic API (400).
+            if m.get("thinking") and m.get("thinking_signature"):
+                blocks.append({"type": "thinking", "thinking": m["thinking"],
+                               "signature": m["thinking_signature"]})
             if m.get("text"):
                 blocks.append({"type": "text", "text": m["text"]})
             blocks += [{"type": "tool_use", "id": tc["id"], "name": tc["name"],

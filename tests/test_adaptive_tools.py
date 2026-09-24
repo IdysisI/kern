@@ -107,17 +107,18 @@ class TestFencedContract:
         from kern.kernel import FENCED_CONTRACT
         assert "Tool Calling Protocol" in FENCED_CONTRACT
 
-    def test_fenced_contract_mentions_call_tool(self):
+    def test_fenced_contract_mentions_tool_json(self):
+        """F-60: contract now describes the ```tool JSON syntax the parser accepts."""
         from kern.kernel import FENCED_CONTRACT
-        assert "CALL_TOOL" in FENCED_CONTRACT
+        assert "```tool" in FENCED_CONTRACT
 
-    def test_fenced_contract_mentions_arg(self):
+    def test_fenced_contract_mentions_arguments(self):
         from kern.kernel import FENCED_CONTRACT
-        assert "ARG" in FENCED_CONTRACT
+        assert "arguments" in FENCED_CONTRACT
 
-    def test_fenced_contract_mentions_end_call(self):
+    def test_fenced_contract_mentions_json(self):
         from kern.kernel import FENCED_CONTRACT
-        assert "END_CALL" in FENCED_CONTRACT
+        assert "JSON" in FENCED_CONTRACT
 
     def test_fenced_contract_has_hard_rules(self):
         from kern.kernel import FENCED_CONTRACT
