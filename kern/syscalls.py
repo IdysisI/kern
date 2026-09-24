@@ -215,19 +215,34 @@ class FS:
         if self.cwd in (Path.home(), Path("/"), Path("/home")):
             return resolved, None
 
-        # Attempt unique fuzzy resolution within self.cwd for relative basenames
+        # F-44: bounded fuzzy resolution — depth 4, skip heavy dirs, cap 2000
+        # visited entries. The old unbounded rglob walked node_modules/.venv
+        # on every missing-path read (models do this often).
         target_name = raw_p.name
         if target_name and len(raw_p.parts) == 1 and not path.startswith(".."):
             matches = []
+            _SKIP = {".git", "__pycache__", "node_modules", ".venv", "venv",
+                     ".tox", ".mypy_cache", ".pytest_cache", "dist", "build",
+                     ".egg-info", ".eggs"}
+            _visited = 0
             try:
-                for candidate in self.cwd.rglob(target_name):
-                    parts = candidate.parts
-                    if any(part.startswith(".") or part in ("__pycache__", "venv", ".venv", "node_modules") for part in parts):
+                import os as _os
+                for root, dirs, files in _os.walk(str(self.cwd)):
+                    # Depth bound: max 4 levels below cwd
+                    rel_depth = root[len(str(self.cwd)):].count(_os.sep)
+                    if rel_depth >= 4:
+                        dirs.clear()
                         continue
-                    if candidate.is_file():
+                    # Prune skip dirs in-place
+                    dirs[:] = [d for d in dirs if d not in _SKIP and not d.startswith(".")]
+                    if target_name in files:
+                        candidate = Path(root) / target_name
                         matches.append(candidate)
                         if len(matches) > 3:
                             break
+                    _visited += len(files) + len(dirs)
+                    if _visited > 2000:
+                        break
             except Exception:
                 pass
             if len(matches) == 1:

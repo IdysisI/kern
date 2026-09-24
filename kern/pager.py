@@ -280,13 +280,16 @@ def materialize(events: list[dict], session) -> list[dict]:
         msgs.append({"role": "user",
                      "text": block + f"<session-summary covers=\"{compact_ev.get('covers', '?')}\">\n"
                              f"{compact_ev.get('text', '')}\n</session-summary>"})
+        # F-29: O(1) resolved-call_id set instead of O(n²) scan per action.
+        _resolved_cids: set = set()
+        for ev in events:
+            if ev["kind"] == "tool_result" and ev.get("call_id"):
+                _resolved_cids.add(ev["call_id"])
         # If any action across the whole session was interrupted mid-flight before
         # receiving its result, ensure the safety flag is preserved in context:
         for i, ev in enumerate(events):
             if ev.get("n", i) < cutoff_n and ev["kind"] == "action":
-                if not ev.get("reconciled") and not any(
-                        e.get("call_id") == ev.get("call_id") and e["kind"] == "tool_result"
-                        for e in events[i + 1:]):
+                if not ev.get("reconciled") and ev.get("call_id") not in _resolved_cids:
                     msgs.append({"role": "user",
                                  "text": f"<system-note>⚠ action '{ev.get('name', '?')}' "
                                          f"(call {ev.get('call_id')}) was dispatched but no "
@@ -305,7 +308,9 @@ def materialize(events: list[dict], session) -> list[dict]:
         objective = next((e.get('text','') for e in reversed(events) if e['kind']=='user'), '')
         ranked = _bm25_rank(episodes, objective)
         chosen = [ranked[0]] if ranked else []
-        index = session.offload('episode-index', __import__('json').dumps(episodes, ensure_ascii=False))
+        # F-33: no disk writes in the render path. The episode index is
+        # available via the journal itself (I1: journal is the only truth).
+        index = "(journal)"
         # compact index pointer: [start:end] + one-line gist each
         gists = []
         for ep in ranked:

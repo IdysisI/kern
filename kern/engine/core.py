@@ -636,6 +636,12 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
     # ---- capability index + mounts ----------------------------------------
 
     def _system(self) -> str:
+        # F-30: cache per turn — subprocess.run + git_env + MemoryTree on every
+        # step blocked the event loop and stalled other sessions in the daemon.
+        _cache = getattr(self, '_system_cache', None)
+        _turn = getattr(self, '_current_turn', -1)
+        if _cache is not None and _cache[0] == _turn:
+            return _cache[1]
         try:
             git = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
                                  capture_output=True, text=True, cwd=self.cwd, timeout=5,
@@ -661,7 +667,9 @@ class Engine(MountsMixin, SubagentsMixin, ReviewMixin, LoopMixin):
         h = health_of(self.model)
         if h and h.get("ok") and not h.get("native_tools", True):
             sys_text += "\n" + kernel.FENCED_CONTRACT
-        return sys_text + "\nPython interpreter: " + sys.executable
+        result = sys_text + "\nPython interpreter: " + sys.executable
+        self._system_cache = (_turn, result)
+        return result
 
     def _tools(self, include_fenced: bool = False) -> list[dict] | None:
         if self.forced_fenced and not include_fenced:

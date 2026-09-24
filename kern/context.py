@@ -545,7 +545,14 @@ class ContextManager:
                 for m in view
             )
             cache_key = ('mission_packet', src_n, repo_ctx_present)
-            cached = rt.get(cache_key)
+            # F-46: bounded LRU (8 entries) — the old unbounded dict grew
+            # one entry per user event over a long session.
+            _mp_cache = rt.setdefault('_mission_packet_lru', {})
+            if len(_mp_cache) > 8:
+                # Evict oldest half
+                for _k in list(_mp_cache.keys())[:4]:
+                    _mp_cache.pop(_k, None)
+            cached = _mp_cache.get(cache_key)
             # Always extract the source user text first (used for stable
             # insertion position even on cache hits).
             latest_user_text = ""
@@ -666,7 +673,7 @@ class ContextManager:
                 if len(inner) > cap:
                     inner = inner[:cap] + "\n...[truncated]"
                 block_text = f"<mission-context>\n{inner}\n</mission-context>"
-                rt[cache_key] = block_text
+                _mp_cache[cache_key] = block_text
                 block = block_text
             # insertion: before the LAST view message whose text equals the
             # source user text (fallback: before the first user message, or

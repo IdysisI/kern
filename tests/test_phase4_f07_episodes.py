@@ -169,11 +169,9 @@ def test_materialize_picks_relevant_episode_over_stopword_noise(tmp_path):
 
 
 def test_offload_index_still_resolvable(tmp_path):
-    """Invariant (§3.1): content-addressed scratch offloads keep every
-    historical pointer resolvable — the episode-index offload still
-    writes and the pointer in the block resolves to readable JSON."""
-    import json as _json
-    import os
+    """F-33: render() performs zero disk writes. Episode data is available
+    directly from the journal (I1). The rendered block contains the episode
+    content inline — no file pointer needed."""
     sess = _Sess(str(tmp_path))
     eps = [_ep("engine drift sensor work", n=1, start=10, end=20)]
     evs = _events_with_user("drift sensor", [
@@ -182,7 +180,7 @@ def test_offload_index_still_resolvable(tmp_path):
     msgs = materialize(evs, sess)
     ep_msgs = [m for m in msgs if "<historical-episodes" in str(m.get("text", ""))]
     text = str(ep_msgs[0].get("text", ""))
-    idx_path = text.split('index="')[1].split('"')[0]
-    assert os.path.exists(idx_path)
-    data = _json.loads(open(idx_path, encoding="utf-8").read())
-    assert data[0]["text"] == "engine drift sensor work"
+    # F-33: episode content is rendered inline from the journal, not via
+    # a disk offload. Verify the episode text is present in the block.
+    assert "engine drift sensor work" in text, (
+        f"episode content must be visible in rendered block; got: {text[:200]}")
