@@ -901,7 +901,15 @@ def _ir_to_openai(messages: list[dict], model: str = "") -> list[dict]:
                 if tc.get("extra_content"):
                     tc_obj["extra_content"] = tc["extra_content"]
                 tool_calls.append(tc_obj)
-            asst_msg = {"role": "assistant", "content": m.get("text") or None, "tool_calls": tool_calls}
+            # Thinking preservation: most OpenAI-compatible providers (vLLM,
+            # Qwen, etc.) strip `reasoning_content` on INPUT — they only emit it.
+            # If we only put thinking there, the model never sees its own prior
+            # reasoning and repeats itself. Fix: embed thinking in the visible
+            # content field so it survives the round-trip.
+            _content = m.get("text") or ""
+            if m.get("thinking"):
+                _content = f"<thinking>\n{m['thinking']}\n</thinking>\n\n{_content}".strip()
+            asst_msg = {"role": "assistant", "content": _content or None, "tool_calls": tool_calls}
             if m.get("thinking"):
                 asst_msg["reasoning_content"] = m["thinking"]
             out.append(asst_msg)
@@ -919,6 +927,11 @@ def _ir_to_openai(messages: list[dict], model: str = "") -> list[dict]:
                 out.append({"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["text"]})
         else:
             content = m.get("content", m.get("text", ""))
+            # Thinking preservation for plain assistant messages (no tool_calls):
+            # same fix as the tool-call branch — embed in visible content so
+            # providers that strip reasoning_content on input still see it.
+            if m.get("role") == "assistant" and m.get("thinking"):
+                content = f"<thinking>\n{m['thinking']}\n</thinking>\n\n{content}".strip()
             items = _media_items(m) if m.get("role") == "user" else []
             if items:
                 if supports_vision(model):

@@ -99,12 +99,15 @@ def test_thinking_retention_in_openai_and_anthropic():
         }
     ]
 
-    # OpenAI format preserves reasoning_content
+    # OpenAI format preserves reasoning_content AND embeds thinking in content
+    # (most providers strip reasoning_content on input, so the model would
+    # never see its prior reasoning without the content embedding).
     oai = _ir_to_openai(messages)
     assert len(oai) == 1
     assert oai[0]["role"] == "assistant"
     assert oai[0]["reasoning_content"] == "Thinking about step 1..."
-    assert oai[0]["content"] == "Done with step 1"
+    assert "<thinking>" in oai[0]["content"]
+    assert "Done with step 1" in oai[0]["content"]
     assert len(oai[0]["tool_calls"]) == 1
 
     # Anthropic format preserves thinking block with signature
