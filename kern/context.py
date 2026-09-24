@@ -314,10 +314,15 @@ class ContextManager:
         """The text to rank memory against: current user intent + objective."""
         last = getattr(self, '_last_user', '') or self._last_user_text(e)
         parts = [last]
+        # F-51: Session has no objective_text() method. Source the objective
+        # directly from the journal (I1: journal is the only truth).
         try:
-            obj = e.session.objective_text()
-            if obj and obj != last:
-                parts.append(obj)
+            for ev in reversed(getattr(e.session, 'events', [])):
+                if ev.get('kind') == 'objective' and ev.get('text'):
+                    obj = str(ev['text'])
+                    if obj and obj != last:
+                        parts.append(obj)
+                    break
         except Exception:
             pass
         return '\n'.join(p for p in parts if p).strip()

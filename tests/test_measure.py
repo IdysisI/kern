@@ -17,19 +17,21 @@ def test_session_stats_empty():
 
 
 def test_session_stats_counts_tool_calls_and_categories():
+    """F-52: session_stats uses the REAL journal kind vocabulary:
+    action, tool_result, constraint_fired, review, fold_abort, turn_end."""
     events = [
-        _ev("turn_start", n=1, ts=1000.0),
-        _ev("tool_call", n=2, tool="read"),
-        _ev("tool_call", n=3, tool="read"),
-        _ev("tool_call", n=4, tool="write"),
-        _ev("tool_call", n=5, tool="edit"),
-        _ev("tool_call", n=6, tool="exec"),
-        _ev("breaker", n=7),
-        _ev("approval", n=8),
+        _ev("turn_end", n=1, ts=1000.0),
+        _ev("action", n=2, name="read"),
+        _ev("action", n=3, name="read"),
+        _ev("action", n=4, name="write"),
+        _ev("action", n=5, name="edit"),
+        _ev("action", n=6, name="exec"),
+        _ev("constraint_fired", n=7),
+        _ev("review", n=8),
         _ev("turn_end", n=9, ts=1010.0),
     ]
     s = session_stats(events)
-    assert s["turns"] == 1
+    assert s["turns"] == 2
     assert s["tool_calls"] == 5
     assert s["read_requests"] == 2
     assert s["mutations"] == 2
@@ -55,9 +57,10 @@ def test_session_stats_sums_hygiene_counters():
 
 
 def test_session_stats_handles_aborted_and_tool_call_done():
+    """F-52: real journal kinds — action for tool calls, fold_abort for aborts."""
     events = [
-        _ev("tool_call_done", n=1, tool="write"),
-        _ev("aborted", n=2),
+        _ev("action", n=1, name="write"),
+        _ev("fold_abort", n=2),
     ]
     s = session_stats(events)
     assert s["tool_calls"] == 1

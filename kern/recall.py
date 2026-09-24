@@ -74,8 +74,12 @@ def tokenize(text: str) -> list[str]:
 
 
 def _norm_key(text: str) -> str:
-    """Canonical key for near-dup detection (anti-circularity)."""
-    return " ".join(tokenize(text))[:200]
+    """Canonical key for near-dup detection (anti-circularity).
+    F-59: sha1 of the full token stream — the old 200-char truncation
+    caused distinct long documents to collide and be dropped as duplicates."""
+    import hashlib
+    tokens = " ".join(tokenize(text))
+    return hashlib.sha1(tokens.encode("utf-8", "replace")).hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -252,17 +256,21 @@ def filter_against_context(candidates: list[tuple[Doc, float]],
     present in context (near-dup on normalized tokens) and cap per-source + total, so
     the agent's own recycled notes cannot feed back and cause loops (O1)."""
     ctx_keys = set()
-    ctx_norm = []
+    ctx_tokens_raw: list[str] = []  # F-59: raw tokens for blob/set (not hashes)
     for line in context_text.splitlines():
         k = _norm_key(line)
         if k:
             ctx_keys.add(k)
-            ctx_norm.append(k)
+        # Build blob from actual tokens, not sha1 hashes (F-59 broke substring
+        # matching when _norm_key started returning hex digests).
+        toks = tokenize(line)
+        if toks:
+            ctx_tokens_raw.append(" ".join(toks))
     # F-34: set-based token containment instead of O(n*m) substring blob scan.
     ctx_token_set: set[str] = set()
-    for _cn in ctx_norm:
+    for _cn in ctx_tokens_raw:
         ctx_token_set.update(_cn.split())
-    ctx_blob = " ".join(ctx_norm)  # kept for backward compat of substring checks
+    ctx_blob = " ".join(ctx_tokens_raw)
     # O1 containment threshold (env-tunable). A candidate is an "echo" only when
     # most of its *distinctive* content is already visible in the context.
     try:
@@ -273,7 +281,7 @@ def filter_against_context(candidates: list[tuple[Doc, float]],
     # sharing only common words with the context is NOT treated as an echo, while a
     # doc whose distinctive tokens are all already visible IS dropped.
     df: Counter = Counter()
-    for line in ctx_norm:
+    for line in ctx_tokens_raw:
         for t in set(line.split()):
             df[t] += 1
     cand_tok_sets = []
@@ -282,7 +290,7 @@ def filter_against_context(candidates: list[tuple[Doc, float]],
         cand_tok_sets.append(ts)
         for t in ts:
             df[t] += 1
-    n_docs = max(1, len(ctx_norm) + len(cand_tok_sets))
+    n_docs = max(1, len(ctx_tokens_raw) + len(cand_tok_sets))
     idf = {t: math.log(1 + n_docs / df[t]) for t in df}
     seen: set[str] = set()
     per_source: Counter = Counter()
