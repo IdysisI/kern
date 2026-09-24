@@ -258,7 +258,11 @@ def filter_against_context(candidates: list[tuple[Doc, float]],
         if k:
             ctx_keys.add(k)
             ctx_norm.append(k)
-    ctx_blob = " ".join(ctx_norm)
+    # F-34: set-based token containment instead of O(n*m) substring blob scan.
+    ctx_token_set: set[str] = set()
+    for _cn in ctx_norm:
+        ctx_token_set.update(_cn.split())
+    ctx_blob = " ".join(ctx_norm)  # kept for backward compat of substring checks
     # O1 containment threshold (env-tunable). A candidate is an "echo" only when
     # most of its *distinctive* content is already visible in the context.
     try:

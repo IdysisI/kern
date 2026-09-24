@@ -74,7 +74,27 @@ def detect_stack(root: Path) -> list[str]:
     """Detect languages/toolchains present (deterministic, filesystem only)."""
     root = Path(root)
     stack = []
-    if (root / 'pyproject.toml').is_file() or list(root.glob('**/*.py')):
+    # F-43: bounded check — stop at first .py hit, skip heavy dirs.
+    _has_py = (root / 'pyproject.toml').is_file()
+    if not _has_py:
+        _SKIP = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.tox', 'dist', 'build'}
+        for _p in root.iterdir():
+            if _p.name in _SKIP or _p.name.startswith('.'):
+                continue
+            if _p.suffix == '.py' and _p.is_file():
+                _has_py = True
+                break
+            if _p.is_dir():
+                try:
+                    for _sub in _p.iterdir():
+                        if _sub.suffix == '.py' and _sub.is_file():
+                            _has_py = True
+                            break
+                except OSError:
+                    pass
+            if _has_py:
+                break
+    if _has_py:
         stack.append('python')
     if (root / 'package.json').is_file():
         stack.append('node')
