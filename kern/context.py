@@ -995,7 +995,14 @@ class ContextManager:
         # The LLM summary above is a navigation aid (P2); this structured record
         # retains decisions/artifacts/open-threads/tool-errors verbatim so a lossy
         # summary can never drop a number, path, or error count.
-        structured = {'goal': getattr(self, '_last_user', '') or '',
+        # F-58: _last_user was never assigned. Source goal from the span's
+        # first user/objective event (the journal is the only truth, I1).
+        _goal = ''
+        for _ev in span:
+            if _ev.get('kind') in ('user', 'objective') and _ev.get('text'):
+                _goal = str(_ev['text'])[:200]
+                break
+        structured = {'goal': _goal,
                       'decisions': [], 'artifacts': [], 'open_threads': [],
                       'tool_errors': {}, 'event_span': [start, end]}
         try:

@@ -226,8 +226,8 @@ class MemoryTree:
                       f'topic="{topic}", key=<shared_key>) then forget the losers:')
         lines = [header]
         for r in current:
-            flag = '' if conflict else ''
-            lines.append(f"note:{r['id']}:{flag} {r['text']} [source:{r['source']}]")
+            # F-55: flag was always '' (dead ternary). Render cleanly.
+            lines.append(f"note:{r['id']} {r['text']} [source:{r['source']}]")
         if superseded:
             lines.append('Elided as duplicate/lower-rank (recoverable via history):')
             for r in superseded:

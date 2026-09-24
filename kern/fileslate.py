@@ -365,14 +365,14 @@ def quick_outline(path: str, max_syms: int = 40) -> str:
         src = p.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+    # F-50: codegraph.file_symbols does not exist. Use the session graph's
+    # outline() method instead, or fall through to the regex fallback below.
     try:
         from . import codegraph
-        syms = codegraph.file_symbols(p)
-        if syms:
-            out = []
-            for s in syms[:max_syms]:
-                out.append(f"L{s.get('line','?')} {s.get('kind','')} {s.get('name','')}")
-            return "\n".join(out)
+        _cg = codegraph.CodeGraph(str(p.parent))
+        _outline = _cg.outline(str(p.name), max_items=max_syms)
+        if _outline and _outline != "(no symbols found)":
+            return _outline
     except Exception:
         pass
     # regex fallback (any language): def/class/func/type + top-level consts

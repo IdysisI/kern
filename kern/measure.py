@@ -64,20 +64,22 @@ def session_stats(events: Iterable[dict]) -> dict:
                 first_ts = ts
             if last_ts is None or ts > last_ts:
                 last_ts = ts
-        if kind == "turn_start":
+        # F-52: use the REAL journal kind vocabulary (action, tool_result,
+        # constraint_fired, review, fold_abort, episode, hygiene, turn_end).
+        if kind == "turn_end":
             turns += 1
-        elif kind in ("tool_call", "tool_call_done"):
+        elif kind == "action":
             tool_calls += 1
-            tool = (ev.get("tool") or ev.get("name") or "").lower()
+            tool = (ev.get("name") or "").lower()
             if tool.startswith("read") or tool in {"fileslate"}:
                 read_requests += 1
             if tool in {"write", "edit", "move", "copy"}:
                 mutations += 1
-        elif kind == "breaker":
+        elif kind == "constraint_fired":
             breaker_fires += 1
-        elif kind in ("approval", "approval_request"):
+        elif kind == "review":
             approvals += 1
-        elif kind in ("aborted", "abortion"):
+        elif kind == "fold_abort":
             abortions += 1
         elif kind == "hygiene":
             for k in HYGIENE_KEYS:
