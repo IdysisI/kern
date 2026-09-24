@@ -347,11 +347,10 @@ class ContextManager:
         episodes = [x for x in e.session.events if x['kind'] == 'episode']
         cutoff = max((x['end'] for x in episodes), default=0)
         groups = [x['n'] for x in e.session.events if x['kind'] == 'assistant' and x['n'] >= cutoff]
-        # Step-count fallback scales with the window: tiny contexts fold early to
-        # stay incremental; large contexts must not amputate working memory every
-        # dozen steps (that reset loop is what made agents re-read the same files).
-        step_trigger = max(12, available // 2048)
-        if len(groups) > 4 and (size > target or len(groups) >= step_trigger):
+        # F-09: Fold ONLY on size pressure. The old step_trigger fired every
+        # 12 assistant messages regardless of context usage, amputating working
+        # memory 313× too early. (I5, §2 Link 1)
+        if len(groups) > 4 and size > target:
             keep = max(4, min(6, len(groups) // 3))
             end = groups[-keep]
             span = [x for x in e.session.events if cutoff <= x['n'] < end and x['kind'] != 'episode']

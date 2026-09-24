@@ -106,7 +106,10 @@ class Summarizer:
 
 
 @pytest.mark.asyncio
-async def test_incremental_episode_sources(tmp_path):
+async def test_incremental_episode_sources(tmp_path, monkeypatch):
+    # F-09: fold now triggers on SIZE pressure only (not step count).
+    # Set a low target so the fold fires with modest content.
+    monkeypatch.setenv('KERN_CONTEXT_TARGET', '100')
     s = create_session(str(tmp_path))
     e = Engine(Summarizer(),'fake',s,str(tmp_path))
     s.emit('user',text='preserve the special identifier ABC123')

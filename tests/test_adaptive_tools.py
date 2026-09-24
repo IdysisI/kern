@@ -37,13 +37,14 @@ class TestCompactDesc:
             assert len(desc) > 0, f"{name} desc is empty"
 
     def test_compact_shorter_than_full(self):
+        """F-14: full descriptions are now ≤120 chars; compact must be ≤ full."""
         from kern.syscalls import SCHEMAS, COMPACT_DESC
         for t in SCHEMAS:
             fn = t["function"]
             full = fn.get("description", "")
             compact = COMPACT_DESC[fn["name"]]
-            assert len(compact) < len(full), (
-                f"{fn['name']}: compact ({len(compact)}) not shorter than full ({len(full)})"
+            assert len(compact) <= len(full), (
+                f"{fn['name']}: compact ({len(compact)}) longer than full ({len(full)})"
             )
 
     def test_read_compact_mentions_full(self):

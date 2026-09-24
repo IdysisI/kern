@@ -336,11 +336,12 @@ def _session_with_slate(cwd):
 
 
 def test_tool_read_direct_dedup(tmp_path):
-    """A second tool_read of a held range returns a slate-hit, not disk."""
+    """F-03: tool_read no longer intercepts via fileslate — it reads disk.
+    Interception lives in the pipeline's ServeStage. Verify tool_read returns
+    actual content on both first and second read."""
     from kern import syscalls
-    # Use a larger file so the slate-hit's win is actually visible
     f = tmp_path / "f.py"
-    f.write_text("\n".join(f"line_{i:03d} = {i}" for i in range(1, 201)))  # 200 lines
+    f.write_text("\n".join(f"line_{i:03d} = {i}" for i in range(1, 201)))
     sess = _session_with_slate(str(tmp_path))
     fs = syscalls.FS(str(tmp_path))
 
@@ -349,14 +350,9 @@ def test_tool_read_direct_dedup(tmp_path):
     assert "line_001" in txt1
 
     txt2, meta2 = syscalls.tool_read(fs, "f.py", offset=1, limit=200, session=sess)
-    assert meta2.get("fileslate") == "hit", "second read must be slate-hit"
-    assert "fileslate hit" in txt2
-    # crucial: the slate-hit is much cheaper than the full body
-    body_len = len(txt1)
-    assert len(txt2) < body_len // 2, (
-        f"slate-hit text ({len(txt2)} bytes) must be cheaper than full body "
-        f"({body_len} bytes) — should be a pointer, not the body"
-    )
+    # F-03: no fileslate interception in tool_read — content returned directly
+    assert meta2.get("fileslate") != "hit", "F-03: tool_read reads disk, no slate interception"
+    assert txt2.strip() == txt1.strip(), "re-read returns identical content"
 
 
 def test_tool_edit_refreshes_slate(tmp_path):
@@ -369,9 +365,8 @@ def test_tool_edit_refreshes_slate(tmp_path):
     fs = syscalls.FS(str(tmp_path))
 
     syscalls.tool_read(fs, "f.py", session=sess)
-    # confirm held
+    # F-03: tool_read no longer returns fileslate hits — interception is in pipeline
     txt_check, meta_check = syscalls.tool_read(fs, "f.py", session=sess)
-    assert meta_check.get("fileslate") == "hit"
 
     # edit the file
     syscalls.tool_edit(fs, sess, "f.py", old_str="first = 1", new_str="FIRST = 99")
@@ -396,8 +391,8 @@ def test_tool_write_refreshes_slate(tmp_path):
     fs = syscalls.FS(str(tmp_path))
 
     syscalls.tool_read(fs, "f.py", session=sess)
+    # F-03: tool_read no longer returns fileslate hits
     _t, m = syscalls.tool_read(fs, "f.py", session=sess)
-    assert m.get("fileslate") == "hit"
 
     syscalls.tool_write(fs, sess, "f.py", "REPLACED\n")
     from kern.fileslate import FileSlate

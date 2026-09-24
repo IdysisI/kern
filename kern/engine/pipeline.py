@@ -247,6 +247,9 @@ class ServeStage(Stage):
         # is the fix for the measured re-read waste (343 reads of
         # one file across 269 slices in a single session).
         if ctx.name == "read":
+            # F-04: full=True is the documented escape hatch — never intercept.
+            if (ctx.args or {}).get("full"):
+                return None
             # --- KnowledgeLedger pre-acquisition interceptor (Continuity) ---
             # Stops redundant reads of unchanged content before they cost a request.
             try:

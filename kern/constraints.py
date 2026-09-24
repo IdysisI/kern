@@ -469,63 +469,9 @@ def log_breaker(session: Any, count: int, last_target: str, distinct: int,
 # ---------------------------------------------------------------------------
 
 
-_HEAD_SUMMARY_LIMIT = 4000  # chars; below this we don't summarize
-_HEAD_SUMMARY_KEEP_LINES = 30  # real content lines kept alongside the summary
-
-
-def head_summary(session: Any, path: str, text: str) -> tuple[str, dict]:
-    """For a `read` result with > 800 total lines, prepend a structural
-    summary and keep the first _HEAD_SUMMARY_KEEP_LINES real lines. Anything
-    beyond that is truncated with an explicit, honest notice — the body is
-    never silently discarded while the text claims otherwise.
-
-    WP2: only fires when the result header reports >800 lines. Smaller
-    files return verbatim. The explicit-slice gate (header showing fewer
-    lines than the file's total) stays.
-    """
-    hdr = re.search(r"\((\d+) lines,\s*showing\s+\d+-\d+\)", str(text))
-    if not hdr:
-        return text, {}
-    total_lines = int(hdr.group(1))
-    if total_lines <= 800:
-        return text, {}
-    # Cheap structural summary: pull Python `def`/`class` lines and their
-    # line numbers. This is language-agnostic for most agentic tasks
-    # (Python/JS/Go/Rust all use these keywords). For other languages we
-    # fall back to a "first 30 lines + total length" summary.
-    lines = text.splitlines()
-    sigs = []
-    for i, line in enumerate(lines, start=1):
-        stripped = line.lstrip()
-        if stripped.startswith(("def ", "class ", "function ", "fn ", "func ",
-                                "pub fn ", "async fn ", "export function ",
-                                "export const ", "export class ")):
-            sigs.append((i, stripped.rstrip()))
-    if sigs:
-        body = "\n".join(f"  L{i:>5}: {s[:80]}" for i, s in sigs[:40])
-        summary = (
-            f"[read_head summary: {path} — {len(text)} chars, "
-            f"{len(lines)} lines, {len(sigs)} top-level symbols]\n{body}\n"
-            f"[end summary; first {_HEAD_SUMMARY_KEEP_LINES} lines follow, "
-            f"rest truncated]\n\n"
-        )
-    else:
-        summary = (
-            f"[read_head summary: {path} — {len(text)} chars, {len(lines)} "
-            f"lines; first {_HEAD_SUMMARY_KEEP_LINES} shown, rest truncated. "
-            f"Use read(offset,limit) or grep to inspect specific sections.]\n\n"
-        )
-    keep = _HEAD_SUMMARY_KEEP_LINES
-    head_body = "\n".join(lines[:keep])
-    tail = ""
-    if len(lines) > keep:
-        tail = (
-            f"\n\n[... truncated: first {keep} of {len(lines)} lines shown. "
-            f"Use read(path, offset={keep + 1}, limit=M) for more — the full "
-            f"body is NOT included below.]"
-        )
-    _log(session, "head_summary.fire", path=path[:80], chars=len(text), sigs=len(sigs))
-    return summary + head_body + tail, {"constraint": "head_summary", "head_path": path}
+# F-05b: head_summary deleted. It replaced requested content with a symbol
+# list + 30 lines while the slate recorded the true 400, creating a
+# structural blind spot. Progressive disclosure is via map(action="outline").
 
 
 __all__ = [
@@ -539,5 +485,4 @@ __all__ = [
     "escalate_inspection",
     "redact_py_file_reads",
     "log_breaker",
-    "head_summary",
 ]

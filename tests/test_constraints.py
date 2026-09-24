@@ -19,29 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from kern import constraints as c  # noqa: E402
 
 
-class TestHeadSummary(unittest.TestCase):
-    def test_large_file_emits_constraint(self):
-        big = "\n".join(f"def fn_{i}(): pass" for i in range(300))
-        text, meta = c.head_summary(None, "f.py", big)
-        self.assertIn("read_head summary", text)
-        self.assertEqual(meta.get("constraint"), "head_summary")
-
-    def test_large_file_keeps_real_body_lines(self):
-        # Regression (2026-09-18 read-tool incident): head_summary used to
-        # discard the ENTIRE body while claiming 'full body follows'. It must
-        # keep the first _HEAD_SUMMARY_KEEP_LINES real lines and say
-        # 'truncated' honestly when the rest is dropped.
-        big = "\n".join(f"def fn_{i}(): pass" for i in range(300))
-        text, _meta = c.head_summary(None, "f.py", big)
-        self.assertIn("def fn_0(): pass", text)  # real first line present
-        self.assertIn("def fn_29(): pass", text)  # within the kept window
-        self.assertIn("truncated", text)
-        self.assertNotIn("full body follows", text)  # the lie is gone
-
-    def test_small_file_passes_through(self):
-        text, meta = c.head_summary(None, "s.py", "small")
-        self.assertEqual(text, "small")
-        self.assertEqual(meta, {})
+# F-05b: TestHeadSummary deleted — head_summary function removed.
 
 
 class TestAutoPaginate(unittest.TestCase):
@@ -58,19 +36,7 @@ class TestAutoPaginate(unittest.TestCase):
         self.assertEqual(meta.get("auto_paginate_next_offset"), 401)
 
 
-class TestHeadSummary(unittest.TestCase):
-    def test_silent_on_500_line_file(self):
-        # WP2: head_summary fires only when total lines > 800.
-        body = "/x.py  (500 lines, showing 1-500)\n" + ("\n".join(f"  l{i}" for i in range(500)))
-        text, meta = c.head_summary(None, "/x.py", body)
-        self.assertEqual(text, body)
-        self.assertEqual(meta, {})
-
-    def test_fires_on_1000_line_file(self):
-        body = "/x.py  (1000 lines, showing 1-1000)\n" + ("\n".join(f"  l{i}" for i in range(1000)))
-        text, meta = c.head_summary(None, "/x.py", body)
-        self.assertNotEqual(text, body)
-        self.assertIn("read_head summary", text)
+# F-05b: TestHeadSummary (WP2) deleted — head_summary function removed.
 
 
 class TestMarkDedup(unittest.TestCase):

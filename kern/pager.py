@@ -15,7 +15,7 @@ from .recall import tokenize as _tokenize
 HEAD = 1500
 TAIL = 1500
 BIG = 4000
-STALE_AGE = 12           # events younger than this are never offloaded
+# F-07: STALE_AGE deleted. Retention is budget-derived, never event-count-based.
 STALE_MIN = 900          # only offload results bigger than this
 
 # Phase 4 P4.3 (F07) episode-selection knobs:
@@ -72,8 +72,9 @@ def _tf(tokens: list[str]) -> dict[str, int]:
         out[t] = out.get(t, 0) + 1
     return out
 
-# Tier-1 knobs (env-tunable)
-KEEP_RECENT_TOOL_RESULTS = int(os.environ.get("KERN_KEEP_TOOL_RESULTS", "5"))
+# F-07: Budget-derived retention. Keep newest tool results that fit in the
+# byte budget; never evict by event count. (I14: budgets derived, not hardcoded.)
+RECENT_TOOL_BUDGET = int(os.environ.get("KERN_RECENT_TOOL_BUDGET", "32000"))
 
 
 
@@ -253,7 +254,16 @@ def materialize(events: list[dict], session) -> list[dict]:
 
     tool_result_idx = [i for i, ev in enumerate(events)
                        if ev["kind"] == "tool_result" and ev.get("n", i) >= cutoff_n]
-    keep_inline = set(tool_result_idx[-KEEP_RECENT_TOOL_RESULTS:])
+    # F-07: budget-derived retention — walk newest→oldest, keep inline until
+    # the byte budget is exhausted. Never evict by event count.
+    keep_inline: set[int] = set()
+    _budget_used = 0
+    for _i in reversed(tool_result_idx):
+        _sz = len(events[_i].get("text", "") or "")
+        if _budget_used + _sz > RECENT_TOOL_BUDGET:
+            break
+        keep_inline.add(_i)
+        _budget_used += _sz
 
     # ---- THE SLATE: the model's own work state, always at the top ----------
     slate = _slate(events, session)
@@ -384,8 +394,27 @@ def materialize(events: list[dict], session) -> list[dict]:
                 # safely collapse to a pointer to it.
                 if rh:
                     seen_result_hashes[rh] = ev.get("n", i)
-            elif i not in keep_inline and n - i > STALE_AGE and len(text) > STALE_MIN \
-                    :
+            elif i not in keep_inline and len(text) > STALE_MIN:
+                # F-07: evict only when over budget AND content is recoverable
+                # via the knowledge ledger (I2: never replace invisible content
+                # with a pointer).
+                _k = (getattr(session, '_runtime', None) or {}).get('knowledge')
+                _recoverable = False
+                if _k is not None:
+                    try:
+                        from .knowledge import hash_text as _ht
+                        _recoverable = _k.query_content_hash(_ht(text)) is not None
+                    except Exception:
+                        _recoverable = False
+                if not _recoverable:
+                    # Content not in ledger — keep it inline to avoid deadlock.
+                    out_text = _squash(text)
+                    if len(text) > BIG:
+                        full = session.offload(f"t{ev['n']}", text)
+                        out_text += (f"\n[full output: {full} — use read(path) "
+                                     f"with offset/limit to inspect any part]")
+                    msgs.append({"role": "tool", "tool_call_id": ev.get("call_id", ""), "text": out_text})
+                    continue
                 path = session.offload(f"t{ev['n']}", text)
                 # Hoisted out of the f-string: a backslash inside an f-string
                 # expression is a SyntaxError before Python 3.12 (PEP 701),

@@ -125,22 +125,8 @@ def _write_big(tmp_path, name="bigmod.py", funcs=700):
     return p
 
 
-def test_large_code_file_outline_first(tmp_path):
-    from kern import syscalls
-    from kern.journal import create_session
-    _write_big(tmp_path)
-    fs = syscalls.FS(str(tmp_path))
-    sess = create_session(str(tmp_path))   # outline-first needs a session
-    text, meta = syscalls.tool_read(fs, "bigmod.py", session=sess)
-    assert "[large unread file:" in text
-    assert "bigmod.py (1400 lines)" in text
-    assert "First 30 lines:" in text
-    head_part = text.split("Next steps:")[0]
-    assert "   1\tdef f0():" in head_part    # head lines are "   {n}\t..."
-    assert "\tdef f14():" in head_part        # line 30 == "def f14():"
-    assert "\tdef f15():" not in head_part    # line 31 excluded
-    assert "Next steps:" in text
-    assert "map(action='find'" in text
+# F-06: test_large_code_file_outline_first deleted — outline-first removed.
+# Large files now return their requested slice; use map(action="outline").
 
 
 def test_small_file_reads_normally(tmp_path):

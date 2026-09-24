@@ -79,8 +79,9 @@ def test_slate_hit_resets_inspection_counter():
 
 
 def test_slate_hit_text_carries_pointer_not_body():
-    """The slate-hit message must be cheap (a pointer), not the full body.
-    This is the structural payoff: re-reads cost ~30 tokens, not ~600."""
+    """F-03: tool_read no longer intercepts via fileslate — it reads disk.
+    Interception lives in the pipeline's ServeStage. This test verifies
+    tool_read returns actual content on re-read (the model gets bytes)."""
     from kern import syscalls
     import tempfile
     f = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
@@ -95,9 +96,8 @@ def test_slate_hit_text_carries_pointer_not_body():
 
     txt1, m1 = syscalls.tool_read(fs, os.path.basename(f.name), offset=1, limit=100, session=sess)
     assert m1.get("fileslate") != "hit"
+    # F-03: second read also returns content (no fileslate interception in tool_read)
     txt2, m2 = syscalls.tool_read(fs, os.path.basename(f.name), offset=1, limit=100, session=sess)
-    assert m2.get("fileslate") == "hit"
-    # Pointer must be much cheaper than the body
-    assert len(txt2) < len(txt1) // 2, (
-        f"slate-hit ({len(txt2)} chars) should be < half the body ({len(txt1)} chars)"
-    )
+    assert m2.get("fileslate") != "hit", "F-03: tool_read no longer returns fileslate hits"
+    # Content should be byte-identical (same file, same range)
+    assert txt2.strip() == txt1.strip(), "re-read returns same content"

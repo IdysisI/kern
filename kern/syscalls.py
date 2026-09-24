@@ -58,7 +58,7 @@ COMPACT_DESC: dict[str, str] = {
 SCHEMAS = [
     {"type": "function", "function": {
         "name": "read",
-        "description": "Read a file (numbered lines). Default: first 400 lines; full=true returns the whole file when ≤2000 lines — PREFER full=true for files under ~800 lines (one call beats five slices). Use offset/limit only after map(outline) or grep located what you need. NEVER re-read a range listed in <file-state> or marked held in a [coverage:] line — it is byte-identical and already known to you.",
+        "description": "Read a file (numbered lines). full=true for whole file ≤2000 lines; offset/limit for slices.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"},
             "offset": {"type": "integer", "description": "first line, 1-based (default 1)"},
@@ -67,13 +67,13 @@ SCHEMAS = [
             "required": ["path"]}}},
     {"type": "function", "function": {
         "name": "write",
-        "description": "Create a file or fully rewrite it. To change part of an existing file use edit instead — never rewrite a whole file to change a few lines.",
+        "description": "Create or fully rewrite a file. Use edit for partial changes.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}, "content": {"type": "string"}},
             "required": ["path", "content"]}}},
     {"type": "function", "function": {
         "name": "edit",
-        "description": "Replace an exact unique string (or a checked line range). The receipt includes the fresh post-edit region with line numbers — do NOT re-read the file to verify the edit; the receipt shows it. If old_str fails, re-read ONLY the small region around the target, not the whole file.",
+        "description": "Replace an exact unique string (or checked line range) in a file.",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string"}, "old_str": {"type": "string"}, "new_str": {"type": "string"},
             "start_line": {"type": "integer", "description": "first line to replace (1-based)"},
@@ -82,7 +82,7 @@ SCHEMAS = [
             "required": ["path", "old_str", "new_str"]}}},
     {"type": "function", "function": {
         "name": "exec",
-        "description": "Run a shell command in the project dir. Batch related steps into ONE command with && when they must run in order. Use background=true + proc() for anything that may exceed 60s (test suites, dev servers). Do NOT use cat/head/tail/sed to read files — use read(); file bytes in exec output are redacted.",
+        "description": "Run a shell command. background=true for long-running. Batch with &&.",
         "parameters": {"type": "object", "properties": {
             "cmd": {"type": "string"},
             "timeout": {"type": "integer", "description": "seconds, default 60"},
@@ -90,7 +90,7 @@ SCHEMAS = [
             "required": ["cmd"]}}},
     {"type": "function", "function": {
         "name": "proc",
-        "description": "Manage a background process started with exec(background=true).",
+        "description": "Manage a background process (logs/status/kill).",
         "parameters": {"type": "object", "properties": {
             "handle": {"type": "string"},
             "action": {"type": "string", "enum": ["logs", "status", "kill"]},
@@ -98,28 +98,28 @@ SCHEMAS = [
             "required": ["handle", "action"]}}},
     {"type": "function", "function": {
         "name": "fetch",
-        "description": "Fetch a URL and return clean readable text (html stripped). For docs, articles, references.",
+        "description": "Fetch a URL, return clean text.",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"},
             "max_chars": {"type": "integer", "description": "default 12000"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "search",
-        "description": "Search the web. Returns ranked results (title, url, snippet). Follow up with scrape() on promising URLs to read their full content. For deep research: set a high limit (50+) and run several searches with differently-phrased queries to cover a topic from multiple angles.",
+        "description": "Web search. Returns title/url/snippet.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"},
             "limit": {"type": "integer", "description": "max results, default 5, no cap — forwarded to the search service"}},
             "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "scrape",
-        "description": "Scrape a web page into clean markdown through a multi-stage extraction pipeline (direct, browser rendering, anti-bot fallback). More robust than fetch() for JS-heavy or protected pages; use fetch() for simple static URLs.",
+        "description": "Scrape a web page into markdown (multi-stage pipeline).",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"},
             "max_chars": {"type": "integer", "description": "default 12000, cap 60000"}},
             "required": ["url"]}}},
     {"type": "function", "function": {
         "name": "memory",
-        "description": "Query/annotate this project's persistent memory. Query it ONLY when the current task plausibly benefits from a past session on this same project (a small auto-surfaced recall block is already injected per turn; this tool is for deeper lookups). Actions: outline (index), search(pattern), read(path=note:<id>), remember(text, topic, key) for durable facts, write(path, content) for project.md/atoms/scenarios, forget(pattern) to tombstone stale facts (use dry_run=true first to preview matches), reconcile(topic) to get active ground truth (drops superseded/deleted), history(pattern) for exact prior events.",
+        "description": "Query/annotate project persistent memory.",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["outline", "search", "read", "remember", "write", "forget", "reconcile", "history"],
                        "description": "reconcile: return active ground truth for a topic without superseded or deleted facts"},
@@ -131,7 +131,7 @@ SCHEMAS = [
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "map",
-        "description": "Zero-cost structural repo index (no model). Call map(outline=path) BEFORE reading any file you have not seen this session; use find/callers/deps instead of grep when looking for a symbol.",
+        "description": "Structural repo index: map/outline/find/callers/deps/dependents.",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["map", "outline", "find", "callers", "deps", "dependents"]},
             "path": {"type": "string", "description": "repo-relative file, for outline/deps"},
@@ -139,14 +139,14 @@ SCHEMAS = [
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "py",
-        "description": "Run Python in a persistent interpreter (variables/imports survive between calls). One py() call can loop over hundreds of files and print a summary — always prefer ONE py() over many read/exec calls for bulk or repetitive work.",
+        "description": "Run Python in a persistent interpreter.",
         "parameters": {"type": "object", "properties": {
             "code": {"type": "string"},
             "timeout": {"type": "integer", "description": "seconds, default 60, max 300"}},
             "required": ["code"]}}},
     {"type": "function", "function": {
         "name": "note",
-        "description": "Record CONCLUSIONS (anchors found, root causes, decisions), not plans. Notes are re-injected every step and survive compaction — a recorded conclusion is never re-derived, so you never re-read a file 'to remember'.",
+        "description": "Record conclusions (anchors, root causes, decisions).",
         "parameters": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["add", "drop", "list"]},
             "text": {"type": "string", "description": "the finding, one line (add)"},
@@ -154,7 +154,7 @@ SCHEMAS = [
             "required": ["action"]}}},
     {"type": "function", "function": {
         "name": "todo",
-        "description": "Set the plan BEFORE the first mutating action on multi-step work: 3-8 verifiable items. Update it as steps complete — a stale plan misleads you. Mark done only with evidence.",
+        "description": "Set/update the plan (3-8 verifiable items).",
         "parameters": {"type": "object", "properties": {
             "items": {"type": "array", "items": {"type": "object", "properties": {
                 "text": {"type": "string"},
@@ -163,7 +163,7 @@ SCHEMAS = [
             "required": ["items"]}}},
     {"type": "function", "function": {
         "name": "spawn",
-        "description": "Spawn an isolated subagent (inherits the exact same model) to explore, research, or write code. Runs asynchronously in the background by default so you can continue working without blocking. Returns a handle (e.g. sub_1).",
+        "description": "Spawn an isolated subagent for parallel work.",
         "parameters": {"type": "object", "properties": {
             "task": {"type": "string", "description": "clear instructions and goal for the subagent"},
             "context": {"type": "string", "description": "file paths, constraints, or background knowledge"},
@@ -173,7 +173,7 @@ SCHEMAS = [
             "required": ["task"]}}},
     {"type": "function", "function": {
         "name": "subagent",
-        "description": "Monitor, inspect, wait for, or cancel a background subagent (e.g. spawned with background=true).",
+        "description": "Monitor/wait/cancel a background subagent.",
         "parameters": {"type": "object", "properties": {
             "handle": {"type": "string", "description": "subagent handle, e.g. sub_1, sub_2"},
             "action": {"type": "string", "enum": ["status", "logs", "wait", "cancel"],
@@ -331,24 +331,8 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 400,
     p, note = fs.resolve_resilient(path)
     res_prefix = (note + "\n") if note else ""
 
-    # FileSlate structural read-dedup (audit R5): if the range is already
-    # held in the session ledger, serve a pointer instead of re-rendering.
-    # The model has nothing to gain from the second byte-for-byte copy, and
-    # the unrendered form is ~30 tokens instead of ~800.
-    slate = (getattr(session, '_runtime', None) or {}).get('fileslate') if session else None
-    if slate is not None and not full:
-        try:
-            held_text = slate.covered_slice(str(p), int(offset), int(limit))
-        except Exception:
-            held_text = None
-        if held_text:
-            msg = (
-                f"{res_prefix}[fileslate hit: {p} lines {offset}-{offset + limit - 1} "
-                f"already held this session — content unchanged. Treat as known. "
-                f"Pass `full=True` only if you genuinely need to re-verify (it "
-                f"forces a real disk read and re-render).]"
-            )
-            return msg, {"fileslate": "hit", "path": str(p)}
+    # F-03: FileSlate interception deleted. tool_read reads the disk;
+    # interception lives only in the pipeline via the plane (I2, I8).
 
     # KnowledgeLedger: scratch duplicate detection (Continuity Phase 4).
     # If the model reads a scratch file that duplicates content we already
@@ -418,89 +402,10 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 400,
         except Exception:
             pass
 
-    # KnowledgeLedger outline-first progressive disclosure (Continuity Phase 5):
-    # For large code files not yet acquired this session, return outline + head
-    # instead of a blind 400-line slice. Stops the read 1-400 / realize wrong
-    # range / read again loop. Toggled by KERN_OUTLINE_FIRST, default-on.
-    if (
-        os.environ.get("KERN_OUTLINE_FIRST", "1") != "0"
-        and not full
-        and offset == 1
-        and limit == 400
-        and session is not None
-        and p.exists()
-        and not p.is_dir()
-        and suffix not in BINARY_EXTS
-    ):
-        try:
-            _knowledge = (getattr(session, '_runtime', None) or {}).get('knowledge')
-            _code_exts = (".py", ".js", ".ts", ".rs", ".go", ".c", ".cpp",
-                          ".java", ".css", ".html", ".json", ".toml",
-                          ".yaml", ".yml", ".sh", ".jsx", ".tsx", ".rb")
-            _already = False
-            if _knowledge is not None:
-                try:
-                    _ov = _knowledge.find_overlapping_read(str(p), 1, 1)
-                    _already = (
-                        (_ov is not None and _ov.status in ("covered", "partial"))
-                        or _knowledge.find_outline(str(p)) is not None
-                    )
-                except Exception:
-                    _already = False
-            if (not _already) and suffix in _code_exts:
-                # P6.4/F13: ONE pass — count lines and collect the 30-line
-                # head preview together (was: a full counting pass plus a
-                # second open() for the head).
-                _total_lines = 0
-                _head = []
-                try:
-                    with p.open("r", encoding="utf-8", errors="replace") as _f:
-                        for _i, _ln in enumerate(_f, 1):
-                            _total_lines = _i
-                            if _i <= 30:
-                                _head.append(f"   {_i}\t{_ln.rstrip()}\n")
-                except Exception:
-                    _total_lines = 0
-                    _head = []
-                if _total_lines > 1200:
-                    # P6.4/F13: dropped the dead outer try/except — the inner
-                    # lookup already fails open to str(p).
-                    _rel = str(p)
-                    if _knowledge is not None and hasattr(_knowledge, "_rel"):
-                        try:
-                            _rel = _knowledge._rel(str(p))
-                        except Exception:
-                            _rel = str(p)
-                    _outline = "(outline unavailable)"
-                    try:
-                        from .codegraph import CodeGraph
-                        _cg = CodeGraph(str(p.parent))
-                        _outline = _cg.outline(_rel, max_items=40)
-                    except Exception:
-                        # P6.4/F13: plain assignment cannot raise — the old
-                        # nested try/except around it was dead code.
-                        _outline = "(codegraph unavailable)"
-                    msg = (
-                        f"{res_prefix}[large unread file: {_rel} ({_total_lines} lines)\n"
-                        f"Outline:\n{_outline}\n\n"
-                        f"First 30 lines:\n" + "".join(_head) +
-                        f"\nNext steps:\n"
-                        f"- read(path='{_rel}', offset=N, limit=M) for targeted slice\n"
-                        f"- read(path='{_rel}', full=true) if whole file is genuinely needed\n"
-                        f"- map(action='find', name='symbol') to locate symbols]"
-                    )
-                    try:
-                        if _knowledge is not None:
-                            _knowledge.record_outline(_rel, _outline)
-                    except Exception:
-                        pass
-                    return msg, {
-                        "outline_first": "served",
-                        "path": str(p),
-                        "total_lines": _total_lines,
-                    }
-        except Exception:
-            pass
+    # F-06: outline-first substitution deleted. It constructed a new sqlite DB
+    # per parent directory, queried with wrong relative paths, and truncated
+    # what the model asked for. Outline is available via map(action="outline").
+
 
     # Multimodal Media: Images
     if is_binary:
@@ -517,12 +422,12 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 400,
         return (f"{res_prefix}error: file too large for full read ({len(text.splitlines())} lines). "
                 f"Use offset/limit instead."), {}
     body = _numbered(p, offset, limit)
-    # Record into fileslate so a subsequent re-read of this range is a slate
-    # hit (see tool_read head) instead of another disk read. This is what
-    # actually kills the "circle and re-check" loop structurally.
-    if slate is not None:
+    # Record into fileslate so the pipeline's ServeStage can serve this
+    # range from cache on subsequent reads (I3: serving held knowledge is free).
+    _slate = (getattr(session, '_runtime', None) or {}).get('fileslate') if session else None
+    if _slate is not None:
         try:
-            slate.record_read(str(p), body)
+            _slate.record_read(str(p), body)
         except Exception:
             pass
     return f"{res_prefix}{body}", {"path": str(p)}
@@ -746,6 +651,8 @@ def tool_edit(fs: FS, session, path: str, old_str: str = "", new_str: str = "",
         return ("error: old_str is empty. Use start_line/end_line to specify "
                 "a line range, or provide the exact string to replace."), {}
 
+    _edit_offset = [0]  # F-12: capture the actual replacement start offset
+
     def _apply(src: str) -> str | None:
         # occurrence is 1-based in the API; 0 means "must be unique".
         hits, mode = _find_occurrences(src, old_str, tolerant=True)
@@ -754,9 +661,11 @@ def tool_edit(fs: FS, session, path: str, old_str: str = "", new_str: str = "",
         if occurrence:
             if not (1 <= occurrence <= len(hits)):
                 return None
+            _edit_offset[0] = hits[occurrence - 1]
             return _replace_nth(src, old_str, new_str, occurrence - 1, mode)
         if len(hits) > 1:
             return None            # ambiguous; detailed message built by caller below
+        _edit_offset[0] = hits[0]
         return _replace_nth(src, old_str, new_str, 0, mode)
 
     # For .py, pre-flight the candidate in memory and refuse BEFORE writing if it
@@ -804,7 +713,9 @@ def tool_edit(fs: FS, session, path: str, old_str: str = "", new_str: str = "",
         meta["content_ref"] = ref
     msg = f"edited {p}{mode_note} (+{len(new_str)} -{len(old_str)} bytes)"
     # Fresh-state window: the replaced region in the NEW content ±8 lines.
-    anchor = new_src[:new_src.find(new_str)].count("\n") + 1 if new_str in new_src else 1
+    # F-12: anchor from the actual edit offset, not the first occurrence of
+    # new_str (which may be an unrelated region).
+    anchor = new_src[:_edit_offset[0]].count("\n") + 1 if new_str in new_src else 1
     msg += _fresh_state(new_src, anchor, len(new_str.splitlines()))
     if p.suffix == ".py":
         ok, err = _py_compile(p)
@@ -946,14 +857,40 @@ def tool_exec(fs: FS, cmd: str, timeout: int = 60, background: bool = False, *, 
     out = data.decode('utf-8', errors='replace') or '(no output)'
     if secrets:
         out = auth.redact_secrets(out, secrets)
-    # Audit finding #2.2: cap large exec results so a stray `cat /etc/passwd`
-    # or `head /var/log/secret` cannot dump the whole file into the model's
-    # context. The constraint system's redact_py_file_reads only fires for
-    # commands matching an `open()` regex, which misses shell cat/head/tail.
+    # F-11: Replace blind head+tail truncation with error-region-aware
+    # truncation. The middle (where tracebacks, assertion diffs, test failure
+    # lists live) is no longer silently destroyed.
     if len(out) > 4000:
-        head = out[:1500]
-        tail = out[-500:]
-        out = head + "\n\n[output truncated; exec result >4KB. Use read() for file contents, or pipe through head/tail/grep.]\n\n" + tail
+        import re as _re
+        _ERR_RE = _re.compile(
+            r"error|traceback|FAILED|assert|panic|Exception|\bat \w+\.\w+:\d+",
+            _re.IGNORECASE,
+        )
+        _lines = out.splitlines()
+        _err_lines = [ln for ln in _lines if _ERR_RE.search(ln)]
+        _err_region = "\n".join(_err_lines)[:2000]
+        _head = out[:1200]
+        _tail = out[-800:]
+        # Offload full text to scratch for later retrieval.
+        _scratch_dir = None
+        try:
+            _sess = None
+            # Try to get session scratch dir from the fs context
+            if hasattr(fs, '_session') and fs._session:
+                _scratch_dir = getattr(fs._session, 'scratch_dir', None)
+        except Exception:
+            pass
+        _scratch_ptr = ""
+        if _scratch_dir is not None:
+            try:
+                import uuid as _uuid
+                _sf = Path(_scratch_dir) / f"exec-{_uuid.uuid4().hex[:8]}.txt"
+                _sf.write_text(out, encoding="utf-8")
+                _scratch_ptr = f"\n[full output offloaded: {_sf}]"
+            except Exception:
+                pass
+        _mid = f"\n\n[error region ({len(_err_lines)} matching lines):]\n{_err_region}\n" if _err_region else ""
+        out = _head + _mid + f"\n[... middle truncated; {_scratch_ptr or 'use pipe/head/tail for full output'} ...]\n" + _tail
     return f"exit={proc.returncode}\n{out}\n[full output: {logfile}]", {
         "exit_code": proc.returncode, "status": "succeeded" if proc.returncode == 0 else "failed",
         "output_path": str(logfile), "timed_out": False}

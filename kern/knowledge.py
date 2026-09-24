@@ -201,7 +201,7 @@ class KnowledgeLedger:
             file_sig=actual_sig,
             event_n=event_n,
             acquired_turn=turn,
-            current_turn_at_record=True,
+            current_turn_at_record=(turn == self._current_turn),
             size_bytes=len(norm_text),
             tags=tags,
             range_lo=lo,
@@ -252,7 +252,7 @@ class KnowledgeLedger:
             file_sig=None,
             event_n=event_n,
             acquired_turn=turn,
-            current_turn_at_record=True,
+            current_turn_at_record=(turn == self._current_turn),
             size_bytes=len(content),
             pointer=dup_entry.source_path if dup_entry else original_source,
         )

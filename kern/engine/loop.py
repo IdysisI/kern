@@ -549,26 +549,8 @@ class LoopMixin:
                         text, _rmeta = constraints.redact_py_file_reads(self.session, name, code, text)
                         meta = {**(meta or {}), **_rmeta}
 
-                # Site 11 (direction C): auto-summarize large read() results so
-                # the model sees the *shape* of the file (top-level symbols + line
-                # numbers) before the bytes burn the context window. The body is
-                # preserved in the journal for replay, but the model's view starts
-                # with the summary so it can target the next read.
-                if name == "read" and tgt:
-                    # Skip head_summary when the caller explicitly asked for a
-                    # slice (offset/limit) or the full file: that is a targeted
-                    # request, and collapsing it to a summary is exactly the
-                    # data-loss bug being fixed. Also skip when an earlier
-                    # constraint already replaced the text (suppress/dedup/
-                    # paginate) so we never summarize a pointer.
-                    _ra = args or {}
-                    _explicit_slice = bool(
-                        _ra.get("full") or _ra.get("offset") or _ra.get("limit")
-                    )
-                    if not _explicit_slice and not (meta or {}).get("constraint"):
-                        text, _hmeta = constraints.head_summary(self.session, tgt, text)
-                        if _hmeta:
-                            meta = {**(meta or {}), **_hmeta}
+                # F-05: head_summary deleted. Progressive disclosure is only via
+                # map(action="outline"). The model gets what it asked for. (I2)
 
                 # Carry constraint meta forward: this is how the gate at the
                 # top of the next iteration knows force_plan / escalate is active.

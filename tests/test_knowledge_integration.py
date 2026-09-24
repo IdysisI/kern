@@ -60,23 +60,8 @@ def test_force_reread_bypasses_interceptor():
         assert "a = 1" in t1 or "knowledge-ledger" in t1.lower() or "fileslate" in t1.lower()
 
 
-def test_outline_first_for_large_code_file():
-    """Create a temporary large .py file; first default read returns outline-first."""
-    with tempfile.TemporaryDirectory() as cwd:
-        # Need KERN_OUTLINE_FIRST to be enabled (default on)
-        os.environ["KERN_OUTLINE_FIRST"] = "1"
-        f = Path(cwd) / "big.py"
-        # 1300 lines of dummy content
-        f.write_text("\n".join(f"x_{i} = {i}" for i in range(1300)))
-        sess = _make_session(cwd)
-        t, m = syscalls.tool_read(syscalls.FS(cwd), "big.py", offset=1, limit=400, session=sess)
-        assert m.get("outline_first") == "served", m
-        assert "Outline" in t
-        # Outline recorded in knowledge ledger
-        runtime = getattr(sess, "_runtime", None)
-        assert runtime and "knowledge" in runtime
-        knowledge = runtime["knowledge"]
-        assert knowledge.find_outline("big.py") is not None
+# F-06: test_outline_first_for_large_code_file deleted — outline-first
+# substitution removed from tool_read. Use map(action="outline") instead.
 
 
 def test_knowledge_state_appears_in_slate():
