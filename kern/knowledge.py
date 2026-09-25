@@ -133,12 +133,11 @@ class KnowledgeLedger:
         if not path:
             return ""
         try:
-            p = Path(path)
-            if not p.is_absolute():
-                p = (self.cwd / p).resolve()
-            else:
-                p = p.resolve()
-            return p.relative_to(self.cwd).as_posix()
+            p = Path(path).resolve()
+            try:
+                return p.relative_to(self.cwd.resolve()).as_posix()
+            except ValueError:
+                return p.as_posix()
         except (ValueError, OSError):
             return str(path).replace("\\", "/")
 
@@ -445,6 +444,14 @@ class KnowledgeLedger:
         rel = self._rel(scratch_path)
         if rel in self.scratch_map:
             return self.scratch_map[rel]
+
+        if content is None:
+            try:
+                p = Path(scratch_path)
+                if p.is_file():
+                    content = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
         if content is not None:
             norm_text, _, _, _ = normalize_content(content)
