@@ -34,9 +34,9 @@ def test_write_mode_open_never_trims():
     assert meta == {}, f"constraint fired on write-mode open: {meta}"
 
 
-def test_piped_cat_without_file_bytes_not_trimmed():
+def test_piped_cat_without_file_bytes_not_trimmed(tmp_path):
     s = _Sess()
-    tmp = Path("/tmp/kern_redact_probe.txt")
+    tmp = tmp_path / "kern_redact_probe.txt"
     tmp.write_text("UNIQUEFILECONTENT123\n" * 3)
     out, meta = redact_py_file_reads(s, "exec", f"cat {tmp} | grep OTHER",
                                      "grep results\n" * 600)   # no file bytes inside
@@ -102,9 +102,9 @@ def test_stdin_cat_and_flag_targets_not_matched():
     assert meta == {}, f"cat - (stdin) matched as file read: {meta}"
 
 
-def test_true_positives_still_fire_with_clean_targets():
+def test_true_positives_still_fire_with_clean_targets(tmp_path):
     s = _Sess()
-    f = Path("/tmp/kern_redact_tp.txt")
+    f = tmp_path / "kern_redact_tp.txt"
     f.write_text("TPCONTENT\n" * 5)
     out, meta = redact_py_file_reads(s, "exec", f"cat {f},", "TPCONTENT\n" * 500)
     assert meta.get("constraint") == "redact_py_file_reads"

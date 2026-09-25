@@ -103,12 +103,12 @@ def test_source_signature_changes_with_content(tmp_path, repo_copy):
     pkg = repo_copy / 'kern'
     before = B.source_signature(repo_copy)
     target = pkg / 'updater.py'
-    orig = target.read_text()
+    orig = target.read_bytes()
     try:
-        target.write_text(orig + '\n# probe\n')
+        target.write_bytes(orig + b'\n# probe\n')
         after = B.source_signature(repo_copy)
     finally:
-        target.write_text(orig)
+        target.write_bytes(orig)
     assert before != after
     assert B.source_signature(repo_copy) == before, 'reverting must restore the signature'
 
@@ -169,12 +169,12 @@ def test_local_restart_needed_detects_real_edit(tmp_path, monkeypatch, repo_copy
         assert need is False, 'freshly matching version must not request a restart'
 
         target = repo_copy / 'kern' / 'updater.py'
-        orig = target.read_text()
+        orig = target.read_bytes()
         try:
-            target.write_text(orig + '\n# edited\n')
+            target.write_bytes(orig + b'\n# edited\n')
             need, detail = updater.local_restart_needed(running)
         finally:
-            target.write_text(orig)
+            target.write_bytes(orig)
         assert need is True, 'an on-disk edit must be detected'
         assert 'local source changed' in detail
 

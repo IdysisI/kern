@@ -388,7 +388,7 @@ def _arg_schema_hint(name: str) -> str:
     props = params.get("properties") or {}
     required = [r for r in (params.get("required") or []) if isinstance(r, str)]
     types = ", ".join(f"{k}: {v.get('type', 'any')}" for k, v in props.items()) or "no parameters"
-    example = ", ".join(f'"{k}": "<{props.get(k, {}).get("type", 'any')}>"' for k in required)
+    example = ", ".join(f'"{k}": "<{(props.get(k) or {}).get("type", "any")}>"' for k in required)
     return (f"schema: {name}({types}); required=[{', '.join(required) or 'none'}]. "
             f"corrected shape example: {{{example}}}")
 

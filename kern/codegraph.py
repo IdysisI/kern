@@ -200,7 +200,7 @@ class CodeGraph:
                 st = p.stat()
             except OSError:
                 continue
-            rel = str(p.relative_to(root))
+            rel = p.relative_to(root).as_posix()
             seen[rel] = (st.st_mtime, st.st_size)
         with self._conn() as db:
             known = {r['path']: (r['mtime'], r['size'])
@@ -363,7 +363,7 @@ class CodeGraph:
         p = Path(path)
         if p.is_absolute():
             try:
-                return str(p.relative_to(self.cwd))
+                return p.relative_to(self.cwd).as_posix()
             except ValueError:
-                return str(p)
-        return str(p).lstrip('./')
+                return p.as_posix()
+        return p.as_posix().lstrip('./')

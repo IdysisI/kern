@@ -77,7 +77,7 @@ def _salvage_text(paths: list[str], per_file: int = _SALVAGE_PER_FILE,
     exhausted = False
     for a in paths:
         try:
-            body = Path(a).read_text(errors="replace")
+            body = Path(a).read_text(encoding="utf-8", errors="replace")
         except Exception:
             parts.append(f"### `{a}` (unreadable)\n")
             continue
@@ -485,7 +485,8 @@ class SubagentsMixin:
                     report_file.write_text(
                         f"# Subagent Report ({hid})\nTask: {task}\nModel: {child_model}\n"
                         f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                        f"Requests: {child_engine.requests}\n\n{reply}"
+                        f"Requests: {child_engine.requests}\n\n{reply}",
+                        encoding="utf-8",
                     )
                     entry["report_path"] = str(report_file)
                     self.session.emit("subagent_finish", handle=hid, result=reply,
@@ -518,7 +519,8 @@ class SubagentsMixin:
                             report_file.write_text(
                                 f"# Subagent Report ({hid}) — SALVAGED AFTER ERROR\n"
                                 f"Task: {task}\nError: {e}\n"
-                                f"Requests: {child_engine.requests}\n\n{salvaged}")
+                                f"Requests: {child_engine.requests}\n\n{salvaged}",
+                                encoding="utf-8")
                             entry["report_path"] = str(report_file)
                             entry["salvaged"] = True
                         except Exception:

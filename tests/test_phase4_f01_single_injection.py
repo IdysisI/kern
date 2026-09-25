@@ -17,6 +17,7 @@ This test commits RED against the bug, then becomes GREEN after the fix.
 import asyncio
 import os
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -29,7 +30,7 @@ from kern.journal import create_session
 def engine_in_repo():
     """A minimal Engine + Session rooted at a real directory (the
     in-tree repo) so KERN.md is found and the mission packet has content."""
-    cwd = "/home/marty/kern"
+    cwd = str(Path(__file__).resolve().parent.parent)
     s = create_session(cwd)
     e = Engine(object(), "test", s, cwd)
     s.emit("meta", cwd=cwd, parent=None, model="test-model")

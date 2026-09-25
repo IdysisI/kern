@@ -52,16 +52,30 @@ fi
 # PySide6, qasync, pygments). Set KERN_NO_GUI=1 for a headless CLI-only install.
 GUI_EXTRA="[gui]"
 if [ "${KERN_NO_GUI:-0}" = "1" ]; then GUI_EXTRA=""; fi
+
+# Auto-detect Termux / Android environments where PySide6 has no wheels
+if [ -n "${TERMUX_VERSION:-}" ] || [ -d "/data/data/com.termux" ] || [ "$(uname -o 2>/dev/null)" = "Android" ]; then
+  GUI_EXTRA=""
+fi
+
 mkdir -p "$BIN_DIR"
 if need pipx; then
   say "installing with pipx (isolated)…"
-  pipx install --force "${INSTALL_DIR}${GUI_EXTRA}" >/dev/null 2>&1 || pipx install --force "${INSTALL_DIR}${GUI_EXTRA}"
+  if [ -n "$GUI_EXTRA" ] && ! pipx install --force "${INSTALL_DIR}${GUI_EXTRA}" >/dev/null 2>&1; then
+    say "  Note: GUI dependencies (PySide6) not available on this platform — installing CLI only."
+    GUI_EXTRA=""
+  fi
+  pipx install --force "${INSTALL_DIR}${GUI_EXTRA}" || die "pipx install failed"
   ok "installed with pipx"
 else
   say "no pipx — using a private venv (pipx is nicer; install it anytime and re-run this)"
   VENV="$INSTALL_DIR/.venv"
   "$PYBIN" -m venv "$VENV" || die "could not create venv (python3-venv missing?)"
   "$VENV/bin/pip" -q install --upgrade pip >/dev/null 2>&1 || true
+  if [ -n "$GUI_EXTRA" ] && ! "$VENV/bin/pip" -q install "${INSTALL_DIR}${GUI_EXTRA}" >/dev/null 2>&1; then
+    say "  Note: GUI dependencies (PySide6) not available on this platform — installing CLI only."
+    GUI_EXTRA=""
+  fi
   "$VENV/bin/pip" -q install "${INSTALL_DIR}${GUI_EXTRA}" || die "pip install failed"
   ln -sf "$VENV/bin/kern" "$BIN_DIR/kern"
   [ -x "$VENV/bin/kern-gui" ] && ln -sf "$VENV/bin/kern-gui" "$BIN_DIR/kern-gui" || true

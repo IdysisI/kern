@@ -32,9 +32,10 @@ def test_store_load_forget_roundtrip(home):
     auth.store_token('tok123', login='octocat', scopes='repo')
     assert auth.load_stored_token() == 'tok123'
     assert auth.get_token() == 'tok123'
-    # owner-only perms
-    mode = stat.S_IMODE((home / '.kern' / 'github.json').stat().st_mode)
-    assert mode == 0o600
+    # owner-only perms (POSIX only; Windows does not implement chmod 0600)
+    if os.name != 'nt':
+        mode = stat.S_IMODE((home / '.kern' / 'github.json').stat().st_mode)
+        assert mode == 0o600
     assert auth.forget() is True
     assert auth.load_stored_token() is None
     assert auth.forget() is False  # already gone

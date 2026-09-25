@@ -138,9 +138,9 @@ class KnowledgeLedger:
                 p = (self.cwd / p).resolve()
             else:
                 p = p.resolve()
-            return str(p.relative_to(self.cwd))
+            return p.relative_to(self.cwd).as_posix()
         except (ValueError, OSError):
-            return str(path)
+            return str(path).replace("\\", "/")
 
     def _extract_tags(self, text: str, path: str) -> list[str]:
         """Extract top symbol names from python/code content for tagging."""

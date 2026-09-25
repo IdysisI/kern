@@ -357,7 +357,7 @@ def tool_read(fs: FS, path: str, offset: int = 1, limit: int = 400,
         try:
             _knowledge = (getattr(session, '_runtime', None) or {}).get('knowledge')
             _resolved = str(p)
-            if _knowledge is not None and '/scratch/' in _resolved:
+            if _knowledge is not None and '/scratch/' in _resolved.replace('\\', '/'):
                 _dup = _knowledge.find_scratch_duplicate(_resolved)
                 if _dup is not None:
                     return (

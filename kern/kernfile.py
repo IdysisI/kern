@@ -65,7 +65,7 @@ _RUNNERS = [
 
 def _read(path: Path) -> str:
     try:
-        return path.read_text(errors='replace')
+        return path.read_text(encoding='utf-8', errors='replace')
     except OSError:
         return ''
 
@@ -268,5 +268,5 @@ def ensure_kern_md(cwd) -> dict:
     new = generate(root, existing)
     changed = new != existing
     if changed:
-        kp.write_text(new)
+        kp.write_text(new, encoding='utf-8')
     return {'path': str(kp), 'created': created, 'changed': changed}

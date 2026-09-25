@@ -95,13 +95,15 @@ def test_hygiene_replay_empty():
 
 def test_hygiene_keys_match_engine_schema():
     """Lock the schema so engine and measure.py can't drift apart."""
+    import tempfile
     from kern.engine import Engine
     s = create_dummy_session()
     from kern.client import Client
-    e = Engine(Client.__new__(Client), "m", s, "/tmp")
+    e = Engine(Client.__new__(Client), "m", s, tempfile.gettempdir())
     assert set(e.hygiene.keys()) == set(HYGIENE_KEYS)
 
 
 def create_dummy_session():
+    import tempfile
     from kern.journal import create_session
-    return create_session("/tmp")
+    return create_session(tempfile.gettempdir())

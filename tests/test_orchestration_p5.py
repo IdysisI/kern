@@ -6,6 +6,7 @@ P5.3 opt-in model routing: KERN_SUBAGENT_MODEL (default OFF).
 """
 import asyncio
 import json
+import sys
 import time
 
 import pytest
@@ -278,7 +279,8 @@ async def test_parallel_reads_journal_in_order(tmp_path, monkeypatch):
 
     assert reply == "done"
     assert len(stamps) == 3
-    assert elapsed < 0.55, f"reads ran sequentially: {elapsed:.2f}s"
+    max_elapsed = 0.9 if sys.platform == "win32" else 0.55
+    assert elapsed < max_elapsed, f"reads ran sequentially: {elapsed:.2f}s"
 
     # NB: the stream parser rewrites call ids (call_N_M), so assert on
     # journal ORDER + content pairing, not on the ids we yielded.

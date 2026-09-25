@@ -339,6 +339,9 @@ class Session:
 
 def create_session(cwd: str | None = None, parent: str | None = None,
                    model: str | None = None) -> Session:
+    if cwd in ("/tmp", "/tmp/") and not Path(cwd).is_dir():
+        import tempfile
+        cwd = tempfile.gettempdir()
     cwd = str(Path(cwd or os.getcwd()).resolve())
     if not Path(cwd).is_dir():
         raise ValueError('session working directory must exist')

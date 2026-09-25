@@ -103,6 +103,7 @@ def test_tool_py_survives_stray_fd1_output(tmp_path):
     assert "42" in text2, f"protocol desynced on the next call: {text2!r}"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="graceful cell-only SIGINT interrupt is POSIX-only")
 def test_interrupt_preserves_namespace(tmp_path):
     """W2 regression: an interrupt must abort ONLY the running cell (SIGINT →
     KeyboardInterrupt in the worker); the persistent namespace must survive.
